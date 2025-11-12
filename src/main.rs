@@ -31,7 +31,7 @@ fn main() -> Result<()> {
 
     let site = Site::load(&config.tar_path)?;
     eprintln!(
-        "[zeroserve] loaded {} entries from {} ({} bytes)",
+        "loaded {} entries from {} ({} bytes)",
         site.total_entries,
         config.tar_path.display(),
         site.total_bytes
@@ -39,7 +39,7 @@ fn main() -> Result<()> {
 
     let tls_runtime = load_tls_if_configured(&config)?;
     if tls_runtime.is_some() {
-        eprintln!("[zeroserve] TLS enabled");
+        eprintln!("TLS enabled");
     }
 
     let shared = Arc::new(SharedState::new(config.clone(), site, tls_runtime));

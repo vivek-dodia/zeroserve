@@ -3,6 +3,9 @@ name = "zeroserve"
 version = "0.1.0"
 edition = "2024"
 
+[profile.release]
+panic = "abort"
+
 [dependencies]
 arc-swap = "1"
 bytes = "1"

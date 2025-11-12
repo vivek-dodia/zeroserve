@@ -12,7 +12,7 @@ pub fn start_reload_thread(shared: Arc<SharedState>) -> Result<()> {
         .spawn(move || {
             for _ in signals.forever() {
                 if let Err(err) = reload_assets(&shared) {
-                    eprintln!("[zeroserve] reload failed: {err:?}");
+                    eprintln!("reload failed: {err:?}");
                 }
             }
         })
@@ -21,13 +21,10 @@ pub fn start_reload_thread(shared: Arc<SharedState>) -> Result<()> {
 }
 
 fn reload_assets(shared: &Arc<SharedState>) -> Result<()> {
-    eprintln!("[zeroserve] reloading site and TLS assets");
+    eprintln!("reloading site and TLS assets");
     let site = Site::load(&shared.config.tar_path)?;
     shared.site.store(Arc::new(site));
-    eprintln!(
-        "[zeroserve] reloaded tarball {}",
-        shared.config.tar_path.display()
-    );
+    eprintln!("reloaded tarball {}", shared.config.tar_path.display());
 
     match load_tls_if_configured(&shared.config) {
         Ok(runtime_opt) => {
@@ -36,10 +33,10 @@ fn reload_assets(shared: &Arc<SharedState>) -> Result<()> {
                 .tls
                 .store(runtime_opt.map(|runtime| Arc::new(runtime)));
             if tls_present {
-                eprintln!("[zeroserve] reloaded TLS configuration");
+                eprintln!("reloaded TLS configuration");
             }
         }
-        Err(err) => eprintln!("[zeroserve] TLS reload failed: {err:?}"),
+        Err(err) => eprintln!("TLS reload failed: {err:?}"),
     }
     Ok(())
 }
