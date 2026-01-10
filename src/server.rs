@@ -1,14 +1,15 @@
 use std::{
     cell::RefCell,
+    collections::HashMap,
     io::ErrorKind,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
-    os::fd::AsFd,
     rc::Rc,
     sync::{Arc, Weak},
 };
 
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
+use futures::FutureExt;
 use http::{Method, StatusCode, Uri};
 use monoio::{
     fs::File,
@@ -31,8 +32,11 @@ use monoio_http::{
     },
 };
 use monoio_rustls::TlsError;
+use ulid::Ulid;
 
 use crate::{
+    logging::async_log,
+    script::{ScriptOutcome, ScriptRequest, ScriptResponse},
     shared::SharedState,
     site::{Site, TarEntry, guess_mime, normalize_request_path},
 };
@@ -53,8 +57,13 @@ pub async fn amain(shared: Arc<SharedState>) -> Result<()> {
 }
 
 async fn run_http_listener(shared: Arc<SharedState>) -> Result<()> {
-    let listener = TcpListener::bind(shared.config.http_addr)
-        .with_context(|| format!("failed to bind {}", shared.config.http_addr))?;
+    let listener = shared
+        .http_listener
+        .lock()
+        .unwrap()
+        .take()
+        .expect("http_listener");
+    let listener = TcpListener::from_std(listener)?;
     eprintln!("listening on http://{}", shared.config.http_addr);
     loop {
         let (stream, addr) = listener.accept().await?;
@@ -89,8 +98,13 @@ async fn run_tls_listener(shared: Arc<SharedState>) -> Result<()> {
         .config
         .tls_addr
         .ok_or_else(|| anyhow!("TLS listener requested without address"))?;
-    let listener = TcpListener::bind(addr)
-        .with_context(|| format!("failed to bind TLS listener on {addr}"))?;
+    let listener = shared
+        .tls_listener
+        .lock()
+        .unwrap()
+        .take()
+        .expect("tls_listener");
+    let listener = TcpListener::from_std(listener)?;
     eprintln!("listening on https://{}", addr);
     loop {
         let (stream, peer) = listener.accept().await?;
@@ -154,12 +168,8 @@ where
     while let Some(result) = decoder.next().await {
         match result {
             Ok(request) => {
-                let method = request.method().clone();
-                let uri = request.uri().clone();
-                if !shared.config.disable_request_logging {
-                    log_request(peer, scheme, &method, &uri).await;
-                }
-                handle_request(request, &shared, peer, &mut w).await;
+                let interrupt = decoder.next().map(|_| ());
+                handle_request(request, &shared, peer, scheme, &mut w, interrupt).await;
             }
             Err(err) => {
                 if let HttpError::IOError(x) = &err {
@@ -185,16 +195,48 @@ async fn handle_request(
     req: Request,
     shared: &Arc<SharedState>,
     peer: std::net::SocketAddr,
+    scheme: Scheme,
     w: &mut impl AsyncWriteRent,
+    interrupt: impl Future<Output = ()>,
 ) {
+    let request_id = Ulid::new();
+    if !shared.config.disable_request_logging {
+        log_request(request_id, peer, scheme, req.method(), req.uri()).await;
+    }
+
     let (head, body) = req.into_parts();
     drain_payload(body).await;
 
+    let script_request = build_script_request(request_id, &head, peer, scheme);
+    let script_outcome = monoio::select! {
+        x = shared.script_runtime.run_request(script_request) => x,
+        _ = interrupt => return,
+    };
+    let script_outcome = match script_outcome {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            eprintln!("script runtime failed: {:?}", err);
+            ScriptOutcome::default()
+        }
+    };
+
+    if let Some(response) = script_outcome.response {
+        send_script_response(w, response, head.method == Method::HEAD).await;
+        return;
+    }
+
     match head.method {
         Method::GET | Method::HEAD => {
-            if serve_static(&head, shared, head.method == Method::HEAD, peer, w)
-                .await
-                .is_none()
+            if serve_static(
+                &head,
+                shared,
+                head.method == Method::HEAD,
+                peer,
+                w,
+                &script_outcome.metadata,
+            )
+            .await
+            .is_none()
             {
                 send_fixed(w, not_found()).await
             }
@@ -225,10 +267,36 @@ async fn serve_static(
     head_only: bool,
     peer: std::net::SocketAddr,
     w: &mut impl AsyncWriteRent,
+    metadata: &HashMap<String, String>,
 ) -> Option<()> {
     let path = normalize_request_path(head.uri.path())?;
     let site = shared.site.load_full();
     let entry = site.lookup(&path, &shared.config.index_file, shared.config.try_html)?;
+    let mime = guess_mime(&entry.path);
+
+    if should_template_replace(mime, metadata) {
+        match read_tar_entry(entry.clone(), &site).await {
+            Ok(body) => {
+                let rendered = match std::str::from_utf8(&body) {
+                    Ok(text) => apply_template(text, metadata).into_bytes(),
+                    Err(_) => body,
+                };
+                send_bytes_response(w, StatusCode::OK, mime, rendered, head_only).await;
+            }
+            Err(err) => {
+                eprintln!("failed to render {}: {:?}", entry.path, err);
+                send_bytes_response(
+                    w,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "text/plain; charset=utf-8",
+                    b"Internal Server Error".to_vec(),
+                    head_only,
+                )
+                .await;
+            }
+        }
+        return Some(());
+    }
 
     let header = format!(
         "HTTP/1.1 200 OK\r
@@ -238,7 +306,7 @@ accept-ranges: bytes\r
 content-type: {}\r\n\r\n",
         entry.size,
         crate::SERVER_HEADER,
-        guess_mime(&entry.path),
+        mime,
     );
 
     let _ = w.write_all(header.into_bytes()).await;
@@ -312,6 +380,134 @@ async fn stream_tar_entry(
     Ok(())
 }
 
+async fn read_tar_entry(entry: Arc<TarEntry>, site: &Arc<Site>) -> std::io::Result<Vec<u8>> {
+    let file = site.tar_file.try_clone().and_then(File::from_std)?;
+    let size = usize::try_from(entry.size)
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
+    let (res, buf) = file.read_exact_at(vec![0u8; size], entry.offset).await;
+    res?;
+    Ok(buf)
+}
+
+fn should_template_replace(content_type: &str, metadata: &HashMap<String, String>) -> bool {
+    !metadata.is_empty() && is_text_mime(content_type)
+}
+
+fn is_text_mime(content_type: &str) -> bool {
+    content_type.starts_with("text/")
+        || matches!(
+            content_type,
+            "application/javascript"
+                | "application/json"
+                | "application/xml"
+                | "application/xhtml+xml"
+                | "image/svg+xml"
+        )
+}
+
+fn apply_template(body: &str, metadata: &HashMap<String, String>) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut rest = body;
+    while let Some(start) = rest.find("{{") {
+        let (before, after_start) = rest.split_at(start);
+        out.push_str(before);
+        let after_start = &after_start[2..];
+        if let Some(end) = after_start.find("}}") {
+            let raw_key = &after_start[..end];
+            let key = raw_key.trim();
+            if let Some(value) = metadata.get(key) {
+                out.push_str(value);
+            } else {
+                out.push_str("{{");
+                out.push_str(raw_key);
+                out.push_str("}}");
+            }
+            rest = &after_start[end + 2..];
+        } else {
+            out.push_str("{{");
+            out.push_str(after_start);
+            rest = "";
+            break;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+async fn send_bytes_response(
+    w: &mut impl AsyncWriteRent,
+    status: StatusCode,
+    content_type: &str,
+    body: Vec<u8>,
+    head_only: bool,
+) {
+    let reason = status.canonical_reason().unwrap_or("");
+    let header = format!(
+        "HTTP/1.1 {} {}\r
+content-length: {}\r
+server: {}\r
+content-type: {}\r\n\r\n",
+        status.as_u16(),
+        reason,
+        body.len(),
+        crate::SERVER_HEADER,
+        content_type
+    );
+    let _ = w.write_all(header.into_bytes()).await;
+    if !head_only {
+        let _ = w.write_all(body).await;
+    }
+    let _ = w.flush().await;
+}
+
+fn build_script_request(
+    request_id: Ulid,
+    head: &RequestHead,
+    peer: std::net::SocketAddr,
+    scheme: Scheme,
+) -> ScriptRequest {
+    let mut headers = HashMap::new();
+    for (name, value) in head.headers.iter() {
+        if let Ok(value) = value.to_str() {
+            headers.insert(name.as_str().to_ascii_lowercase(), value.to_string());
+        }
+    }
+
+    let query = head.uri.query().unwrap_or("").to_string();
+    let mut query_params = HashMap::new();
+    if !query.is_empty() {
+        for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+            query_params
+                .entry(key.into_owned())
+                .or_insert(value.into_owned());
+        }
+    }
+
+    ScriptRequest {
+        request_id,
+        method: head.method.as_str().to_string(),
+        path: head.uri.path().to_string(),
+        uri: head.uri.to_string(),
+        query,
+        scheme: scheme.as_str().to_string(),
+        peer: peer.to_string(),
+        headers,
+        query_params,
+    }
+}
+
+async fn send_script_response(
+    w: &mut impl AsyncWriteRent,
+    response: ScriptResponse,
+    head_only: bool,
+) {
+    let status = StatusCode::from_u16(response.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let content_type = response
+        .content_type
+        .unwrap_or_else(|| "text/plain; charset=utf-8".to_string());
+    send_bytes_response(w, status, &content_type, response.body, head_only).await;
+}
+
 fn not_found() -> Response<Bytes> {
     text_response(StatusCode::NOT_FOUND, "Not Found")
 }
@@ -329,17 +525,25 @@ fn text_response(status: StatusCode, body: &str) -> Response<Bytes> {
         .unwrap()
 }
 
-async fn log_request(peer: std::net::SocketAddr, scheme: Scheme, method: &Method, uri: &Uri) {
-    thread_local! {
-        static STDERR: Rc<File> = Rc::new(File::from_std(
-            std::fs::File::from(
-                std::io::stderr().as_fd().try_clone_to_owned()
-                    .expect("failed to clone stderr")
-            )).unwrap());
-    }
-    let msg = format!("{} {} {} {}\n", scheme.as_str(), peer, method, uri).into_bytes();
-    let stderr = STDERR.with(|x| x.clone());
-    let _ = stderr.write_all_at(msg, 0).await;
+async fn log_request(
+    request_id: Ulid,
+    peer: std::net::SocketAddr,
+    scheme: Scheme,
+    method: &Method,
+    uri: &Uri,
+) {
+    async_log(
+        format!(
+            "[request] {}: {} {} {} {}\n",
+            request_id,
+            scheme.as_str(),
+            peer,
+            method,
+            uri
+        )
+        .into_bytes(),
+    )
+    .await
 }
 
 #[derive(Clone, Copy)]

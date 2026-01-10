@@ -1,21 +1,34 @@
 mod cli;
 mod config;
+mod logging;
+mod pack;
 mod reload;
+mod script;
 mod server;
 mod shared;
 mod site;
 mod tls;
 
+use std::io::Write;
+use std::net::TcpListener;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
+use landlock::{Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr};
 use monoio::{IoUringDriver, RuntimeBuilder};
 use rustls::crypto::aws_lc_rs;
 
 use crate::{
-    cli::Cli, config::StaticConfig, reload::start_reload_thread, server::amain,
-    shared::SharedState, site::Site, tls::load_tls_if_configured,
+    cli::Cli,
+    config::StaticConfig,
+    pack::ZEROSERVE_H,
+    reload::start_reload_thread,
+    script::{ScriptRuntime, ScriptRuntimeConfig},
+    server::amain,
+    shared::SharedState,
+    site::Site,
+    tls::load_tls_if_configured,
 };
 
 pub const SERVER_HEADER: &str = "zeroserve";
@@ -27,9 +40,43 @@ fn main() -> Result<()> {
         .expect("failed to install aws-lc provider");
 
     let args = Cli::parse();
+    if args.dump_sdk {
+        let mut out = std::io::stdout().lock();
+        out.write_all(ZEROSERVE_H)?;
+        out.flush()?;
+        return Ok(());
+    }
+    if let Some(pack_root) = args.pack.as_ref() {
+        pack::pack_site(pack_root)?;
+        return Ok(());
+    }
     let config = Arc::new(StaticConfig::try_from(args)?);
 
-    let site = Site::load(&config.tar_path)?;
+    let http_listener = TcpListener::bind(&config.http_addr)
+        .with_context(|| format!("failed to bind HTTP listener on {}", config.http_addr))?;
+    let tls_listener = if let Some(x) = &config.tls_addr {
+        Some(
+            TcpListener::bind(x)
+                .with_context(|| format!("failed to bind TLS listener on {}", x))?,
+        )
+    } else {
+        None
+    };
+
+    if !config.disable_ns_isolation {
+        setup_ns_isolation().with_context(
+            || "failed to set up namespace isolation (set --disable-ns-isolation to disable)",
+        )?;
+        eprintln!("enabled namespace isolation");
+
+        drop_all_capabilities().with_context(|| "failed to drop capabilities")?;
+        eprintln!("dropped capabilities");
+    }
+
+    setup_landlock(&config).with_context(|| "failed to setup landlock")?;
+    eprintln!("enabled landlock");
+
+    let site = Arc::new(Site::load(&config.tar_path)?);
     eprintln!(
         "loaded {} entries from {} ({} bytes)",
         site.total_entries,
@@ -42,12 +89,116 @@ fn main() -> Result<()> {
         eprintln!("TLS enabled");
     }
 
-    let shared = Arc::new(SharedState::new(config.clone(), site, tls_runtime));
-    start_reload_thread(shared.clone())?;
+    let mut urb = io_uring::IoUring::builder();
+    urb.setup_single_issuer();
+    if let Some(ms) = config.sqpoll_idle_ms {
+        urb.setup_sqpoll(ms);
+        eprintln!("io_uring sqpoll enabled with idle timeout {}ms", ms);
+    }
 
     RuntimeBuilder::<IoUringDriver>::new()
         .enable_timer()
+        .uring_builder(urb)
         .build()
         .expect("zeroserve: failed to build io_uring runtime")
-        .block_on(async move { amain(shared).await })
+        .block_on(async move {
+            let script_runtime = unsafe {
+                ScriptRuntime::new(ScriptRuntimeConfig {
+                    preempt_timer_interval: config.preempt_timer_interval,
+                })
+            };
+            eprintln!(
+                "async preemption timer interval: {:?}",
+                config.preempt_timer_interval
+            );
+
+            script_runtime
+                .reload(site.clone())
+                .await
+                .with_context(|| "failed to load scripts")?;
+
+            let shared = Arc::new(SharedState::new(
+                config.clone(),
+                site,
+                tls_runtime,
+                http_listener,
+                tls_listener,
+                script_runtime,
+            ));
+            start_reload_thread(shared.clone())?;
+
+            amain(shared).await
+        })
+}
+
+fn setup_landlock(config: &StaticConfig) -> anyhow::Result<()> {
+    let abi = landlock::ABI::V2;
+    let access_read = AccessFs::ReadFile;
+    let access_all = AccessFs::from_all(abi);
+
+    let mut ruleset = Ruleset::default()
+        .handle_access(access_all)?
+        .create()?
+        .add_rule(PathBeneath::new(
+            PathFd::new(&config.tar_path).with_context(|| "failed to open tar_path")?,
+            access_read,
+        ))?;
+
+    if let Some(x) = &config.cert_path {
+        ruleset = ruleset.add_rule(PathBeneath::new(
+            PathFd::new(x).with_context(|| "failed to open cert_path")?,
+            access_read,
+        ))?;
+    }
+
+    if let Some(x) = &config.key_path {
+        ruleset = ruleset.add_rule(PathBeneath::new(
+            PathFd::new(x).with_context(|| "failed to open key_path")?,
+            access_read,
+        ))?;
+    }
+
+    if let Some(x) = &config.reload_signal_file {
+        ruleset = ruleset.add_rule(PathBeneath::new(
+            PathFd::new(x).with_context(|| "failed to open reload_signal_file")?,
+            access_read,
+        ))?;
+    }
+    ruleset.restrict_self()?;
+    Ok(())
+}
+
+fn setup_ns_isolation() -> anyhow::Result<()> {
+    unsafe {
+        let uid = libc::getuid();
+        let gid = libc::getgid();
+        if uid == 0 {
+            anyhow::bail!("cannot run with uid 0");
+        }
+
+        if libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET | libc::CLONE_NEWNS) != 0 {
+            return Err(anyhow::Error::from(std::io::Error::last_os_error()).context("unshare"));
+        }
+        std::fs::write("/proc/self/uid_map", format!("0 {} 1\n", uid))
+            .with_context(|| "write uid_map")?;
+        std::fs::write("/proc/self/setgroups", "deny\n").with_context(|| "write setgroups")?;
+        std::fs::write("/proc/self/gid_map", format!("0 {} 1\n", gid))
+            .with_context(|| "write gid_map")?;
+    }
+    Ok(())
+}
+
+pub fn drop_all_capabilities() -> Result<(), caps::errors::CapsError> {
+    use caps::CapSet;
+
+    // Order matters: clear Bounding/Ambient first while we may still have CAP_SETPCAP.
+    caps::clear(None, CapSet::Bounding)?;
+    caps::clear(None, CapSet::Ambient)?;
+
+    // Then clear the traditional POSIX sets.
+    caps::clear(None, CapSet::Inheritable)?;
+    caps::clear(None, CapSet::Permitted)?;
+    caps::clear(None, CapSet::Effective)?;
+
+    Ok(())
 }

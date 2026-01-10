@@ -42,9 +42,25 @@ pub struct Cli {
     #[arg(long)]
     pub try_html: bool,
 
+    /// Pack a directory to stdout as a site tarball.
+    #[arg(long, value_name = "DIR", conflicts_with = "tarball")]
+    pub pack: Option<PathBuf>,
+
+    /// Dump the embedded SDK header to stdout.
+    #[arg(long, conflicts_with_all = ["pack", "tarball"])]
+    pub dump_sdk: bool,
+
     /// Path to the site tarball.
-    #[arg(value_name = "SITE_TAR")]
-    pub tarball: PathBuf,
+    #[arg(
+        value_name = "SITE_TAR",
+        required_unless_present_any = ["pack", "dump_sdk"],
+        conflicts_with = "pack"
+    )]
+    pub tarball: Option<PathBuf>,
+
+    /// Path to a signal file; polled every second, reloads when content changes.
+    #[arg(long, value_name = "FILE")]
+    pub reload_signal_file: Option<PathBuf>,
 
     /// Disable per-request logging.
     #[arg(long)]
@@ -53,4 +69,16 @@ pub struct Cli {
     /// Expect a PROXY protocol v1 header before the first request on each connection.
     #[arg(long)]
     pub enable_proxy_protocol: bool,
+
+    /// Disable Linux network namespace isolation.
+    #[arg(long)]
+    pub disable_ns_isolation: bool,
+
+    /// eBPF async preemption timer interval.
+    #[arg(long, default_value_t = 20, value_parser = must_be_positive)]
+    pub preempt_timer_interval_ms: usize,
+
+    /// Enable io_uring sqpoll with the provided idle timeout.
+    #[arg(long)]
+    pub sqpoll_idle_ms: Option<u32>,
 }

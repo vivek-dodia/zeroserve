@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, path::PathBuf};
+use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use anyhow::{Result, anyhow};
 
@@ -10,11 +10,15 @@ pub struct StaticConfig {
     pub tar_path: PathBuf,
     pub cert_path: Option<PathBuf>,
     pub key_path: Option<PathBuf>,
+    pub reload_signal_file: Option<PathBuf>,
     pub index_file: String,
     pub chunk_size: usize,
     pub try_html: bool,
     pub disable_request_logging: bool,
     pub enable_proxy_protocol: bool,
+    pub disable_ns_isolation: bool,
+    pub preempt_timer_interval: Duration,
+    pub sqpoll_idle_ms: Option<u32>,
 }
 
 impl TryFrom<Cli> for StaticConfig {
@@ -46,17 +50,25 @@ impl TryFrom<Cli> for StaticConfig {
             cli.index
         };
 
+        let tar_path = cli
+            .tarball
+            .ok_or_else(|| anyhow!("SITE_TAR is required unless --pack or --dump-sdk is used"))?;
+
         Ok(Self {
             http_addr,
             tls_addr,
-            tar_path: cli.tarball,
+            tar_path,
             cert_path,
             key_path,
+            reload_signal_file: cli.reload_signal_file,
             index_file,
             chunk_size: cli.chunk_size.max(1024),
             try_html: cli.try_html,
             disable_request_logging: cli.disable_request_logging,
             enable_proxy_protocol: cli.enable_proxy_protocol,
+            disable_ns_isolation: cli.disable_ns_isolation,
+            preempt_timer_interval: Duration::from_millis(cli.preempt_timer_interval_ms as u64),
+            sqpoll_idle_ms: cli.sqpoll_idle_ms,
         })
     }
 }
