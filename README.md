@@ -36,3 +36,15 @@ zeroserve --enable-proxy-protocol site.tar
 # Hot-reload certificate and site tarball
 killall -SIGHUP zeroserve
 ```
+
+## Testing
+
+End-to-end tests live in `testing/` and are written in TypeScript for Deno.
+
+```bash
+# Run all e2e tests
+cd testing
+deno test -A
+```
+
+The scripting tests require `clang` and `llc` to be available on PATH; they are skipped if the toolchain is missing.

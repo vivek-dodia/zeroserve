@@ -12,16 +12,21 @@ use anyhow::{Context, anyhow};
 use async_ebpf::{
     helpers::{Helper, write_cstr},
     program::{
-        GlobalEnv, HelperScope, Program, ProgramEventListener, ProgramLoader, TimesliceConfig,
-        Timeslicer, UnboundProgram,
+        GlobalEnv, HelperScope, PreemptionEnabled, Program, ProgramEventListener, ProgramLoader,
+        ThreadEnv, TimesliceConfig, Timeslicer, UnboundProgram,
     },
 };
 use futures::{
     FutureExt, StreamExt,
     channel::{mpsc, oneshot},
 };
+use http::{
+    Uri,
+    header::{HeaderName, HeaderValue},
+};
 use monoio::fs::File;
 use ulid::Ulid;
+use url::form_urlencoded;
 
 use crate::{logging::async_log, site::Site};
 
@@ -34,14 +39,17 @@ static SCRIPT_HELPERS: &[(&str, Helper)] = &[
     ("zs_req_method", h_req_method),
     ("zs_req_path", h_req_path),
     ("zs_req_uri", h_req_uri),
+    ("zs_req_set_uri", h_req_set_uri),
     ("zs_req_query", h_req_query),
     ("zs_req_scheme", h_req_scheme),
     ("zs_req_peer", h_req_peer),
     ("zs_req_header", h_req_header),
+    ("zs_req_set_header", h_req_set_header),
     ("zs_req_query_param", h_req_query_param),
     ("zs_meta_get", h_meta_get),
     ("zs_meta_set", h_meta_set),
     ("zs_respond", h_respond),
+    ("zs_reverse_proxy", h_reverse_proxy),
 ];
 
 static HELPER_TABLES: &[&[(&str, Helper)]] = &[SCRIPT_HELPERS];
@@ -57,6 +65,8 @@ pub struct ScriptRequest {
     pub peer: String,
     pub headers: HashMap<String, String>,
     pub query_params: HashMap<String, String>,
+    pub(crate) uri_changed: bool,
+    pub(crate) header_changes: HashMap<String, Option<String>>,
 }
 
 impl ScriptRequest {
@@ -68,6 +78,68 @@ impl ScriptRequest {
     fn query_param(&self, name: &str) -> Option<&str> {
         self.query_params.get(name).map(String::as_str)
     }
+
+    fn set_uri(&mut self, uri: &str) -> Result<(), ()> {
+        let uri = uri.trim();
+        if uri.is_empty() {
+            return Err(());
+        }
+        let parsed: Uri = uri.parse().map_err(|_| ())?;
+        let path = parsed.path().to_string();
+        let query = parsed.query().unwrap_or("").to_string();
+        self.uri = uri.to_string();
+        self.path = path;
+        self.query = query.clone();
+        self.query_params = parse_query_params(&query);
+        self.uri_changed = true;
+        Ok(())
+    }
+
+    fn set_header(&mut self, name: &str, value: Option<&str>) -> Result<(), ()> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(());
+        }
+        let name = name.to_ascii_lowercase();
+        if HeaderName::from_bytes(name.as_bytes()).is_err() {
+            return Err(());
+        }
+        match value {
+            Some(value) => {
+                if HeaderValue::from_str(value).is_err() {
+                    return Err(());
+                }
+                let value = value.to_string();
+                self.headers.insert(name.clone(), value.clone());
+                self.header_changes.insert(name, Some(value));
+            }
+            None => {
+                self.headers.remove(&name);
+                self.header_changes.insert(name, None);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn uri_changed(&self) -> bool {
+        self.uri_changed
+    }
+
+    pub(crate) fn header_changes(&self) -> &HashMap<String, Option<String>> {
+        &self.header_changes
+    }
+}
+
+fn parse_query_params(query: &str) -> HashMap<String, String> {
+    let mut query_params = HashMap::new();
+    if !query.is_empty() {
+        for (key, value) in form_urlencoded::parse(query.as_bytes()) {
+            query_params
+                .entry(key.into_owned())
+                .or_insert(value.into_owned());
+        }
+    }
+    query_params
 }
 
 #[derive(Clone, Debug)]
@@ -77,16 +149,30 @@ pub struct ScriptResponse {
     pub content_type: Option<String>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ScriptOutcome {
+    pub request: ScriptRequest,
     pub metadata: HashMap<String, String>,
     pub response: Option<ScriptResponse>,
+    pub reverse_proxy: Option<String>,
+}
+
+impl ScriptOutcome {
+    pub(crate) fn from_request(request: ScriptRequest) -> Self {
+        ScriptOutcome {
+            request,
+            metadata: HashMap::new(),
+            response: None,
+            reverse_proxy: None,
+        }
+    }
 }
 
 struct ScriptExecutionContext {
-    request: Arc<ScriptRequest>,
+    request: ScriptRequest,
     metadata: HashMap<String, String>,
     response: Option<ScriptResponse>,
+    reverse_proxy: Option<String>,
     script_name: String,
     log_buffer: RefCell<Vec<u8>>,
 }
@@ -225,7 +311,7 @@ async fn script_worker(
                         .await;
                         return;
                       },
-                      x = run_request_scripts(&scripts, request, &timeslice, &MonoioTimeslicer) => x,
+                      x = run_request_scripts(t, &scripts, request, &timeslice, &MonoioTimeslicer) => x,
                     };
                     let _ = tx.send(outcome);
                 });
@@ -235,18 +321,21 @@ async fn script_worker(
 }
 
 async fn run_request_scripts(
+    t: ThreadEnv,
     scripts: &[(String, Program)],
     request: ScriptRequest,
     timeslice: &TimesliceConfig,
     timeslicer: &impl Timeslicer,
 ) -> ScriptOutcome {
     if scripts.is_empty() {
-        return ScriptOutcome::default();
+        return ScriptOutcome::from_request(request);
     }
 
-    let request = Arc::new(request);
+    let mut request = request;
     let mut metadata: HashMap<String, String> = HashMap::new();
     let mut response: Option<ScriptResponse> = None;
+    let mut reverse_proxy: Option<String> = None;
+    let preemption = PreemptionEnabled::new(t);
 
     for (name, program) in scripts {
         if !program.has_section(SCRIPT_ENTRYPOINT) {
@@ -254,9 +343,10 @@ async fn run_request_scripts(
         }
 
         let mut ctx = ScriptExecutionContext {
-            request: request.clone(),
+            request,
             metadata,
             response: None,
+            reverse_proxy: None,
             script_name: name.clone(),
             log_buffer: RefCell::new(vec![]),
         };
@@ -268,6 +358,7 @@ async fn run_request_scripts(
                 SCRIPT_ENTRYPOINT,
                 &mut resources,
                 &[],
+                &preemption,
             )
             .await;
         if let Err(err) = run {
@@ -275,13 +366,23 @@ async fn run_request_scripts(
         }
 
         metadata = ctx.metadata;
+        request = ctx.request;
         if let Some(script_response) = ctx.response {
             response = Some(script_response);
             break;
         }
+        if let Some(proxy_url) = ctx.reverse_proxy {
+            reverse_proxy = Some(proxy_url);
+            break;
+        }
     }
 
-    ScriptOutcome { metadata, response }
+    ScriptOutcome {
+        request,
+        metadata,
+        response,
+        reverse_proxy,
+    }
 }
 
 fn with_ectx<R>(
@@ -411,6 +512,21 @@ fn h_req_uri(
     })
 }
 
+fn h_req_set_uri(
+    scope: &async_ebpf::program::HelperScope,
+    uri_ptr: u64,
+    uri_len: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    let uri = read_utf8(scope, uri_ptr, uri_len)?;
+    with_ectx(scope, |ctx| {
+        ctx.request.set_uri(uri)?;
+        Ok(0)
+    })
+}
+
 fn h_req_query(
     scope: &async_ebpf::program::HelperScope,
     out_ptr: u64,
@@ -462,6 +578,26 @@ fn h_req_header(
     with_ectx(scope, |ctx| {
         let value = ctx.request.header(name.trim()).unwrap_or("");
         write_str(scope, out_ptr, out_len, value)
+    })
+}
+
+fn h_req_set_header(
+    scope: &async_ebpf::program::HelperScope,
+    name_ptr: u64,
+    name_len: u64,
+    value_ptr: u64,
+    value_len: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    let name = read_utf8(scope, name_ptr, name_len)?;
+    let value = if value_len == 0 {
+        None
+    } else {
+        Some(read_utf8(scope, value_ptr, value_len)?)
+    };
+    with_ectx(scope, |ctx| {
+        ctx.request.set_header(name, value)?;
+        Ok(0)
     })
 }
 
@@ -544,6 +680,28 @@ fn h_respond(
             body,
             content_type,
         });
+        Ok(0)
+    })
+}
+
+fn h_reverse_proxy(
+    scope: &async_ebpf::program::HelperScope,
+    url_ptr: u64,
+    url_len: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    let url = read_utf8(scope, url_ptr, url_len)?;
+    let url = url.trim();
+    if url.is_empty() {
+        return Err(());
+    }
+    with_ectx(scope, |ctx| {
+        if ctx.response.is_some() || ctx.reverse_proxy.is_some() {
+            return Err(());
+        }
+        ctx.reverse_proxy = Some(url.to_string());
         Ok(0)
     })
 }

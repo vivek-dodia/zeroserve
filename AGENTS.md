@@ -17,13 +17,12 @@
 - Follow standard Rust style and keep modules small and focused; prefer `snake_case` for functions/vars and `CamelCase` for types.
 - Use `cargo fmt` before submitting changes that touch Rust code.
 - Keep CLI flags descriptive and documented in `src/cli.rs`.
+- Keep `docs/user_manual.md` in sync with user-facing behavior and CLI changes.
 
 ## Testing Guidelines
-- No automated test suite is present. Validate changes with targeted manual checks:
-  - Build: `cargo build`
-  - Serve: `cargo run -- --addr 0.0.0.0:8080 site.tar`
-  - Pack: `cargo run -- --pack . > site.tar`
-- If you add tests, include how to run them in this document.
+- End-to-end tests live in `testing/` and run with Deno:
+  - `cd testing && deno test -A`
+- Scripting e2e tests are skipped unless `clang` and `llc` are available on PATH.
 
 ## Security & Configuration Tips
 - TLS expects PEM files; avoid committing real keys. Use local test certs where needed.

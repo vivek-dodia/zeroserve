@@ -2,15 +2,19 @@ use std::{
     cell::RefCell,
     collections::HashMap,
     io::ErrorKind,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs},
     rc::Rc,
     sync::{Arc, Weak},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
-use futures::FutureExt;
-use http::{Method, StatusCode, Uri};
+use futures::{FutureExt, channel::oneshot};
+use http::{
+    Method, StatusCode, Uri,
+    header::{HeaderName, HeaderValue},
+};
 use monoio::{
     fs::File,
     io::{
@@ -21,21 +25,30 @@ use monoio::{
 };
 use monoio_http::{
     common::{
-        body::Body,
+        body::{Body, StreamHint},
         error::HttpError,
         request::{Request, RequestHead},
         response::Response,
     },
     h1::{
-        codec::{decoder::RequestDecoder, encoder::GenericEncoder},
+        BorrowFramedRead,
+        codec::{
+            ClientCodec,
+            decoder::{ChunkedBodyDecoder, FixedBodyDecoder, PayloadDecoder, RequestDecoder},
+            encoder::GenericEncoder,
+        },
         payload::{FixedPayload, Payload},
     },
 };
-use monoio_rustls::TlsError;
+use monoio_rustls::{ClientTlsStream, TlsConnector, TlsError};
+use rayon::ThreadPool;
+use rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
 use ulid::Ulid;
+use url::Url;
 
 use crate::{
     logging::async_log,
+    pool::{self, PoolKey, PooledConnection},
     script::{ScriptOutcome, ScriptRequest, ScriptResponse},
     shared::SharedState,
     site::{Site, TarEntry, guess_mime, normalize_request_path},
@@ -204,10 +217,11 @@ async fn handle_request(
         log_request(request_id, peer, scheme, req.method(), req.uri()).await;
     }
 
-    let (head, body) = req.into_parts();
-    drain_payload(body).await;
+    let (mut head, body) = req.into_parts();
+    let head_only = head.method == Method::HEAD;
 
     let script_request = build_script_request(request_id, &head, peer, scheme);
+    let script_request_fallback = script_request.clone();
     let script_outcome = monoio::select! {
         x = shared.script_runtime.run_request(script_request) => x,
         _ = interrupt => return,
@@ -215,28 +229,45 @@ async fn handle_request(
     let script_outcome = match script_outcome {
         Ok(outcome) => outcome,
         Err(err) => {
-            eprintln!("script runtime failed: {:?}", err);
-            ScriptOutcome::default()
+            async_log(format!("[handle] {}: script runtime: {:?}\n", request_id, err).into_bytes())
+                .await;
+            ScriptOutcome::from_request(script_request_fallback)
         }
     };
 
-    if let Some(response) = script_outcome.response {
-        send_script_response(w, response, head.method == Method::HEAD).await;
+    if let Err(err) = apply_script_request(&mut head, &script_outcome.request) {
+        async_log(
+            format!(
+                "[handle] {}: script request update: {:?}\n",
+                request_id, err
+            )
+            .into_bytes(),
+        )
+        .await;
+    }
+
+    if let Some(proxy_url) = script_outcome.reverse_proxy {
+        if let Err(err) = reverse_proxy_request(&proxy_url, head, body, w, head_only).await {
+            async_log(format!("[handle] {}: reverse proxy: {:?}\n", request_id, err).into_bytes())
+                .await;
+            send_fixed(w, bad_gateway()).await;
+        }
         return;
     }
 
+    if let Some(response) = script_outcome.response {
+        drain_payload(body).await;
+        send_script_response(w, response, head_only).await;
+        return;
+    }
+
+    drain_payload(body).await;
+
     match head.method {
         Method::GET | Method::HEAD => {
-            if serve_static(
-                &head,
-                shared,
-                head.method == Method::HEAD,
-                peer,
-                w,
-                &script_outcome.metadata,
-            )
-            .await
-            .is_none()
+            if serve_static(&head, shared, head_only, peer, w, &script_outcome.metadata)
+                .await
+                .is_none()
             {
                 send_fixed(w, not_found()).await
             }
@@ -251,7 +282,10 @@ async fn send_fixed(w: &mut impl AsyncWriteRent, res: Response<Bytes>) {
         .await;
 }
 
-async fn drain_payload(mut payload: HttpBody) {
+async fn drain_payload<B>(mut payload: B)
+where
+    B: Body<Data = Bytes, Error = HttpError>,
+{
     loop {
         match payload.next_data().await {
             Some(Ok(_)) => continue,
@@ -390,41 +424,30 @@ async fn read_tar_entry(entry: Arc<TarEntry>, site: &Arc<Site>) -> std::io::Resu
 }
 
 fn should_template_replace(content_type: &str, metadata: &HashMap<String, String>) -> bool {
-    !metadata.is_empty() && is_text_mime(content_type)
-}
-
-fn is_text_mime(content_type: &str) -> bool {
-    content_type.starts_with("text/")
-        || matches!(
-            content_type,
-            "application/javascript"
-                | "application/json"
-                | "application/xml"
-                | "application/xhtml+xml"
-                | "image/svg+xml"
-        )
+    !metadata.is_empty()
+        && (content_type == "text/html"
+            || content_type.starts_with("text/html;")
+            || content_type == "application/xml")
 }
 
 fn apply_template(body: &str, metadata: &HashMap<String, String>) -> String {
+    const START_TAG: &str = "<zs-meta>";
+    const END_TAG: &str = "</zs-meta>";
     let mut out = String::with_capacity(body.len());
     let mut rest = body;
-    while let Some(start) = rest.find("{{") {
+    while let Some(start) = rest.find(START_TAG) {
         let (before, after_start) = rest.split_at(start);
         out.push_str(before);
-        let after_start = &after_start[2..];
-        if let Some(end) = after_start.find("}}") {
+        let after_start = &after_start[START_TAG.len()..];
+        if let Some(end) = after_start.find(END_TAG) {
             let raw_key = &after_start[..end];
             let key = raw_key.trim();
             if let Some(value) = metadata.get(key) {
                 out.push_str(value);
-            } else {
-                out.push_str("{{");
-                out.push_str(raw_key);
-                out.push_str("}}");
             }
-            rest = &after_start[end + 2..];
+            rest = &after_start[end + END_TAG.len()..];
         } else {
-            out.push_str("{{");
+            out.push_str(START_TAG);
             out.push_str(after_start);
             rest = "";
             break;
@@ -493,7 +516,41 @@ fn build_script_request(
         peer: peer.to_string(),
         headers,
         query_params,
+        uri_changed: false,
+        header_changes: HashMap::new(),
     }
+}
+
+fn apply_script_request(head: &mut RequestHead, request: &ScriptRequest) -> Result<()> {
+    if request.uri_changed() {
+        let uri: Uri = request
+            .uri
+            .parse()
+            .map_err(|err| anyhow!("invalid script uri: {err}"))?;
+        head.uri = uri;
+    }
+
+    if request.header_changes().is_empty() {
+        return Ok(());
+    }
+
+    for (name, value) in request.header_changes() {
+        let Ok(header_name) = HeaderName::from_bytes(name.as_bytes()) else {
+            continue;
+        };
+        match value {
+            Some(value) => {
+                let Ok(header_value) = HeaderValue::from_str(value) else {
+                    continue;
+                };
+                head.headers.insert(header_name, header_value);
+            }
+            None => {
+                head.headers.remove(&header_name);
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn send_script_response(
@@ -508,8 +565,496 @@ async fn send_script_response(
     send_bytes_response(w, status, &content_type, response.body, head_only).await;
 }
 
+async fn reverse_proxy_request(
+    backend_url: &str,
+    mut head: RequestHead,
+    body: HttpBody,
+    w: &mut impl AsyncWriteRent,
+    head_only: bool,
+) -> Result<()> {
+    let target = match parse_backend_target(backend_url) {
+        Ok(target) => target,
+        Err(err) => {
+            drain_payload(body).await;
+            return Err(err);
+        }
+    };
+    let uri = match build_backend_uri(&target, &head.uri) {
+        Ok(uri) => uri,
+        Err(err) => {
+            drain_payload(body).await;
+            return Err(err);
+        }
+    };
+
+    let mut headers = head.headers;
+    strip_hop_headers(&mut headers);
+    let host_header = target.host_header();
+    let host_header_value = match http::HeaderValue::from_str(&host_header) {
+        Ok(value) => value,
+        Err(_) => {
+            drain_payload(body).await;
+            return Err(anyhow!("invalid backend host header"));
+        }
+    };
+    headers.insert(http::header::HOST, host_header_value);
+
+    head.uri = uri;
+    head.headers = headers;
+    head.version = http::Version::HTTP_11;
+
+    let pool_key = PoolKey::new(
+        target.host.clone(),
+        target.port,
+        matches!(target.scheme, BackendScheme::Https),
+    );
+    let mut conn = match pool::take_connection(&pool_key) {
+        Some(conn) => conn,
+        None => match connect_backend(&target).await {
+            Ok(conn) => conn,
+            Err(err) => {
+                drain_payload(body).await;
+                return Err(err);
+            }
+        },
+    };
+
+    let reuse = match &mut conn {
+        PooledConnection::Http(codec) => proxy_over_codec(codec, head, body, w, head_only).await?,
+        PooledConnection::Https(codec) => proxy_over_codec(codec, head, body, w, head_only).await?,
+    };
+
+    if reuse {
+        pool::return_connection(pool_key, conn);
+    }
+
+    Ok(())
+}
+
+async fn connect_backend(target: &BackendTarget) -> Result<PooledConnection> {
+    thread_local! {
+        static DNS_TP: ThreadPool = rayon::ThreadPoolBuilder::new()
+            .thread_name(|i| format!("dns-tp-{}", i))
+            .num_threads(4).build().unwrap();
+        static DNS_CACHE: RefCell<mini_moka::unsync::Cache<String, Arc<Vec<SocketAddr>>>> =
+            RefCell::new(mini_moka::unsync::CacheBuilder::new(128)
+                .time_to_live(Duration::from_secs(60))
+                .build());
+    }
+    let addr = target.authority();
+    let addr = match DNS_CACHE.with(|x| x.borrow_mut().get(&addr).cloned()) {
+        Some(x) => x,
+        None => {
+            let (tx, rx) = oneshot::channel();
+            DNS_TP.with(|tp| {
+                tp.spawn(move || {
+                    let resolved = addr.to_socket_addrs();
+                    let _ = tx.send((addr, resolved));
+                });
+            });
+            let (k, v) = rx.await?;
+            let v = v
+                .with_context(|| "failed to resolve dns name")?
+                .into_iter()
+                .collect::<Vec<_>>();
+            let v = Arc::new(v);
+            DNS_CACHE.with(|x| x.borrow_mut().insert(k, v.clone()));
+            v
+        }
+    };
+    let stream = TcpStream::connect(&addr[..]).await.and_then(|x| {
+        x.set_nodelay(true)?;
+        Ok(x)
+    });
+    let stream = match stream {
+        Ok(stream) => stream,
+        Err(err) => return Err(anyhow!("failed to connect to backend: {err}")),
+    };
+
+    match target.scheme {
+        BackendScheme::Http => Ok(PooledConnection::Http(ClientCodec::new(stream))),
+        BackendScheme::Https => {
+            let tls_stream = connect_tls(stream, &target.host).await?;
+            Ok(PooledConnection::Https(ClientCodec::new(tls_stream)))
+        }
+    }
+}
+
+async fn connect_tls(stream: TcpStream, host: &str) -> Result<ClientTlsStream<TcpStream>> {
+    let root_store = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let config = ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    let connector = TlsConnector::from(Arc::new(config));
+    let server_name =
+        ServerName::try_from(host.to_string()).map_err(|_| anyhow!("invalid TLS server name"))?;
+    connector
+        .connect(server_name, stream)
+        .await
+        .map_err(|err| anyhow!("TLS handshake failed: {err}"))
+}
+
+async fn proxy_over_codec<IO>(
+    codec: &mut ClientCodec<IO>,
+    head: RequestHead,
+    body: HttpBody,
+    w: &mut impl AsyncWriteRent,
+    head_only: bool,
+) -> Result<bool>
+where
+    IO: AsyncReadRent + AsyncWriteRent,
+{
+    let request = Request::from_parts(head, body);
+    codec
+        .send_and_flush(request)
+        .await
+        .map_err(|err| anyhow!("failed to send proxy request: {err}"))?;
+
+    let response = match codec.next().await {
+        Some(Ok(resp)) => resp,
+        Some(Err(err)) => return Err(anyhow!("failed to read proxy response: {err}")),
+        None => return Err(anyhow!("proxy backend closed without response")),
+    };
+
+    let (resp_head, mut resp_body) = response.into_parts();
+    let status = resp_head.status;
+    let can_reuse = should_reuse_proxy_connection(resp_head.version, &resp_head.headers);
+    let mut headers = resp_head.headers;
+    strip_hop_headers(&mut headers);
+
+    let body_hint = resp_body.hint();
+    let send_body = should_send_proxy_body(status, body_hint, head_only);
+    apply_proxy_response_headers(&mut headers, body_hint, send_body);
+    write_proxy_response_head(w, status, &headers).await?;
+
+    if !send_body {
+        drain_proxy_payload(codec, &mut resp_body).await?;
+        let _ = w.flush().await;
+        return Ok(can_reuse);
+    }
+
+    match &mut resp_body {
+        PayloadDecoder::None => {}
+        PayloadDecoder::Fixed(decoder) => forward_fixed_body(w, codec, decoder).await?,
+        PayloadDecoder::Streamed(decoder) => forward_chunked_body(w, codec, decoder).await?,
+    }
+
+    let _ = w.flush().await;
+    Ok(can_reuse)
+}
+
+fn should_reuse_proxy_connection(version: http::Version, headers: &http::HeaderMap) -> bool {
+    if version != http::Version::HTTP_11 {
+        return false;
+    }
+    !connection_has_close(headers)
+}
+
+fn connection_has_close(headers: &http::HeaderMap) -> bool {
+    headers
+        .get(http::header::CONNECTION)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("close"))
+        })
+        .unwrap_or(false)
+}
+
+fn should_send_proxy_body(status: StatusCode, body_hint: StreamHint, head_only: bool) -> bool {
+    if head_only {
+        return false;
+    }
+    if matches!(status, StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED)
+        || status.is_informational()
+    {
+        return false;
+    }
+    !matches!(body_hint, StreamHint::None)
+}
+
+fn apply_proxy_response_headers(
+    headers: &mut http::HeaderMap,
+    body_hint: StreamHint,
+    send_body: bool,
+) {
+    if !send_body {
+        headers.remove(http::header::TRANSFER_ENCODING);
+        return;
+    }
+
+    match body_hint {
+        StreamHint::None => {
+            headers.remove(http::header::CONTENT_LENGTH);
+            headers.remove(http::header::TRANSFER_ENCODING);
+        }
+        StreamHint::Fixed => {
+            headers.remove(http::header::TRANSFER_ENCODING);
+        }
+        StreamHint::Stream => {
+            headers.remove(http::header::CONTENT_LENGTH);
+            headers.insert(
+                http::header::TRANSFER_ENCODING,
+                http::HeaderValue::from_static("chunked"),
+            );
+        }
+    }
+}
+
+async fn write_proxy_response_head(
+    w: &mut impl AsyncWriteRent,
+    status: StatusCode,
+    headers: &http::HeaderMap,
+) -> Result<()> {
+    let reason = status.canonical_reason().unwrap_or("");
+    let mut buf = Vec::new();
+    buf.extend_from_slice(format!("HTTP/1.1 {} {}\r\n", status.as_u16(), reason).as_bytes());
+    for (name, value) in headers.iter() {
+        buf.extend_from_slice(name.as_str().as_bytes());
+        buf.extend_from_slice(b": ");
+        buf.extend_from_slice(value.as_bytes());
+        buf.extend_from_slice(b"\r\n");
+    }
+    buf.extend_from_slice(b"\r\n");
+    let (res, _) = w.write_all(buf).await;
+    res.map_err(|err| anyhow!("failed to write proxy response head: {err}"))?;
+    Ok(())
+}
+
+async fn drain_proxy_payload<IO>(
+    codec: &mut ClientCodec<IO>,
+    body: &mut PayloadDecoder<FixedBodyDecoder, ChunkedBodyDecoder>,
+) -> Result<()>
+where
+    IO: AsyncReadRent + AsyncWriteRent,
+{
+    match body {
+        PayloadDecoder::None => Ok(()),
+        PayloadDecoder::Fixed(decoder) => {
+            read_fixed_chunk(codec, decoder).await?;
+            Ok(())
+        }
+        PayloadDecoder::Streamed(decoder) => loop {
+            match codec.framed_mut().next_with(decoder).await {
+                None => return Err(anyhow!("proxy body read failed: unexpected eof")),
+                Some(Ok(Some(_))) => continue,
+                Some(Ok(None)) => return Ok(()),
+                Some(Err(err)) => return Err(anyhow!("proxy body read failed: {err}")),
+            }
+        },
+    }
+}
+
+async fn read_fixed_chunk<IO>(
+    codec: &mut ClientCodec<IO>,
+    decoder: &mut FixedBodyDecoder,
+) -> Result<Bytes>
+where
+    IO: AsyncReadRent + AsyncWriteRent,
+{
+    match codec.framed_mut().next_with(decoder).await {
+        None => Err(anyhow!("proxy body read failed: unexpected eof")),
+        Some(Ok(chunk)) => Ok(chunk),
+        Some(Err(err)) => Err(anyhow!("proxy body read failed: {err}")),
+    }
+}
+
+async fn forward_fixed_body<IO>(
+    w: &mut impl AsyncWriteRent,
+    codec: &mut ClientCodec<IO>,
+    decoder: &mut FixedBodyDecoder,
+) -> Result<()>
+where
+    IO: AsyncReadRent + AsyncWriteRent,
+{
+    let data = read_fixed_chunk(codec, decoder).await?;
+    let (res, _) = w.write_all(data).await;
+    res.map_err(|err| anyhow!("failed to write proxy body: {err}"))?;
+    Ok(())
+}
+
+async fn forward_chunked_body<IO>(
+    w: &mut impl AsyncWriteRent,
+    codec: &mut ClientCodec<IO>,
+    decoder: &mut ChunkedBodyDecoder,
+) -> Result<()>
+where
+    IO: AsyncReadRent + AsyncWriteRent,
+{
+    loop {
+        match codec.framed_mut().next_with(decoder).await {
+            None => return Err(anyhow!("proxy body read failed: unexpected eof")),
+            Some(Ok(Some(data))) => {
+                if data.is_empty() {
+                    continue;
+                }
+                let header = format!("{:X}\r\n", data.len());
+                let (res, _) = w.write_all(header.into_bytes()).await;
+                res.map_err(|err| anyhow!("failed to write proxy body header: {err}"))?;
+                let (res, _) = w.write_all(data).await;
+                res.map_err(|err| anyhow!("failed to write proxy body: {err}"))?;
+                let (res, _) = w.write_all(b"\r\n".to_vec()).await;
+                res.map_err(|err| anyhow!("failed to write proxy body trailer: {err}"))?;
+            }
+            Some(Ok(None)) => break,
+            Some(Err(err)) => return Err(anyhow!("proxy body read failed: {err}")),
+        }
+    }
+    let (res, _) = w.write_all(b"0\r\n\r\n".to_vec()).await;
+    res.map_err(|err| anyhow!("failed to write proxy body end: {err}"))?;
+    Ok(())
+}
+
+fn strip_hop_headers(headers: &mut http::HeaderMap) {
+    let connection_values = headers
+        .get(http::header::CONNECTION)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_string());
+    if let Some(value) = connection_values {
+        for name in value.split(',').map(|name| name.trim()) {
+            if !name.is_empty() {
+                let name = name.to_ascii_lowercase();
+                headers.remove(name.as_str());
+            }
+        }
+    }
+
+    for name in [
+        "connection",
+        "proxy-connection",
+        "keep-alive",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    ] {
+        headers.remove(name);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BackendScheme {
+    Http,
+    Https,
+}
+
+impl BackendScheme {
+    fn default_port(self) -> u16 {
+        match self {
+            BackendScheme::Http => 80,
+            BackendScheme::Https => 443,
+        }
+    }
+}
+
+struct BackendTarget {
+    scheme: BackendScheme,
+    host: String,
+    is_ipv6: bool,
+    port: u16,
+    base_path: String,
+    base_query: Option<String>,
+}
+
+impl BackendTarget {
+    fn authority(&self) -> String {
+        format_host_port(&self.host, self.port, self.is_ipv6)
+    }
+
+    fn host_header(&self) -> String {
+        if self.port == self.scheme.default_port() {
+            if self.is_ipv6 {
+                format!("[{}]", self.host)
+            } else {
+                self.host.clone()
+            }
+        } else {
+            self.authority()
+        }
+    }
+}
+
+fn parse_backend_target(raw: &str) -> Result<BackendTarget> {
+    let url = Url::parse(raw).map_err(|err| anyhow!("invalid backend url: {err}"))?;
+    let scheme = match url.scheme() {
+        "http" => BackendScheme::Http,
+        "https" => BackendScheme::Https,
+        other => return Err(anyhow!("unsupported backend scheme: {other}")),
+    };
+    let host = url
+        .host()
+        .ok_or_else(|| anyhow!("backend url missing host"))?;
+    let (host, is_ipv6) = match host {
+        url::Host::Domain(name) => (name.to_string(), false),
+        url::Host::Ipv4(addr) => (addr.to_string(), false),
+        url::Host::Ipv6(addr) => (addr.to_string(), true),
+    };
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| anyhow!("backend url missing port"))?;
+    let base_path = url.path().to_string();
+    let base_query = url.query().map(|q| q.to_string());
+
+    Ok(BackendTarget {
+        scheme,
+        host,
+        is_ipv6,
+        port,
+        base_path,
+        base_query,
+    })
+}
+
+fn build_backend_uri(target: &BackendTarget, req_uri: &Uri) -> Result<Uri> {
+    let req_path = req_uri.path();
+    let base_path = &target.base_path;
+    let path = join_paths(base_path, req_path);
+    let query = merge_queries(target.base_query.as_deref(), req_uri.query());
+    let mut out = path;
+    if let Some(query) = query {
+        out.push('?');
+        out.push_str(&query);
+    }
+    out.parse()
+        .map_err(|err| anyhow!("invalid proxy path: {err}"))
+}
+
+fn join_paths(base: &str, path: &str) -> String {
+    let base = base.trim_end_matches('/');
+    let path = if path.is_empty() { "/" } else { path };
+    if base.is_empty() || base == "/" {
+        path.to_string()
+    } else {
+        format!("{}/{}", base, path.trim_start_matches('/'))
+    }
+}
+
+fn merge_queries(base: Option<&str>, extra: Option<&str>) -> Option<String> {
+    match (base, extra) {
+        (Some(base), Some(extra)) if !base.is_empty() && !extra.is_empty() => {
+            Some(format!("{base}&{extra}"))
+        }
+        (Some(base), _) if !base.is_empty() => Some(base.to_string()),
+        (_, Some(extra)) if !extra.is_empty() => Some(extra.to_string()),
+        _ => None,
+    }
+}
+
+fn format_host_port(host: &str, port: u16, is_ipv6: bool) -> String {
+    if is_ipv6 {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
 fn not_found() -> Response<Bytes> {
     text_response(StatusCode::NOT_FOUND, "Not Found")
+}
+
+fn bad_gateway() -> Response<Bytes> {
+    text_response(StatusCode::BAD_GATEWAY, "Bad Gateway")
 }
 
 fn method_not_allowed() -> Response<Bytes> {

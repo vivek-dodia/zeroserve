@@ -70,12 +70,16 @@ pub struct Cli {
     #[arg(long)]
     pub enable_proxy_protocol: bool,
 
-    /// Disable Linux network namespace isolation.
+    /// Disable Linux namespace isolation.
     #[arg(long)]
     pub disable_ns_isolation: bool,
 
+    /// Enable Linux network namespace isolation.
+    #[arg(long, conflicts_with = "disable_ns_isolation")]
+    pub enable_netns_isolation: bool,
+
     /// eBPF async preemption timer interval.
-    #[arg(long, default_value_t = 20, value_parser = must_be_positive)]
+    #[arg(long, default_value_t = 2, value_parser = must_be_positive)]
     pub preempt_timer_interval_ms: usize,
 
     /// Enable io_uring sqpoll with the provided idle timeout.

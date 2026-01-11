@@ -17,6 +17,7 @@ pub struct StaticConfig {
     pub disable_request_logging: bool,
     pub enable_proxy_protocol: bool,
     pub disable_ns_isolation: bool,
+    pub enable_netns_isolation: bool,
     pub preempt_timer_interval: Duration,
     pub sqpoll_idle_ms: Option<u32>,
 }
@@ -69,6 +70,7 @@ impl TryFrom<Cli> for StaticConfig {
             disable_ns_isolation: cli.disable_ns_isolation,
             preempt_timer_interval: Duration::from_millis(cli.preempt_timer_interval_ms as u64),
             sqpoll_idle_ms: cli.sqpoll_idle_ms,
+            enable_netns_isolation: cli.enable_netns_isolation,
         })
     }
 }

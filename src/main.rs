@@ -2,6 +2,7 @@ mod cli;
 mod config;
 mod logging;
 mod pack;
+mod pool;
 mod reload;
 mod script;
 mod server;
@@ -17,6 +18,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use landlock::{Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr};
 use monoio::{IoUringDriver, RuntimeBuilder};
+use nix::mount::MsFlags;
 use rustls::crypto::aws_lc_rs;
 
 use crate::{
@@ -52,6 +54,10 @@ fn main() -> Result<()> {
     }
     let config = Arc::new(StaticConfig::try_from(args)?);
 
+    let fdlimit =
+        rlimit::increase_nofile_limit(1048576).with_context(|| "failed to raise fd limit")?;
+    eprintln!("fd limit {}", fdlimit);
+
     let http_listener = TcpListener::bind(&config.http_addr)
         .with_context(|| format!("failed to bind HTTP listener on {}", config.http_addr))?;
     let tls_listener = if let Some(x) = &config.tls_addr {
@@ -64,13 +70,40 @@ fn main() -> Result<()> {
     };
 
     if !config.disable_ns_isolation {
-        setup_ns_isolation().with_context(
+        setup_ns_isolation(&config).with_context(
             || "failed to set up namespace isolation (set --disable-ns-isolation to disable)",
         )?;
-        eprintln!("enabled namespace isolation");
+
+        let resolv_conf = std::fs::read("/etc/resolv.conf").ok();
+
+        nix::mount::mount(
+            None::<&str>,
+            "/etc",
+            Some("tmpfs"),
+            MsFlags::empty(),
+            None::<&str>,
+        )
+        .with_context(|| "failed to mount virtual /etc")?;
+
+        if let Some(x) = &resolv_conf {
+            std::fs::write("/etc/resolv.conf", x)
+                .with_context(|| "failed to write /etc/resolv.conf in tmpfs")?;
+        }
 
         drop_all_capabilities().with_context(|| "failed to drop capabilities")?;
-        eprintln!("dropped capabilities");
+
+        rlimit::Resource::NPROC
+            .set(1024, 1024)
+            .with_context(|| "failed to restrict nproc")?;
+
+        eprintln!(
+            "isolation: ns_user=y, ns_net={}, ns_mount=y; caps, nproc",
+            if config.enable_netns_isolation {
+                "y"
+            } else {
+                "n"
+            }
+        );
     }
 
     setup_landlock(&config).with_context(|| "failed to setup landlock")?;
@@ -143,6 +176,9 @@ fn setup_landlock(config: &StaticConfig) -> anyhow::Result<()> {
             PathFd::new(&config.tar_path).with_context(|| "failed to open tar_path")?,
             access_read,
         ))?;
+    if let Ok(x) = PathFd::new("/etc/resolv.conf") {
+        ruleset = ruleset.add_rule(PathBeneath::new(x, access_read))?;
+    }
 
     if let Some(x) = &config.cert_path {
         ruleset = ruleset.add_rule(PathBeneath::new(
@@ -168,15 +204,17 @@ fn setup_landlock(config: &StaticConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn setup_ns_isolation() -> anyhow::Result<()> {
+fn setup_ns_isolation(config: &StaticConfig) -> anyhow::Result<()> {
     unsafe {
         let uid = libc::getuid();
         let gid = libc::getgid();
-        if uid == 0 {
-            anyhow::bail!("cannot run with uid 0");
+
+        let mut flags = libc::CLONE_NEWUSER | libc::CLONE_NEWNS;
+        if config.enable_netns_isolation {
+            flags |= libc::CLONE_NEWNET;
         }
 
-        if libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET | libc::CLONE_NEWNS) != 0 {
+        if libc::unshare(flags) != 0 {
             return Err(anyhow::Error::from(std::io::Error::last_os_error()).context("unshare"));
         }
         std::fs::write("/proc/self/uid_map", format!("0 {} 1\n", uid))
