@@ -56,6 +56,7 @@ static SCRIPT_HELPERS: &[(&str, Helper)] = &[
     ("zs_memset", h_memset),
     ("zs_json_parse", h_json_parse),
     ("zs_load_static_json", h_load_static_json),
+    ("zs_load_file_metadata", h_load_file_metadata),
     ("zs_json_reset", h_json_reset),
     ("zs_json_get", h_json_get),
     ("zs_json_array_get", h_json_array_get),
@@ -719,6 +720,34 @@ fn h_load_static_json(
         }
     });
     Ok(0)
+}
+
+fn h_load_file_metadata(
+    scope: &async_ebpf::program::HelperScope,
+    path_ptr: u64,
+    path_len: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    let path = match read_utf8(scope, path_ptr, path_len) {
+        Ok(path) if !path.is_empty() => path.to_string(),
+        _ => return Ok(-1i64 as u64),
+    };
+    with_ectx(scope, |ctx| {
+        let entry = match ctx.site.entries.get(&path) {
+            Some(entry) => entry,
+            None => return Ok(-1i64 as u64),
+        };
+        let json = serde_json::json!({
+            "size": entry.size,
+            "etag": entry.etag,
+            "mtime": entry.mtime,
+        });
+        ctx.alloc_memory_footprint(estimate_json_memory_usage(&json) as u64)?;
+        let r = JsonRef::new(json);
+        ctx.alloc_extobj(r)
+    })
 }
 
 fn h_json_reset(

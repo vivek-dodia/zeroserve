@@ -44,6 +44,8 @@
 - `zs_load_static_json(path, path_len)` reads the static file at `path` in the tarball and
   parses JSON, returning a handle (-1 if missing or invalid JSON). The path is used verbatim
   (no normalization, index fallback, or `.html` try).
+- `zs_load_file_metadata(path, path_len)` returns a JSON handle for a tarball entry with
+  `{"size":...,"etag":...,"mtime":...}` (-1 if missing). The path is used verbatim.
 - `zs_json_reset(handle)` resets a handle back to the document root.
 - `zs_json_get(handle, key, key_len)` reads an object key and returns a handle
   (-1 if missing, non-object, or invalid UTF-8 key).

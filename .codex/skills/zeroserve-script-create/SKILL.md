@@ -71,6 +71,8 @@ zeroserve --dump-sdk > zeroserve.h
      `zs_json_read_*`, then free handles with `zs_object_free` (handle table is limited).
    - To parse a static JSON file from the tarball, call `zs_load_static_json(path, path_len)`
      and treat the returned handle like any other JSON handle.
+   - To read tarball entry metadata as JSON, call `zs_load_file_metadata(path, path_len)`
+     and access `size`, `etag`, and `mtime`.
    - For response headers, set metadata keys `zs.response.header.<name>`.
    - Call `zs_respond` or `zs_reverse_proxy` to stop later scripts.
 4. Validate eBPF constraints

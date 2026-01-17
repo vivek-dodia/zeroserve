@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs::File as StdFile,
+    io::Read,
     path::Path,
     sync::Arc,
 };
@@ -21,6 +22,8 @@ pub struct TarEntry {
     pub path: String,
     pub offset: u64,
     pub size: u64,
+    pub etag: String,
+    pub mtime: u64,
 }
 
 impl Site {
@@ -38,7 +41,7 @@ impl Site {
             .entries()
             .context("failed to iterate over tarball entries")?;
         for entry_res in iter {
-            let entry = entry_res.context("unable to decode tar entry")?;
+            let mut entry = entry_res.context("unable to decode tar entry")?;
             let entry_type = entry.header().entry_type();
             let raw_path = entry.path().context("invalid tar entry path")?;
             let normalized = normalize_tar_path(raw_path.to_string_lossy().as_ref());
@@ -47,10 +50,17 @@ impl Site {
             }
             match entry_type {
                 EntryType::Regular | EntryType::Continuous | EntryType::GNUSparse => {
+                    let offset = entry.raw_file_position();
+                    let size = entry.size();
+                    let etag = compute_entry_etag(&mut entry)
+                        .with_context(|| format!("failed to hash tar entry {}", normalized))?;
+                    let mtime = entry.header().mtime().unwrap_or(0);
                     let arc_entry = Arc::new(TarEntry {
                         path: normalized.clone(),
-                        offset: entry.raw_file_position(),
-                        size: entry.size(),
+                        offset,
+                        size,
+                        etag,
+                        mtime,
                     });
                     entries.insert(normalized.clone(), arc_entry);
                     mark_parents(&normalized, &mut directories);
@@ -242,4 +252,30 @@ fn trim_trailing_slash(path: &str) -> &str {
 
 pub fn normalize_tar_path(path: &str) -> String {
     path.trim_start_matches("./").trim_matches('/').to_string()
+}
+
+fn compute_entry_etag<R: Read>(entry: &mut tar::Entry<R>) -> Result<String> {
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = entry
+            .read(&mut buf)
+            .context("failed to read tar entry for etag")?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let digest = hasher.finalize();
+    Ok(hex_encode_prefix(&digest.as_bytes()[..16]))
+}
+
+fn hex_encode_prefix(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }

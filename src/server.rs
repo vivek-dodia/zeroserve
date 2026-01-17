@@ -416,7 +416,13 @@ async fn serve_static(
         return Some(());
     }
 
+    if if_none_match_matches(&head.headers, &entry.etag) {
+        send_not_modified(w, &entry.etag, metadata).await;
+        return Some(());
+    }
+
     let mut headers = build_base_headers(entry.size, mime);
+    headers.insert(http::header::ETAG, etag_header_value(&entry.etag));
     headers.insert(
         http::header::ACCEPT_RANGES,
         http::HeaderValue::from_static("bytes"),
@@ -566,6 +572,40 @@ fn apply_metadata_response_headers(
     }
 }
 
+fn if_none_match_matches(headers: &http::HeaderMap, etag: &str) -> bool {
+    let value = match headers.get(http::header::IF_NONE_MATCH) {
+        Some(value) => value,
+        None => return false,
+    };
+    let value = match value.to_str() {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    if value.trim() == "*" {
+        return true;
+    }
+    let quoted = format!("\"{etag}\"");
+    for part in value.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let part = part.strip_prefix("W/").unwrap_or(part).trim();
+        if part == etag || part == quoted {
+            return true;
+        }
+    }
+    false
+}
+
+fn etag_header_value(etag: &str) -> HeaderValue {
+    let mut value = String::with_capacity(etag.len() + 2);
+    value.push('"');
+    value.push_str(etag);
+    value.push('"');
+    HeaderValue::from_str(&value).unwrap_or_else(|_| HeaderValue::from_static("\"\""))
+}
+
 async fn send_bytes_response(
     w: &mut impl AsyncWriteRent,
     status: StatusCode,
@@ -580,6 +620,23 @@ async fn send_bytes_response(
     if !head_only {
         let _ = w.write_all(body).await;
     }
+    let _ = w.flush().await;
+}
+
+async fn send_not_modified(
+    w: &mut impl AsyncWriteRent,
+    etag: &str,
+    metadata: &HashMap<String, String>,
+) {
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::SERVER,
+        HeaderValue::from_static(crate::SERVER_HEADER),
+    );
+    headers.insert(http::header::ETAG, etag_header_value(etag));
+    headers.insert(http::header::CONTENT_LENGTH, HeaderValue::from_static("0"));
+    apply_metadata_response_headers(&mut headers, metadata);
+    let _ = write_response_head(w, StatusCode::NOT_MODIFIED, &headers).await;
     let _ = w.flush().await;
 }
 
@@ -1161,10 +1218,6 @@ fn format_host_port(host: &str, port: u16, is_ipv6: bool) -> String {
 
 fn not_found() -> Response<Bytes> {
     text_response(StatusCode::NOT_FOUND, "Not Found")
-}
-
-fn bad_gateway() -> Response<Bytes> {
-    text_response(StatusCode::BAD_GATEWAY, "Bad Gateway")
 }
 
 fn method_not_allowed() -> Response<Bytes> {

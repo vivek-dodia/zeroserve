@@ -184,6 +184,8 @@ JSON parsing:
 - `zs_load_static_json(path, path_len)` reads the static file at `path` in the tarball,
   parses JSON, and returns a handle (-1 if missing or invalid JSON). The path is used
   verbatim (no normalization, index fallback, or `.html` try).
+- `zs_load_file_metadata(path, path_len)` returns a JSON handle for a tarball entry
+  with `{"size":...,"etag":...,"mtime":...}` (-1 if missing). The path is used verbatim.
 - `zs_json_reset(json)` resets a handle back to the document root.
 - `zs_json_get(json, key, key_len)` reads an object key and returns a handle (-1 if missing).
 - `zs_json_array_get(handle, array_index)` takes an array index and returns a handle
@@ -289,6 +291,8 @@ Only `http` and `https` backends are supported.
 - `--disable-ns-isolation` and `--enable-netns-isolation` are Linux-specific
   isolation controls; leave them default unless you know you need them.
 - Long-running scripts are throttled; keep scripts fast and avoid busy loops.
+- Static file responses include an `ETag` based on a Blake3 hash prefix; matching
+  `If-None-Match` requests receive `304 Not Modified`.
 
 ## Troubleshooting
 

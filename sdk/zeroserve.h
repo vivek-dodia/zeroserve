@@ -47,6 +47,7 @@ extern zs_s64 zs_base64_decode_in_place(void *buf, zs_u64 buf_len,
 
 extern zs_s64 zs_json_parse(const void *data, zs_u64 data_len);
 extern zs_s64 zs_load_static_json(const char *path, zs_u64 path_len);
+extern zs_s64 zs_load_file_metadata(const char *path, zs_u64 path_len);
 extern zs_s64 zs_json_reset(zs_u64 json);
 extern zs_s64 zs_json_get(zs_u64 json, const char *key, zs_u64 key_len);
 extern zs_s64 zs_json_array_get(zs_u64 json, zs_u64 array_index);

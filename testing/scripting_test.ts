@@ -572,10 +572,13 @@ Deno.test({
 
             const dataDir = join(siteDir, "data");
             await Deno.mkdir(dataDir, { recursive: true });
-            await Deno.writeTextFile(
-                join(dataDir, "config.json"),
-                '{"name":"Ada","enabled":true,"count":3}',
-            );
+            const configJson = '{"name":"Ada","enabled":true,"count":3}';
+            const configPath = join(dataDir, "config.json");
+            await Deno.writeTextFile(configPath, configJson);
+            const expectedMtime = 1_700_000_000;
+            const expectedMtimeDate = new Date(expectedMtime * 1000);
+            await Deno.utime(configPath, expectedMtimeDate, expectedMtimeDate);
+            const expectedSize = encoder.encode(configJson).length;
 
             const scriptsDir = join(siteDir, ".zeroserve", "scripts");
             await Deno.mkdir(scriptsDir, { recursive: true });
@@ -588,6 +591,62 @@ zs_u64 entry(void) {
   zs_req_path(path, sizeof(path));
   if (zs_strcmp(path, "/static-json") != 0) {
     return 0;
+  }
+
+  zs_s64 bad_meta = zs_load_file_metadata(ZS_STR("/data/config.json"));
+  if (bad_meta != -1) {
+    zs_object_free(bad_meta);
+    zs_respond(500, ZS_STR("meta path normalization\n"));
+    return 0;
+  }
+
+  zs_s64 meta = zs_load_file_metadata(ZS_STR("data/config.json"));
+  if (meta == -1) {
+    zs_respond(500, ZS_STR("meta load failed\n"));
+    return 0;
+  }
+
+  zs_s64 size_h = zs_json_get(meta, ZS_STR("size"));
+  if (size_h == -1) {
+    zs_respond(500, ZS_STR("missing size\n"));
+    return 0;
+  }
+  zs_s64 size = 0;
+  zs_s64 size_len = zs_json_read_i64(size_h, &size, sizeof(size));
+  if (size_len != (zs_s64)sizeof(size) || size != ${expectedSize}) {
+    zs_respond(500, ZS_STR("bad size\n"));
+    return 0;
+  }
+
+  zs_s64 mtime_h = zs_json_get(meta, ZS_STR("mtime"));
+  if (mtime_h == -1) {
+    zs_respond(500, ZS_STR("missing mtime\n"));
+    return 0;
+  }
+  zs_s64 mtime = 0;
+  zs_s64 mtime_len = zs_json_read_i64(mtime_h, &mtime, sizeof(mtime));
+  if (mtime_len != (zs_s64)sizeof(mtime) || mtime != ${expectedMtime}) {
+    zs_respond(500, ZS_STR("bad mtime\n"));
+    return 0;
+  }
+
+  zs_s64 etag_h = zs_json_get(meta, ZS_STR("etag"));
+  if (etag_h == -1) {
+    zs_respond(500, ZS_STR("missing etag\n"));
+    return 0;
+  }
+  char etag[64];
+  zs_s64 etag_len = zs_json_read_string(etag_h, etag, sizeof(etag));
+  if (etag_len != 32) {
+    zs_respond(500, ZS_STR("bad etag length\n"));
+    return 0;
+  }
+  for (int i = 0; i < 32; i++) {
+    char c = etag[i];
+    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+      zs_respond(500, ZS_STR("bad etag chars\n"));
+      return 0;
+    }
   }
 
   zs_s64 bad = zs_load_static_json(ZS_STR("/data/config.json"));
@@ -643,6 +702,10 @@ zs_u64 entry(void) {
   zs_object_free(enabled_h);
   zs_object_free(count_h);
   zs_object_free(root);
+  zs_object_free(size_h);
+  zs_object_free(mtime_h);
+  zs_object_free(etag_h);
+  zs_object_free(meta);
 
   zs_respond(200, ZS_STR("ok\n"));
   return 0;
