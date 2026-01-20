@@ -26,6 +26,7 @@ use monoio::{IoUringDriver, RuntimeBuilder};
 use nix::mount::MsFlags;
 use rustls::crypto::aws_lc_rs;
 
+use crate::reload::SighupBlocked;
 use crate::{
     cli::Cli,
     config::StaticConfig,
@@ -114,6 +115,9 @@ fn main() -> Result<()> {
     setup_landlock(&config).with_context(|| "failed to setup landlock")?;
     eprintln!("enabled landlock");
 
+    // Block SIGHUP early before spawning any threads
+    let sighup_blocked = SighupBlocked::new();
+
     let site = Arc::new(Site::load(&config.tar_path)?);
     eprintln!(
         "loaded {} entries from {} ({} bytes)",
@@ -163,7 +167,7 @@ fn main() -> Result<()> {
                 http_listener,
                 tls_listener,
             ));
-            start_reload_thread(shared.clone(), script_runtime.clone())?;
+            start_reload_thread(shared.clone(), script_runtime.clone(), sighup_blocked)?;
 
             amain(shared, script_runtime).await
         })

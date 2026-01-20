@@ -16,7 +16,6 @@ Zero-config, fast `io_uring`-based HTTPS server.
 - `clap`: Argument parser (use derive macro)
 - `monoio-rustls`: TLS server
 - `tar`: Tarball handling
-- `signal-hook`: Signal handling
 
 ## Usage
 

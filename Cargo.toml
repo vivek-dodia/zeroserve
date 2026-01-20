@@ -42,7 +42,6 @@ ulid = "1"
 url = "2"
 webpki-roots = "0.26"
 moka = { version = "0.12", features = ["future"] }
-signal-hook = "0.3"
 tar = "0.4"
 
 [patch.crates-io]
