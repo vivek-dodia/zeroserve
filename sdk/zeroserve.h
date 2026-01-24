@@ -26,6 +26,13 @@ typedef long ssize_t;
 #define ZS_BASE64_URL 2
 #define ZS_BASE64_URL_NO_PAD 3
 
+#define ZS_JSON_NULL 0
+#define ZS_JSON_BOOL 1
+#define ZS_JSON_NUMBER 2
+#define ZS_JSON_STRING 3
+#define ZS_JSON_ARRAY 4
+#define ZS_JSON_OBJECT 5
+
 typedef uint64_t zs_u64;
 typedef int64_t zs_s64;
 typedef uint32_t zs_u32;
@@ -37,7 +44,11 @@ typedef int8_t zs_s8;
 
 extern zs_s64 zs_log(const char *msg, zs_u64 len);
 extern zs_u64 zs_now_ms(void);
+extern zs_s64 zs_env_get(const char *name, zs_u64 name_len, char *out,
+                         zs_u64 out_len);
 extern zs_s64 zs_getrandom(void *out, zs_u64 out_len);
+extern zs_s64 zs_sha256(const void *data, zs_u64 data_len, void *out,
+                        zs_u64 out_len);
 extern zs_s64 zs_hmac_sha256(const void *key, zs_u64 key_len, const void *msg,
                              zs_u64 msg_len, void *out);
 extern zs_s64 zs_base64_encode(const void *data, zs_u64 data_len, void *out,
@@ -55,6 +66,25 @@ extern zs_s64 zs_json_read_string(zs_u64 json, char *out, zs_u64 out_len);
 extern zs_s64 zs_json_read_i64(zs_u64 json, void *out, zs_u64 out_len);
 extern zs_s64 zs_json_read_bool(zs_u64 json, void *out, zs_u64 out_len);
 extern zs_s64 zs_object_free(zs_u64 idx);
+
+extern zs_s64 zs_json_new_object(void);
+extern zs_s64 zs_json_new_array(void);
+extern zs_s64 zs_json_clone(zs_u64 json);
+extern zs_s64 zs_json_len(zs_u64 json);
+extern zs_s64 zs_json_type(zs_u64 json);
+extern zs_s64 zs_json_set(zs_u64 json, const char *key, zs_u64 key_len,
+                          zs_u64 value_json);
+extern zs_s64 zs_json_remove(zs_u64 json, const char *key, zs_u64 key_len);
+extern zs_s64 zs_json_array_push(zs_u64 json, zs_u64 value_json);
+extern zs_s64 zs_json_array_set(zs_u64 json, zs_u64 index, zs_u64 value_json);
+extern zs_s64 zs_json_set_string(zs_u64 json, const char *value,
+                                 zs_u64 value_len);
+extern zs_s64 zs_json_set_i64(zs_u64 json, zs_s64 value);
+extern zs_s64 zs_json_set_bool(zs_u64 json, zs_u64 value);
+extern zs_s64 zs_json_set_null(zs_u64 json);
+extern zs_s64 zs_json_respond(zs_u64 status, zs_u64 json);
+
+extern zs_s64 zs_req_body_json(void);
 
 extern zs_s64 zs_req_method(char *out, zs_u64 out_len);
 extern zs_s64 zs_req_path(char *out, zs_u64 out_len);

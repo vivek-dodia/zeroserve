@@ -68,6 +68,10 @@ Key options:
 - `--index <NAME>`: Default document for directories (default `index.html`).
 - `--try-html`: Try `<path>.html` when a request path is missing.
 - `--chunk-size <BYTES>`: Streaming chunk size for tar reads (default 65536).
+- `--max-buffered-body-size-kb <KB>`: Maximum request body size in KB for script
+  body reads via `zs_req_body_json` (default 256).
+- `--max-request-external-memory-footprint-kb <KB>`: Maximum external memory
+  footprint in KB per request for scripts (default 256).
 - `--reload-signal-file <FILE>`: Poll a file and reload when its contents change.
 - `--disable-request-logging`: Turn off per-request logs.
 - `--enable-proxy-protocol`: Expect PROXY protocol v1 on each new connection.
@@ -173,11 +177,13 @@ Logging and time:
 
 - `zs_log(msg, len)`
 - `zs_now_ms()` returns milliseconds since the Unix epoch.
+- `zs_env_get(name, name_len, out, out_len)` reads an environment variable.
 
 Crypto and encoding:
 
 - `zs_getrandom(out, out_len)` fills `out` with random bytes.
-- `zs_hmac_sha256(key, key_len, msg, msg_len, out)` writes a 32-byte digest.
+- `zs_sha256(data, data_len, out, out_len)` writes a 32-byte SHA-256 digest.
+- `zs_hmac_sha256(key, key_len, msg, msg_len, out)` writes a 32-byte HMAC-SHA-256 digest.
 - `zs_base64_encode(data, data_len, out, out_len, encoding)` encodes Base64.
 - `zs_base64_decode_in_place(buf, buf_len, encoding)` decodes Base64 in place.
 
@@ -198,11 +204,34 @@ JSON parsing:
 - `zs_json_read_bool(json, out, out_len)` writes `0` or `1` into `out`.
 - `zs_object_free(handle)` releases a handle when you're done with it.
 
+JSON creation and modification:
+
+- `zs_json_new_object()` creates an empty JSON object `{}`; returns a handle.
+- `zs_json_new_array()` creates an empty JSON array `[]`; returns a handle.
+- `zs_json_clone(json)` deep-clones a JSON value into a new independent tree.
+- `zs_json_len(json)` returns the length of an array, object, or string (-1 for other types).
+- `zs_json_type(json)` returns the type code: `ZS_JSON_NULL` (0), `ZS_JSON_BOOL` (1),
+  `ZS_JSON_NUMBER` (2), `ZS_JSON_STRING` (3), `ZS_JSON_ARRAY` (4), `ZS_JSON_OBJECT` (5).
+- `zs_json_set(json, key, key_len, value_json)` sets a field on an object (value is cloned).
+- `zs_json_remove(json, key, key_len)` removes a field from an object.
+- `zs_json_array_push(json, value_json)` appends a cloned value to an array.
+- `zs_json_array_set(json, index, value_json)` sets an element at an array index.
+- `zs_json_set_string(json, value, value_len)` replaces the node with a string.
+- `zs_json_set_i64(json, value)` replaces the node with an i64.
+- `zs_json_set_bool(json, value)` replaces the node with a boolean.
+- `zs_json_set_null(json)` replaces the node with null.
+
+JSON response:
+
+- `zs_json_respond(status, json)` serializes the JSON handle to a response body,
+  sets `Content-Type: application/json`, and sends the response.
+
 Request inspection:
 
 - `zs_req_method`, `zs_req_path`, `zs_req_uri`, `zs_req_query`, `zs_req_scheme`, `zs_req_peer`
 - `zs_req_header(name, name_len, out, out_len)`
 - `zs_req_query_param(name, name_len, out, out_len)`
+- `zs_req_body_json()` parses the request body as JSON and returns a handle (-1 on failure).
 
 Request mutation:
 
@@ -222,6 +251,7 @@ Example: `zs_meta_set("zs.response.header.cache-control", ..., "no-store", ...)`
 Response/proxy:
 
 - `zs_respond(status, body, body_len)`
+- `zs_json_respond(status, json)` (auto-sets Content-Type to application/json)
 - `zs_reverse_proxy(backend_url, backend_url_len)`
 
 Helper notes:
@@ -229,6 +259,7 @@ Helper notes:
 - String helpers write C strings into the provided buffer.
 - If `out_len = 0`, helpers return the required length.
 - Binary helpers return the number of bytes written and do not NUL-terminate.
+- `zs_sha256` requires `out_len` to be exactly 32 bytes.
 - `zs_hmac_sha256` requires an output buffer of at least 32 bytes.
 - `zs_base64_encode` needs an output buffer sized to the encoded length; use `out_len = 0` to query it.
 - `zs_base64_decode_in_place` uses `buf_len` bytes of input (exclude any trailing NUL).
@@ -239,6 +270,10 @@ Helper notes:
 - `ZS_STR("literal")` expands to `(ptr, len)` using `zs_strlen`, which is handy for
   helpers that take a string pointer plus length; only use it with NUL-terminated
   strings and pass explicit lengths for binary or embedded-NUL data.
+- `zs_req_body_json` reads the request body lazily (only when called) and caches the
+  result for subsequent calls. The body is limited to 256KB by default (configurable
+  via `--max-buffered-body-size-kb`); larger bodies return -1. Returns -1 for empty
+  bodies or invalid JSON.
 
 Examples:
 

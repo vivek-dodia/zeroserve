@@ -14,6 +14,8 @@
 - `zs_req_peer(out, out_len)`
 - `zs_req_header(name, name_len, out, out_len)`
 - `zs_req_query_param(name, name_len, out, out_len)`
+- `zs_req_body_json()` parses the request body as JSON and returns a handle (-1 on failure,
+  empty body, body > 256KB, or invalid JSON). The body is read lazily on first call and cached.
 
 ## Request mutation
 - `zs_req_set_uri(uri, uri_len)`
@@ -29,12 +31,14 @@
 - `zs_respond(status, body, body_len)`
 - `zs_reverse_proxy(backend_url, backend_url_len)`
 
-## Logging and time
+## Logging, time, and environment
 - `zs_log(msg, len)`
 - `zs_now_ms()`
+- `zs_env_get(name, name_len, out, out_len)` reads an environment variable.
 
 ## Crypto and encoding
 - `zs_getrandom(out, out_len)`
+- `zs_sha256(data, data_len, out, out_len)` writes a 32-byte SHA-256 digest (requires `out_len == 32`).
 - `zs_hmac_sha256(key, key_len, msg, msg_len, out)`
 - `zs_base64_encode(data, data_len, out, out_len, encoding)`
 - `zs_base64_decode_in_place(buf, buf_len, encoding)`
@@ -60,10 +64,35 @@
 - `zs_object_free(handle)` releases a JSON handle when you're done with it.
 - The handle table is limited (32 entries); free handles to avoid exhaustion.
 
+## JSON creation and modification
+- `zs_json_new_object()` creates an empty JSON object `{}`; returns a handle (-1 on failure).
+- `zs_json_new_array()` creates an empty JSON array `[]`; returns a handle (-1 on failure).
+- `zs_json_clone(handle)` deep-clones a JSON value into a new independent tree; returns a handle.
+- `zs_json_len(handle)` returns the length of an array, object, or string (-1 for other types).
+- `zs_json_type(handle)` returns the type code: `ZS_JSON_NULL` (0), `ZS_JSON_BOOL` (1),
+  `ZS_JSON_NUMBER` (2), `ZS_JSON_STRING` (3), `ZS_JSON_ARRAY` (4), `ZS_JSON_OBJECT` (5).
+- `zs_json_set(handle, key, key_len, value_handle)` sets a field on an object; the value is
+  cloned from `value_handle`. Returns 0 on success, -1 if not an object.
+- `zs_json_remove(handle, key, key_len)` removes a field from an object. Returns 0 on success,
+  -1 if not an object or key not found.
+- `zs_json_array_push(handle, value_handle)` appends a cloned value to an array; returns new
+  length on success, -1 if not an array.
+- `zs_json_array_set(handle, index, value_handle)` sets an element at an array index; returns
+  0 on success, -1 if out of bounds or not an array.
+- `zs_json_set_string(handle, value, value_len)` replaces the node with a string value.
+- `zs_json_set_i64(handle, value)` replaces the node with an i64 value.
+- `zs_json_set_bool(handle, value)` replaces the node with a boolean (0 = false, non-zero = true).
+- `zs_json_set_null(handle)` replaces the node with null.
+
+## JSON response
+- `zs_json_respond(status, handle)` serializes the JSON handle to a response body, sets
+  `Content-Type: application/json`, and sends the response. Returns 0 on success.
+
 ## Helper notes
 - String helpers write C strings into the output buffer.
 - Passing `out_len = 0` returns the required length.
 - Binary helpers return the number of bytes written and do not NUL-terminate.
+- `zs_sha256` requires `out_len` to be exactly 32 bytes.
 - `zs_hmac_sha256` writes 32 bytes to the output buffer.
 - `zs_base64_encode` requires the output buffer to fit the encoded length.
 - Base64 `encoding` values: `ZS_BASE64_STANDARD`, `ZS_BASE64_STANDARD_NO_PAD`,
@@ -71,3 +100,5 @@
 - Header names are matched case-insensitively.
 - The SDK also provides small string/memory helpers like `zs_strlen`, `zs_strcmp`,
   `zs_memcpy`, `zs_memset`, and `zs_utoa10`.
+- `zs_req_body_json` reads the body lazily (only when called) and caches the result.
+  Subsequent calls return the cached handle. The body is limited to 256KB.

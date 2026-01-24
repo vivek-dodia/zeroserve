@@ -1477,3 +1477,722 @@ zs_u64 entry(void) {
         }
     },
 });
+
+Deno.test({
+    name: "e2e: sha256 helper",
+    ignore: !canRunScripts,
+    fn: async () => {
+        const siteDir = await Deno.makeTempDir();
+        let tarPath: string | null = null;
+        try {
+            await Deno.writeTextFile(
+                join(siteDir, "index.html"),
+                "sha256 helper\n",
+            );
+
+            const scriptsDir = join(siteDir, ".zeroserve", "scripts");
+            await Deno.mkdir(scriptsDir, { recursive: true });
+
+            const scriptSource = String.raw`#include <zeroserve.h>
+
+ZS_ENTRY
+zs_u64 entry(void) {
+  char path[32];
+  zs_req_path(path, sizeof(path));
+  if (zs_strcmp(path, "/sha256") != 0) {
+    return 0;
+  }
+
+  const char *input = "hello world";
+  zs_u8 digest[32];
+  zs_s64 ret = zs_sha256(input, zs_strlen(input), digest, sizeof(digest));
+  if (ret != 32) {
+    zs_respond(500, ZS_STR("sha256 failed\n"));
+    return 0;
+  }
+
+  char digest_b64[64];
+  zs_s64 b64_len = zs_base64_encode(digest, sizeof(digest), digest_b64, sizeof(digest_b64), ZS_BASE64_STANDARD);
+
+  char body[128];
+  char *bp = zs_stpcpy(body, "{\"sha256_b64\":\"");
+  zs_memcpy(bp, digest_b64, b64_len);
+  bp += b64_len;
+  bp = zs_stpcpy(bp, "\"}\n");
+
+  zs_meta_set(ZS_STR("zs.response.header.content-type"), ZS_STR("application/json"));
+  zs_respond(200, body, bp - body);
+  return 0;
+}
+`;
+
+            await Deno.writeTextFile(
+                join(scriptsDir, "10-sha256-helper.c"),
+                scriptSource,
+            );
+
+            tarPath = await packSite(siteDir);
+
+            await withZeroserve(tarPath, async (baseUrl) => {
+                const res = await fetch(`${baseUrl}/sha256`);
+                assertEquals(res.status, 200);
+                const payload = (await res.json()) as {
+                    sha256_b64: string;
+                };
+
+                const expectedDigest = new Uint8Array(
+                    await crypto.subtle.digest(
+                        "SHA-256",
+                        new TextEncoder().encode("hello world"),
+                    ),
+                );
+                const expectedB64 = bytesToBase64(expectedDigest);
+                assertEquals(payload.sha256_b64, expectedB64);
+            });
+        } finally {
+            if (tarPath) {
+                await Deno.remove(tarPath).catch(() => {});
+            }
+            await Deno.remove(siteDir, { recursive: true }).catch(() => {});
+        }
+    },
+});
+
+Deno.test({
+    name: "e2e: json creation and modification helpers",
+    ignore: !canRunScripts,
+    fn: async () => {
+        const siteDir = await Deno.makeTempDir();
+        let tarPath: string | null = null;
+        try {
+            await Deno.writeTextFile(
+                join(siteDir, "index.html"),
+                "json modification helpers\n",
+            );
+
+            const scriptsDir = join(siteDir, ".zeroserve", "scripts");
+            await Deno.mkdir(scriptsDir, { recursive: true });
+
+            const scriptSource = String.raw`#include <zeroserve.h>
+
+ZS_ENTRY
+zs_u64 entry(void) {
+  char path[64];
+  zs_req_path(path, sizeof(path));
+
+  if (zs_strcmp(path, "/json/new-object") == 0) {
+    zs_s64 obj = zs_json_new_object();
+    if (obj < 0) {
+      zs_respond(500, ZS_STR("new_object failed\n"));
+      return 0;
+    }
+    zs_s64 type = zs_json_type(obj);
+    zs_s64 len = zs_json_len(obj);
+    if (type != 5 || len != 0) {
+      zs_respond(500, ZS_STR("wrong type/len\n"));
+      return 0;
+    }
+    zs_object_free(obj);
+    zs_respond(200, ZS_STR("ok\n"));
+    return 0;
+  }
+
+  if (zs_strcmp(path, "/json/new-array") == 0) {
+    zs_s64 arr = zs_json_new_array();
+    if (arr < 0) {
+      zs_respond(500, ZS_STR("new_array failed\n"));
+      return 0;
+    }
+    zs_s64 type = zs_json_type(arr);
+    zs_s64 len = zs_json_len(arr);
+    if (type != 4 || len != 0) {
+      zs_respond(500, ZS_STR("wrong type/len\n"));
+      return 0;
+    }
+    zs_object_free(arr);
+    zs_respond(200, ZS_STR("ok\n"));
+    return 0;
+  }
+
+  if (zs_strcmp(path, "/json/set-fields") == 0) {
+    zs_s64 obj = zs_json_new_object();
+    if (obj < 0) {
+      zs_respond(500, ZS_STR("new_object failed\n"));
+      return 0;
+    }
+
+    // Create and set a string value
+    zs_s64 str_val = zs_json_parse(ZS_STR("\"hello\""));
+    if (str_val < 0) {
+      zs_respond(500, ZS_STR("parse string failed\n"));
+      return 0;
+    }
+    if (zs_json_set(obj, ZS_STR("greeting"), str_val) != 0) {
+      zs_respond(500, ZS_STR("set greeting failed\n"));
+      return 0;
+    }
+    zs_object_free(str_val);
+
+    // Create and set a number value
+    zs_s64 num_val = zs_json_parse(ZS_STR("42"));
+    if (num_val < 0) {
+      zs_respond(500, ZS_STR("parse number failed\n"));
+      return 0;
+    }
+    if (zs_json_set(obj, ZS_STR("count"), num_val) != 0) {
+      zs_respond(500, ZS_STR("set count failed\n"));
+      return 0;
+    }
+    zs_object_free(num_val);
+
+    // Verify length is now 2
+    if (zs_json_len(obj) != 2) {
+      zs_respond(500, ZS_STR("wrong len after set\n"));
+      return 0;
+    }
+
+    // Verify we can read the values back
+    zs_s64 greeting_h = zs_json_get(obj, ZS_STR("greeting"));
+    if (greeting_h < 0) {
+      zs_respond(500, ZS_STR("get greeting failed\n"));
+      return 0;
+    }
+    char greeting[16];
+    if (zs_json_read_string(greeting_h, greeting, sizeof(greeting)) != 5) {
+      zs_respond(500, ZS_STR("read greeting failed\n"));
+      return 0;
+    }
+    if (zs_memcmp(greeting, "hello", 5) != 0) {
+      zs_respond(500, ZS_STR("greeting mismatch\n"));
+      return 0;
+    }
+    zs_object_free(greeting_h);
+    zs_object_free(obj);
+    zs_respond(200, ZS_STR("ok\n"));
+    return 0;
+  }
+
+  if (zs_strcmp(path, "/json/remove-field") == 0) {
+    zs_s64 obj = zs_json_parse(ZS_STR("{\"a\":1,\"b\":2,\"c\":3}"));
+    if (obj < 0) {
+      zs_respond(500, ZS_STR("parse failed\n"));
+      return 0;
+    }
+    if (zs_json_len(obj) != 3) {
+      zs_respond(500, ZS_STR("initial len wrong\n"));
+      return 0;
+    }
+    if (zs_json_remove(obj, ZS_STR("b")) != 0) {
+      zs_respond(500, ZS_STR("remove failed\n"));
+      return 0;
+    }
+    if (zs_json_len(obj) != 2) {
+      zs_respond(500, ZS_STR("len after remove wrong\n"));
+      return 0;
+    }
+    // Verify b is gone
+    if (zs_json_get(obj, ZS_STR("b")) != -1) {
+      zs_respond(500, ZS_STR("b still exists\n"));
+      return 0;
+    }
+    // Verify a and c still exist
+    zs_s64 a_h = zs_json_get(obj, ZS_STR("a"));
+    zs_s64 c_h = zs_json_get(obj, ZS_STR("c"));
+    if (a_h < 0 || c_h < 0) {
+      zs_respond(500, ZS_STR("a or c missing\n"));
+      return 0;
+    }
+    zs_object_free(a_h);
+    zs_object_free(c_h);
+    // Remove non-existent key should return -1
+    if (zs_json_remove(obj, ZS_STR("missing")) != -1) {
+      zs_respond(500, ZS_STR("remove missing should fail\n"));
+      return 0;
+    }
+    zs_object_free(obj);
+    zs_respond(200, ZS_STR("ok\n"));
+    return 0;
+  }
+
+  if (zs_strcmp(path, "/json/array-push") == 0) {
+    zs_s64 arr = zs_json_new_array();
+    if (arr < 0) {
+      zs_respond(500, ZS_STR("new_array failed\n"));
+      return 0;
+    }
+
+    zs_s64 val1 = zs_json_parse(ZS_STR("\"first\""));
+    zs_s64 val2 = zs_json_parse(ZS_STR("\"second\""));
+    zs_s64 val3 = zs_json_parse(ZS_STR("\"third\""));
+
+    zs_s64 len1 = zs_json_array_push(arr, val1);
+    zs_s64 len2 = zs_json_array_push(arr, val2);
+    zs_s64 len3 = zs_json_array_push(arr, val3);
+
+    if (len1 != 1 || len2 != 2 || len3 != 3) {
+      zs_respond(500, ZS_STR("push lengths wrong\n"));
+      return 0;
+    }
+
+    zs_object_free(val1);
+    zs_object_free(val2);
+    zs_object_free(val3);
+
+    // Verify array contents
+    zs_s64 elem0 = zs_json_array_get(arr, 0);
+    zs_s64 elem2 = zs_json_array_get(arr, 2);
+    char buf[16];
+    if (zs_json_read_string(elem0, buf, sizeof(buf)) != 5 || zs_memcmp(buf, "first", 5) != 0) {
+      zs_respond(500, ZS_STR("elem0 wrong\n"));
+      return 0;
+    }
+    if (zs_json_read_string(elem2, buf, sizeof(buf)) != 5 || zs_memcmp(buf, "third", 5) != 0) {
+      zs_respond(500, ZS_STR("elem2 wrong\n"));
+      return 0;
+    }
+    zs_object_free(elem0);
+    zs_object_free(elem2);
+    zs_object_free(arr);
+    zs_respond(200, ZS_STR("ok\n"));
+    return 0;
+  }
+
+  if (zs_strcmp(path, "/json/array-set") == 0) {
+    zs_s64 arr = zs_json_parse(ZS_STR("[\"a\",\"b\",\"c\"]"));
+    if (arr < 0) {
+      zs_respond(500, ZS_STR("parse failed\n"));
+      return 0;
+    }
+
+    zs_s64 new_val = zs_json_parse(ZS_STR("\"replaced\""));
+    if (zs_json_array_set(arr, 1, new_val) != 0) {
+      zs_respond(500, ZS_STR("array_set failed\n"));
+      return 0;
+    }
+    zs_object_free(new_val);
+
+    // Verify element was replaced
+    zs_s64 elem1 = zs_json_array_get(arr, 1);
+    char buf[16];
+    if (zs_json_read_string(elem1, buf, sizeof(buf)) != 8 || zs_memcmp(buf, "replaced", 8) != 0) {
+      zs_respond(500, ZS_STR("replacement wrong\n"));
+      return 0;
+    }
+    zs_object_free(elem1);
+
+    // Out of bounds should fail
+    zs_s64 oob_val = zs_json_parse(ZS_STR("\"oob\""));
+    if (zs_json_array_set(arr, 10, oob_val) != -1) {
+      zs_respond(500, ZS_STR("oob should fail\n"));
+      return 0;
+    }
+    zs_object_free(oob_val);
+    zs_object_free(arr);
+    zs_respond(200, ZS_STR("ok\n"));
+    return 0;
+  }
+
+  if (zs_strcmp(path, "/json/set-primitives") == 0) {
+    zs_s64 obj = zs_json_new_object();
+
+    // Set string
+    zs_s64 s = zs_json_parse(ZS_STR("null"));
+    zs_json_set_string(s, ZS_STR("hello world"));
+    if (zs_json_type(s) != 3) {
+      zs_respond(500, ZS_STR("set_string type wrong\n"));
+      return 0;
+    }
+    zs_json_set(obj, ZS_STR("str"), s);
+    zs_object_free(s);
+
+    // Set i64
+    zs_s64 n = zs_json_parse(ZS_STR("null"));
+    zs_json_set_i64(n, -12345);
+    if (zs_json_type(n) != 2) {
+      zs_respond(500, ZS_STR("set_i64 type wrong\n"));
+      return 0;
+    }
+    zs_json_set(obj, ZS_STR("num"), n);
+    zs_object_free(n);
+
+    // Set bool true
+    zs_s64 bt = zs_json_parse(ZS_STR("null"));
+    zs_json_set_bool(bt, 1);
+    if (zs_json_type(bt) != 1) {
+      zs_respond(500, ZS_STR("set_bool type wrong\n"));
+      return 0;
+    }
+    zs_json_set(obj, ZS_STR("flag_true"), bt);
+    zs_object_free(bt);
+
+    // Set bool false
+    zs_s64 bf = zs_json_parse(ZS_STR("null"));
+    zs_json_set_bool(bf, 0);
+    zs_json_set(obj, ZS_STR("flag_false"), bf);
+    zs_object_free(bf);
+
+    // Set null
+    zs_s64 nl = zs_json_parse(ZS_STR("123"));
+    zs_json_set_null(nl);
+    if (zs_json_type(nl) != 0) {
+      zs_respond(500, ZS_STR("set_null type wrong\n"));
+      return 0;
+    }
+    zs_json_set(obj, ZS_STR("nothing"), nl);
+    zs_object_free(nl);
+
+    // Verify values
+    zs_s64 str_h = zs_json_get(obj, ZS_STR("str"));
+    char str_buf[32];
+    if (zs_json_read_string(str_h, str_buf, sizeof(str_buf)) != 11) {
+      zs_respond(500, ZS_STR("str len wrong\n"));
+      return 0;
+    }
+    zs_object_free(str_h);
+
+    zs_s64 num_h = zs_json_get(obj, ZS_STR("num"));
+    zs_s64 num_val = 0;
+    zs_json_read_i64(num_h, &num_val, sizeof(num_val));
+    if (num_val != -12345) {
+      zs_respond(500, ZS_STR("num val wrong\n"));
+      return 0;
+    }
+    zs_object_free(num_h);
+
+    zs_s64 ft_h = zs_json_get(obj, ZS_STR("flag_true"));
+    zs_u8 ft_val = 0;
+    zs_json_read_bool(ft_h, &ft_val, 1);
+    if (ft_val != 1) {
+      zs_respond(500, ZS_STR("flag_true wrong\n"));
+      return 0;
+    }
+    zs_object_free(ft_h);
+
+    zs_s64 ff_h = zs_json_get(obj, ZS_STR("flag_false"));
+    zs_u8 ff_val = 1;
+    zs_json_read_bool(ff_h, &ff_val, 1);
+    if (ff_val != 0) {
+      zs_respond(500, ZS_STR("flag_false wrong\n"));
+      return 0;
+    }
+    zs_object_free(ff_h);
+
+    zs_s64 null_h = zs_json_get(obj, ZS_STR("nothing"));
+    if (zs_json_type(null_h) != 0) {
+      zs_respond(500, ZS_STR("nothing type wrong\n"));
+      return 0;
+    }
+    zs_object_free(null_h);
+
+    zs_object_free(obj);
+    zs_respond(200, ZS_STR("ok\n"));
+    return 0;
+  }
+
+  if (zs_strcmp(path, "/json/clone") == 0) {
+    zs_s64 orig = zs_json_parse(ZS_STR("{\"x\":1,\"y\":2}"));
+    if (orig < 0) {
+      zs_respond(500, ZS_STR("parse failed\n"));
+      return 0;
+    }
+
+    zs_s64 clone = zs_json_clone(orig);
+    if (clone < 0) {
+      zs_respond(500, ZS_STR("clone failed\n"));
+      return 0;
+    }
+
+    // Modify the clone
+    zs_s64 new_val = zs_json_parse(ZS_STR("999"));
+    zs_json_set(clone, ZS_STR("x"), new_val);
+    zs_object_free(new_val);
+
+    // Original should be unchanged
+    zs_s64 orig_x = zs_json_get(orig, ZS_STR("x"));
+    zs_s64 orig_x_val = 0;
+    zs_json_read_i64(orig_x, &orig_x_val, sizeof(orig_x_val));
+    if (orig_x_val != 1) {
+      zs_respond(500, ZS_STR("original modified\n"));
+      return 0;
+    }
+    zs_object_free(orig_x);
+
+    // Clone should have new value
+    zs_s64 clone_x = zs_json_get(clone, ZS_STR("x"));
+    zs_s64 clone_x_val = 0;
+    zs_json_read_i64(clone_x, &clone_x_val, sizeof(clone_x_val));
+    if (clone_x_val != 999) {
+      zs_respond(500, ZS_STR("clone not modified\n"));
+      return 0;
+    }
+    zs_object_free(clone_x);
+
+    zs_object_free(orig);
+    zs_object_free(clone);
+    zs_respond(200, ZS_STR("ok\n"));
+    return 0;
+  }
+
+  if (zs_strcmp(path, "/json/type-and-len") == 0) {
+    // Test all types
+    zs_s64 null_j = zs_json_parse(ZS_STR("null"));
+    zs_s64 bool_j = zs_json_parse(ZS_STR("true"));
+    zs_s64 num_j = zs_json_parse(ZS_STR("42"));
+    zs_s64 str_j = zs_json_parse(ZS_STR("\"hello\""));
+    zs_s64 arr_j = zs_json_parse(ZS_STR("[1,2,3]"));
+    zs_s64 obj_j = zs_json_parse(ZS_STR("{\"a\":1}"));
+
+    if (zs_json_type(null_j) != 0) { zs_respond(500, ZS_STR("null type\n")); return 0; }
+    if (zs_json_type(bool_j) != 1) { zs_respond(500, ZS_STR("bool type\n")); return 0; }
+    if (zs_json_type(num_j) != 2) { zs_respond(500, ZS_STR("num type\n")); return 0; }
+    if (zs_json_type(str_j) != 3) { zs_respond(500, ZS_STR("str type\n")); return 0; }
+    if (zs_json_type(arr_j) != 4) { zs_respond(500, ZS_STR("arr type\n")); return 0; }
+    if (zs_json_type(obj_j) != 5) { zs_respond(500, ZS_STR("obj type\n")); return 0; }
+
+    // Test lengths
+    if (zs_json_len(str_j) != 5) { zs_respond(500, ZS_STR("str len\n")); return 0; }
+    if (zs_json_len(arr_j) != 3) { zs_respond(500, ZS_STR("arr len\n")); return 0; }
+    if (zs_json_len(obj_j) != 1) { zs_respond(500, ZS_STR("obj len\n")); return 0; }
+    // Null, bool, number should return -1 for len
+    if (zs_json_len(null_j) != (zs_s64)-1) { zs_respond(500, ZS_STR("null len\n")); return 0; }
+    if (zs_json_len(bool_j) != (zs_s64)-1) { zs_respond(500, ZS_STR("bool len\n")); return 0; }
+    if (zs_json_len(num_j) != (zs_s64)-1) { zs_respond(500, ZS_STR("num len\n")); return 0; }
+
+    zs_object_free(null_j);
+    zs_object_free(bool_j);
+    zs_object_free(num_j);
+    zs_object_free(str_j);
+    zs_object_free(arr_j);
+    zs_object_free(obj_j);
+    zs_respond(200, ZS_STR("ok\n"));
+    return 0;
+  }
+
+  return 0;
+}
+`;
+
+            await Deno.writeTextFile(
+                join(scriptsDir, "15-json-modification.c"),
+                scriptSource,
+            );
+
+            tarPath = await packSite(siteDir);
+
+            await withZeroserve(tarPath, async (baseUrl) => {
+                const endpoints = [
+                    "/json/new-object",
+                    "/json/new-array",
+                    "/json/set-fields",
+                    "/json/remove-field",
+                    "/json/array-push",
+                    "/json/array-set",
+                    "/json/set-primitives",
+                    "/json/clone",
+                    "/json/type-and-len",
+                ];
+
+                for (const endpoint of endpoints) {
+                    const res = await fetch(`${baseUrl}${endpoint}`);
+                    const text = await res.text();
+                    assertEquals(
+                        res.status,
+                        200,
+                        `${endpoint} failed: ${text}`,
+                    );
+                    assertEquals(text, "ok\n");
+                }
+            });
+        } finally {
+            if (tarPath) {
+                await Deno.remove(tarPath).catch(() => {});
+            }
+            await Deno.remove(siteDir, { recursive: true }).catch(() => {});
+        }
+    },
+});
+
+Deno.test({
+    name: "e2e: json respond helper",
+    ignore: !canRunScripts,
+    fn: async () => {
+        const siteDir = await Deno.makeTempDir();
+        let tarPath: string | null = null;
+        try {
+            await Deno.writeTextFile(
+                join(siteDir, "index.html"),
+                "json respond helper\n",
+            );
+
+            const scriptsDir = join(siteDir, ".zeroserve", "scripts");
+            await Deno.mkdir(scriptsDir, { recursive: true });
+
+            const scriptSource = String.raw`#include <zeroserve.h>
+
+ZS_ENTRY
+zs_u64 entry(void) {
+  char path[64];
+  zs_req_path(path, sizeof(path));
+
+  if (zs_strcmp(path, "/json/respond-simple") == 0) {
+    zs_s64 obj = zs_json_new_object();
+
+    zs_s64 status = zs_json_parse(ZS_STR("\"ok\""));
+    zs_json_set(obj, ZS_STR("status"), status);
+    zs_object_free(status);
+
+    zs_s64 code = zs_json_parse(ZS_STR("0"));
+    zs_json_set_i64(code, 200);
+    zs_json_set(obj, ZS_STR("code"), code);
+    zs_object_free(code);
+
+    zs_json_respond(200, obj);
+    zs_object_free(obj);
+    return 0;
+  }
+
+  if (zs_strcmp(path, "/json/respond-nested") == 0) {
+    zs_s64 root = zs_json_new_object();
+
+    // Create nested object
+    zs_s64 user = zs_json_new_object();
+    zs_s64 name = zs_json_parse(ZS_STR("\"Alice\""));
+    zs_json_set(user, ZS_STR("name"), name);
+    zs_object_free(name);
+
+    zs_s64 age = zs_json_parse(ZS_STR("0"));
+    zs_json_set_i64(age, 30);
+    zs_json_set(user, ZS_STR("age"), age);
+    zs_object_free(age);
+
+    zs_json_set(root, ZS_STR("user"), user);
+    zs_object_free(user);
+
+    // Create array of tags
+    zs_s64 tags = zs_json_new_array();
+    zs_s64 tag1 = zs_json_parse(ZS_STR("\"admin\""));
+    zs_s64 tag2 = zs_json_parse(ZS_STR("\"verified\""));
+    zs_json_array_push(tags, tag1);
+    zs_json_array_push(tags, tag2);
+    zs_object_free(tag1);
+    zs_object_free(tag2);
+
+    zs_json_set(root, ZS_STR("tags"), tags);
+    zs_object_free(tags);
+
+    zs_json_respond(200, root);
+    zs_object_free(root);
+    return 0;
+  }
+
+  if (zs_strcmp(path, "/json/respond-array") == 0) {
+    zs_s64 arr = zs_json_new_array();
+
+    for (int i = 0; i < 3; i++) {
+      zs_s64 item = zs_json_new_object();
+      zs_s64 id = zs_json_parse(ZS_STR("0"));
+      zs_json_set_i64(id, i + 1);
+      zs_json_set(item, ZS_STR("id"), id);
+      zs_object_free(id);
+
+      zs_json_array_push(arr, item);
+      zs_object_free(item);
+    }
+
+    zs_json_respond(200, arr);
+    zs_object_free(arr);
+    return 0;
+  }
+
+  if (zs_strcmp(path, "/json/respond-error") == 0) {
+    zs_s64 obj = zs_json_new_object();
+
+    zs_s64 err = zs_json_parse(ZS_STR("\"Not Found\""));
+    zs_json_set(obj, ZS_STR("error"), err);
+    zs_object_free(err);
+
+    zs_s64 code = zs_json_parse(ZS_STR("0"));
+    zs_json_set_i64(code, 404);
+    zs_json_set(obj, ZS_STR("code"), code);
+    zs_object_free(code);
+
+    zs_json_respond(404, obj);
+    zs_object_free(obj);
+    return 0;
+  }
+
+  return 0;
+}
+`;
+
+            await Deno.writeTextFile(
+                join(scriptsDir, "16-json-respond.c"),
+                scriptSource,
+            );
+
+            tarPath = await packSite(siteDir);
+
+            await withZeroserve(tarPath, async (baseUrl) => {
+                // Test simple object response
+                {
+                    const res = await fetch(`${baseUrl}/json/respond-simple`);
+                    assertEquals(res.status, 200);
+                    assertEquals(
+                        res.headers.get("content-type"),
+                        "application/json",
+                    );
+                    const body = await res.json();
+                    assertEquals(body.status, "ok");
+                    assertEquals(body.code, 200);
+                }
+
+                // Test nested object response
+                {
+                    const res = await fetch(`${baseUrl}/json/respond-nested`);
+                    assertEquals(res.status, 200);
+                    assertEquals(
+                        res.headers.get("content-type"),
+                        "application/json",
+                    );
+                    const body = await res.json();
+                    assertEquals(body.user.name, "Alice");
+                    assertEquals(body.user.age, 30);
+                    assertEquals(body.tags, ["admin", "verified"]);
+                }
+
+                // Test array response
+                {
+                    const res = await fetch(`${baseUrl}/json/respond-array`);
+                    assertEquals(res.status, 200);
+                    assertEquals(
+                        res.headers.get("content-type"),
+                        "application/json",
+                    );
+                    const body = await res.json();
+                    assertEquals(body.length, 3);
+                    assertEquals(body[0].id, 1);
+                    assertEquals(body[1].id, 2);
+                    assertEquals(body[2].id, 3);
+                }
+
+                // Test error response with non-200 status
+                {
+                    const res = await fetch(`${baseUrl}/json/respond-error`);
+                    assertEquals(res.status, 404);
+                    assertEquals(
+                        res.headers.get("content-type"),
+                        "application/json",
+                    );
+                    const body = await res.json();
+                    assertEquals(body.error, "Not Found");
+                    assertEquals(body.code, 404);
+                }
+            });
+        } finally {
+            if (tarPath) {
+                await Deno.remove(tarPath).catch(() => {});
+            }
+            await Deno.remove(siteDir, { recursive: true }).catch(() => {});
+        }
+    },
+});

@@ -89,4 +89,12 @@ pub struct Cli {
     /// Disable proxy protocol decoding fast path for debugging.
     #[arg(long)]
     pub debug_proxy_protocol_disable_fast_path: bool,
+
+    /// Maximum buffered body size in kilobytes for script body reads.
+    #[arg(long, default_value_t = 256, value_parser = must_be_positive)]
+    pub max_buffered_body_size_kb: usize,
+
+    /// Maximum external memory footprint in kilobytes per request for scripts.
+    #[arg(long, default_value_t = 256, value_parser = must_be_positive)]
+    pub max_request_external_memory_footprint_kb: usize,
 }

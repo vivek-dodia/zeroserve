@@ -79,7 +79,7 @@ impl JsonRef {
         }
     }
 
-    pub fn modify<R>(&self, modify: impl FnOnce(&mut serde_json::Value) -> R) -> Result<R, ()> {
+    pub fn modify<R>(&mut self, modify: impl FnOnce(&mut serde_json::Value) -> R) -> Result<R, ()> {
         unsafe {
             let latest_epoch = (*self.tree.get()).latest_epoch;
             if self.epoch != latest_epoch {
@@ -92,6 +92,7 @@ impl JsonRef {
                 panic!("JsonRef::modify: reader active");
             }
             (*self.tree.get()).latest_epoch += 1;
+            self.epoch += 1;
             let mut node = self.node;
             (*self.tree.get()).writer = true;
             let ret = modify(node.as_mut());

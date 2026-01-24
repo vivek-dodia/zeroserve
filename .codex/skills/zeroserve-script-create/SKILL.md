@@ -69,12 +69,17 @@ zeroserve --dump-sdk > zeroserve.h
    - Use `ZS_STR("literal")` for helper calls needing `(ptr, len)` for string literals.
    - For JSON parsing, use `zs_json_parse`/`zs_json_get`/`zs_json_array_get` and
      `zs_json_read_*`, then free handles with `zs_object_free` (handle table is limited).
+   - To parse the request body as JSON, use `zs_req_body_json()` which returns a handle
+     (-1 on empty body, body > 256KB, or invalid JSON). The body is read lazily and cached.
+   - To build JSON dynamically, use `zs_json_new_object`/`zs_json_new_array` and modify
+     with `zs_json_set`, `zs_json_array_push`, `zs_json_set_string`, `zs_json_set_i64`, etc.
+   - To send a JSON response, use `zs_json_respond(status, handle)` which auto-sets Content-Type.
    - To parse a static JSON file from the tarball, call `zs_load_static_json(path, path_len)`
      and treat the returned handle like any other JSON handle.
    - To read tarball entry metadata as JSON, call `zs_load_file_metadata(path, path_len)`
      and access `size`, `etag`, and `mtime`.
    - For response headers, set metadata keys `zs.response.header.<name>`.
-   - Call `zs_respond` or `zs_reverse_proxy` to stop later scripts.
+   - Call `zs_respond`, `zs_json_respond`, or `zs_reverse_proxy` to stop later scripts.
 4. Validate eBPF constraints
    - Avoid unbounded loops and recursion.
    - Keep stack usage small (BPF stack is limited).

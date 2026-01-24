@@ -21,6 +21,8 @@ pub struct StaticConfig {
     pub preempt_timer_interval: Duration,
     pub sqpoll_idle_ms: Option<u32>,
     pub debug_proxy_protocol_disable_fast_path: bool,
+    pub max_buffered_body_size: usize,
+    pub max_request_external_memory_footprint: u64,
 }
 
 impl TryFrom<Cli> for StaticConfig {
@@ -73,6 +75,9 @@ impl TryFrom<Cli> for StaticConfig {
             sqpoll_idle_ms: cli.sqpoll_idle_ms,
             enable_netns_isolation: cli.enable_netns_isolation,
             debug_proxy_protocol_disable_fast_path: cli.debug_proxy_protocol_disable_fast_path,
+            max_buffered_body_size: cli.max_buffered_body_size_kb * 1024,
+            max_request_external_memory_footprint: (cli.max_request_external_memory_footprint_kb
+                * 1024) as u64,
         })
     }
 }

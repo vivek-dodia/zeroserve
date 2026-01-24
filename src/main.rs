@@ -1,5 +1,6 @@
 mod cli;
 mod config;
+mod helpers;
 mod http;
 mod hupwatch;
 mod json;
@@ -147,6 +148,7 @@ fn main() -> Result<()> {
             let script_runtime = unsafe {
                 ScriptRuntime::new(ScriptRuntimeConfig {
                     preempt_timer_interval: config.preempt_timer_interval,
+                    max_memory_footprint: config.max_request_external_memory_footprint,
                 })
             };
             let script_runtime = Rc::new(script_runtime);

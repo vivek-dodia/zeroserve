@@ -38,7 +38,9 @@ use crate::{
     http::h1::{self, HttpError, Request, RequestHead, StreamHint},
     logging::async_log,
     pool::{self, PoolKey, PooledConnection},
-    script::{ScriptOutcome, ScriptRequest, ScriptResponse, ScriptRuntime},
+    script::{
+        BodyReadError, BodySource, ScriptOutcome, ScriptRequest, ScriptResponse, ScriptRuntime,
+    },
     shared::{SharedState, read_tar_entry, stream_tar_entry},
     site::{guess_mime, normalize_request_path},
     thread_pool::DNS_TP,
@@ -47,6 +49,84 @@ use crate::{
 type HttpBody = h1::Body;
 
 const H2_PREFACE: &[u8; 24] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+use std::cell::RefCell as StdRefCell;
+
+type H1BodyState<R> = Rc<StdRefCell<Option<(h1::H1Connection<R>, h1::Body)>>>;
+
+fn create_h1_body_source<R: AsyncReadRent + 'static>(
+    reader: h1::H1Connection<R>,
+    body: h1::Body,
+    max_buffered_body_size: usize,
+) -> (BodySource, H1BodyState<R>) {
+    let state: H1BodyState<R> = Rc::new(StdRefCell::new(Some((reader, body))));
+    let state_clone = state.clone();
+
+    let body_source = BodySource::new(Box::pin(async move {
+        let (mut reader, mut body) = state_clone
+            .borrow_mut()
+            .take()
+            .ok_or(BodyReadError::ReadError)?;
+
+        let mut buf = Vec::new();
+        loop {
+            match body.next_data(&mut reader).await {
+                Some(Ok(chunk)) => {
+                    if buf.len() + chunk.len() > max_buffered_body_size {
+                        *state_clone.borrow_mut() = Some((reader, body));
+                        return Err(BodyReadError::TooLarge);
+                    }
+                    buf.extend_from_slice(&chunk);
+                }
+                Some(Err(_)) => {
+                    *state_clone.borrow_mut() = Some((reader, body));
+                    return Err(BodyReadError::ReadError);
+                }
+                None => break,
+            }
+        }
+
+        *state_clone.borrow_mut() = Some((reader, body));
+        Ok(buf)
+    }));
+
+    (body_source, state)
+}
+
+type H2BodyState = Rc<StdRefCell<Option<h2::RecvStream>>>;
+
+fn create_h2_body_source(
+    body: h2::RecvStream,
+    max_buffered_body_size: usize,
+) -> (BodySource, H2BodyState) {
+    let state: H2BodyState = Rc::new(StdRefCell::new(Some(body)));
+    let state_clone = state.clone();
+
+    let body_source = BodySource::new(Box::pin(async move {
+        let mut body = state_clone
+            .borrow_mut()
+            .take()
+            .ok_or(BodyReadError::ReadError)?;
+
+        let mut buf = Vec::new();
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk.map_err(|_| BodyReadError::ReadError)?;
+            if buf.len() + chunk.len() > max_buffered_body_size {
+                *state_clone.borrow_mut() = Some(body);
+                return Err(BodyReadError::TooLarge);
+            }
+            buf.extend_from_slice(&chunk);
+            body.flow_control()
+                .release_capacity(chunk.len())
+                .map_err(|_| BodyReadError::ReadError)?;
+        }
+
+        // Body fully consumed, no need to restore
+        Ok(buf)
+    }));
+
+    (body_source, state)
+}
 
 enum StaticBody {
     Empty,
@@ -313,9 +393,9 @@ where
             }
         };
 
-        let outcome = handle_request(
+        let (continue_conn, returned_reader) = handle_request(
             request,
-            &mut reader,
+            reader,
             &shared,
             &script_runtime,
             peer,
@@ -324,7 +404,8 @@ where
             hup,
         )
         .await;
-        if !outcome {
+        reader = returned_reader;
+        if !continue_conn {
             break;
         }
     }
@@ -400,30 +481,34 @@ where
     Ok(())
 }
 
-async fn handle_request<R: AsyncReadRent>(
+async fn handle_request<R: AsyncReadRent + 'static>(
     req: Request,
-    reader: &mut h1::H1Connection<R>,
+    reader: h1::H1Connection<R>,
     shared: &Arc<SharedState>,
     script_runtime: &Rc<ScriptRuntime>,
     peer: std::net::SocketAddr,
     scheme: Scheme,
     w: &mut impl AsyncWriteRent,
     interrupt: &mut (impl Future<Output = ()> + Unpin),
-) -> bool {
+) -> (bool, h1::H1Connection<R>) {
     let request_id = Ulid::new();
-    let (mut head, mut body) = req.into_parts();
+    let (mut head, body) = req.into_parts();
     if !shared.config.disable_request_logging {
         log_request(request_id, peer, scheme, &head.method, &head.uri).await;
     }
     let head_only = head.method == Method::HEAD;
 
+    let (body_source, body_state) =
+        create_h1_body_source(reader, body, shared.config.max_buffered_body_size);
+
     let script_request = build_script_request(request_id, &head, peer, scheme);
     let script_request_fallback = script_request.clone();
     let script_outcome = monoio::select! {
-        x = script_runtime.run_request(shared.site.load_full(), script_request) => x,
+        x = script_runtime.run_request(shared.site.load_full(), script_request, body_source) => x,
         _ = &mut *interrupt => {
           async_log(format!("[handle] {}: interrupted\n", request_id).into_bytes()).await;
-          return false;
+          let (reader, _) = body_state.borrow_mut().take().unwrap();
+          return (false, reader);
         }
     };
     let script_outcome = match script_outcome {
@@ -446,13 +531,16 @@ async fn handle_request<R: AsyncReadRent>(
         .await;
     }
 
+    // Take reader and body back from shared state
+    let (mut reader, mut body) = body_state.borrow_mut().take().unwrap();
+
     if let Some(proxy_url) = script_outcome.reverse_proxy {
         let res = monoio::select! {
             x = reverse_proxy_request(
                 &proxy_url,
                 head,
                 body,
-                reader,
+                &mut reader,
                 w,
                 head_only,
                 &script_outcome.metadata,
@@ -460,24 +548,24 @@ async fn handle_request<R: AsyncReadRent>(
             _ = &mut *interrupt => Err(anyhow::anyhow!("interrupted")),
         };
         match res {
-            Ok(continue_conn) => return continue_conn,
+            Ok(continue_conn) => return (continue_conn, reader),
             Err(err) => {
                 async_log(
                     format!("[handle] {}: reverse proxy: {:?}\n", request_id, err).into_bytes(),
                 )
                 .await;
-                return false;
+                return (false, reader);
             }
         }
     }
 
     if let Some(response) = script_outcome.response {
-        drain_payload(reader, &mut body).await;
+        drain_payload(&mut reader, &mut body).await;
         send_script_response(w, response, head_only, &script_outcome.metadata).await;
-        return true;
+        return (true, reader);
     }
 
-    drain_payload(reader, &mut body).await;
+    drain_payload(&mut reader, &mut body).await;
 
     match head.method {
         Method::GET | Method::HEAD => {
@@ -491,7 +579,7 @@ async fn handle_request<R: AsyncReadRent>(
         _ => send_fixed(w, method_not_allowed(), &script_outcome.metadata).await,
     }
 
-    true
+    (true, reader)
 }
 
 async fn handle_h2_request<H>(
@@ -521,11 +609,14 @@ where
     }
     let head_only = head.method == Method::HEAD;
 
+    let (body_source, body_state) =
+        create_h2_body_source(body, shared.config.max_buffered_body_size);
+
     let script_request = build_script_request(request_id, &head, peer, scheme);
     let script_request_fallback = script_request.clone();
     let mut hup_wait = hup.clone();
     let script_outcome = monoio::select! {
-        x = script_runtime.run_request(shared.site.load_full(), script_request) => x,
+        x = script_runtime.run_request(shared.site.load_full(), script_request, body_source) => x,
         _ = &mut hup_wait => {
           async_log(format!("[handle] {}: interrupted\n", request_id).into_bytes()).await;
           return Ok(());
@@ -552,21 +643,36 @@ where
     }
 
     if let Some(proxy_url) = script_outcome.reverse_proxy {
-        let mut hup_wait = hup.clone();
-        let res = monoio::select! {
-            x = reverse_proxy_request_h2(
-                &proxy_url,
-                head,
-                body,
-                &mut respond,
-                head_only,
-                &script_outcome.metadata,
-            ) => x,
-            _ = &mut hup_wait => Err(anyhow::anyhow!("interrupted")),
-        };
-        if let Err(err) = res {
-            async_log(format!("[handle] {}: reverse proxy: {:?}\n", request_id, err).into_bytes())
+        // Take body from state - may be None if script consumed it
+        let body = body_state.borrow_mut().take();
+        if let Some(body) = body {
+            let mut hup_wait = hup.clone();
+            let res = monoio::select! {
+                x = reverse_proxy_request_h2(
+                    &proxy_url,
+                    head,
+                    body,
+                    &mut respond,
+                    head_only,
+                    &script_outcome.metadata,
+                ) => x,
+                _ = &mut hup_wait => Err(anyhow::anyhow!("interrupted")),
+            };
+            if let Err(err) = res {
+                async_log(
+                    format!("[handle] {}: reverse proxy: {:?}\n", request_id, err).into_bytes(),
+                )
                 .await;
+            }
+        } else {
+            async_log(
+                format!(
+                    "[handle] {}: reverse proxy skipped - body already consumed\n",
+                    request_id
+                )
+                .into_bytes(),
+            )
+            .await;
         }
         return Ok(());
     }
