@@ -104,6 +104,8 @@ static SCRIPT_HELPERS: &[(&str, Helper)] = &[
         "zs_base64_decode_in_place",
         helpers::h_base64_decode_in_place,
     ),
+    ("zs_hex_encode", helpers::h_hex_encode),
+    ("zs_hex_decode_in_place", helpers::h_hex_decode_in_place),
     ("zs_memcpy", helpers::h_memcpy),
     ("zs_memcmp", helpers::h_memcmp),
     ("zs_memset", helpers::h_memset),

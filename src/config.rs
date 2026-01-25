@@ -1,12 +1,12 @@
-use std::{net::SocketAddr, path::PathBuf, time::Duration};
+use std::{path::PathBuf, time::Duration};
 
 use anyhow::{Result, anyhow};
 
-use crate::cli::Cli;
+use crate::cli::{Cli, ListenAddr};
 
 pub struct StaticConfig {
-    pub http_addr: SocketAddr,
-    pub tls_addr: Option<SocketAddr>,
+    pub http_addr: ListenAddr,
+    pub tls_addr: Option<ListenAddr>,
     pub tar_path: PathBuf,
     pub cert_path: Option<PathBuf>,
     pub key_path: Option<PathBuf>,
@@ -40,10 +40,10 @@ impl TryFrom<Cli> for StaticConfig {
                 .key
                 .clone()
                 .ok_or_else(|| anyhow!("--key is required when enabling TLS"))?;
-            let addr = cli
+            let tls_addr = cli
                 .tls_addr
                 .ok_or_else(|| anyhow!("--tls-addr is required when enabling TLS"))?;
-            (Some(addr), Some(cert), Some(key))
+            (Some(tls_addr), Some(cert), Some(key))
         } else {
             (None, None, None)
         };

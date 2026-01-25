@@ -26,6 +26,9 @@ typedef long ssize_t;
 #define ZS_BASE64_URL 2
 #define ZS_BASE64_URL_NO_PAD 3
 
+#define ZS_HEX_LOWERCASE 0
+#define ZS_HEX_UPPERCASE 1
+
 #define ZS_JSON_NULL 0
 #define ZS_JSON_BOOL 1
 #define ZS_JSON_NUMBER 2
@@ -55,6 +58,9 @@ extern zs_s64 zs_base64_encode(const void *data, zs_u64 data_len, void *out,
                                zs_u64 out_len, zs_u64 encoding);
 extern zs_s64 zs_base64_decode_in_place(void *buf, zs_u64 buf_len,
                                         zs_u64 encoding);
+extern zs_s64 zs_hex_encode(const void *data, zs_u64 data_len, void *out,
+                            zs_u64 out_len, zs_u64 case_flag);
+extern zs_s64 zs_hex_decode_in_place(void *buf, zs_u64 buf_len);
 
 extern zs_s64 zs_json_parse(const void *data, zs_u64 data_len);
 extern zs_s64 zs_load_static_json(const char *path, zs_u64 path_len);

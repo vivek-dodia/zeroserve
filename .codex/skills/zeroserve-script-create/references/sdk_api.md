@@ -42,6 +42,8 @@
 - `zs_hmac_sha256(key, key_len, msg, msg_len, out)`
 - `zs_base64_encode(data, data_len, out, out_len, encoding)`
 - `zs_base64_decode_in_place(buf, buf_len, encoding)`
+- `zs_hex_encode(data, data_len, out, out_len, case)` encodes binary data to hexadecimal.
+- `zs_hex_decode_in_place(buf, buf_len)` decodes hexadecimal to binary in place.
 
 ## JSON parsing (handle table)
 - `zs_json_parse(data, data_len)` parses JSON and returns a handle (-1 on failure).
@@ -97,6 +99,9 @@
 - `zs_base64_encode` requires the output buffer to fit the encoded length.
 - Base64 `encoding` values: `ZS_BASE64_STANDARD`, `ZS_BASE64_STANDARD_NO_PAD`,
   `ZS_BASE64_URL`, `ZS_BASE64_URL_NO_PAD`.
+- `zs_hex_encode` outputs 2 hex characters per input byte; use `out_len = 0` to query the required length.
+- `zs_hex_decode_in_place` requires an even `buf_len`; returns the decoded length or -1 on error.
+- Hex `case` values: `ZS_HEX_LOWERCASE`, `ZS_HEX_UPPERCASE`.
 - Header names are matched case-insensitively.
 - The SDK also provides small string/memory helpers like `zs_strlen`, `zs_strcmp`,
   `zs_memcpy`, `zs_memset`, and `zs_utoa10`.

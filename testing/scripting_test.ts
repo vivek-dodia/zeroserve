@@ -2196,3 +2196,148 @@ zs_u64 entry(void) {
         }
     },
 });
+
+Deno.test({
+    name: "e2e: hex encoding helpers",
+    ignore: !canRunScripts,
+    fn: async () => {
+        const siteDir = await Deno.makeTempDir();
+        let tarPath: string | null = null;
+        try {
+            await Deno.writeTextFile(
+                join(siteDir, "index.html"),
+                "hex helpers\n",
+            );
+
+            const scriptsDir = join(siteDir, ".zeroserve", "scripts");
+            await Deno.mkdir(scriptsDir, { recursive: true });
+
+            const scriptSource = String.raw`#include <zeroserve.h>
+
+static int hex_roundtrip(const char *input, zs_u64 input_len, zs_u64 case_flag) {
+  char buf[128];
+  zs_s64 enc_len = zs_hex_encode(input, input_len, buf, sizeof(buf), case_flag);
+  if (enc_len != (zs_s64)(input_len * 2)) return 0;
+  zs_s64 dec_len = zs_hex_decode_in_place(buf, enc_len);
+  if (dec_len != (zs_s64)input_len) return 0;
+  if (zs_memcmp(buf, input, input_len) != 0) return 0;
+  return 1;
+}
+
+static int hex_expected(void) {
+  zs_u8 bytes[4] = {0xde, 0xad, 0xbe, 0xef};
+  char buf[16];
+
+  // Test lowercase encoding
+  zs_s64 len = zs_hex_encode(bytes, sizeof(bytes), buf, sizeof(buf), ZS_HEX_LOWERCASE);
+  if (len != 8 || zs_memcmp(buf, "deadbeef", 8) != 0) return 0;
+
+  // Test uppercase encoding
+  len = zs_hex_encode(bytes, sizeof(bytes), buf, sizeof(buf), ZS_HEX_UPPERCASE);
+  if (len != 8 || zs_memcmp(buf, "DEADBEEF", 8) != 0) return 0;
+
+  // Test length query (out_len = 0)
+  len = zs_hex_encode(bytes, sizeof(bytes), buf, 0, ZS_HEX_LOWERCASE);
+  if (len != 8) return 0;
+
+  // Test decoding lowercase
+  zs_memcpy(buf, "cafebabe", 8);
+  zs_s64 dec_len = zs_hex_decode_in_place(buf, 8);
+  if (dec_len != 4) return 0;
+  if ((zs_u8)buf[0] != 0xca || (zs_u8)buf[1] != 0xfe ||
+      (zs_u8)buf[2] != 0xba || (zs_u8)buf[3] != 0xbe) return 0;
+
+  // Test decoding uppercase
+  zs_memcpy(buf, "CAFEBABE", 8);
+  dec_len = zs_hex_decode_in_place(buf, 8);
+  if (dec_len != 4) return 0;
+  if ((zs_u8)buf[0] != 0xca || (zs_u8)buf[1] != 0xfe ||
+      (zs_u8)buf[2] != 0xba || (zs_u8)buf[3] != 0xbe) return 0;
+
+  // Test decoding mixed case
+  zs_memcpy(buf, "CaFeBaBe", 8);
+  dec_len = zs_hex_decode_in_place(buf, 8);
+  if (dec_len != 4) return 0;
+  if ((zs_u8)buf[0] != 0xca || (zs_u8)buf[1] != 0xfe ||
+      (zs_u8)buf[2] != 0xba || (zs_u8)buf[3] != 0xbe) return 0;
+
+  // Test odd length returns -1
+  zs_memcpy(buf, "abc", 3);
+  dec_len = zs_hex_decode_in_place(buf, 3);
+  if (dec_len != (zs_s64)-1) return 0;
+
+  // Test invalid hex char returns -1
+  zs_memcpy(buf, "ghij", 4);
+  dec_len = zs_hex_decode_in_place(buf, 4);
+  if (dec_len != (zs_s64)-1) return 0;
+
+  // Test empty input
+  dec_len = zs_hex_decode_in_place(buf, 0);
+  if (dec_len != 0) return 0;
+
+  return 1;
+}
+
+ZS_ENTRY
+zs_u64 entry(void) {
+  char path[32];
+  zs_req_path(path, sizeof(path));
+  if (zs_strcmp(path, "/hex") != 0) {
+    return 0;
+  }
+
+  int ok = 1;
+  if (!hex_roundtrip("hello", sizeof("hello") - 1, ZS_HEX_LOWERCASE)) ok = 0;
+  if (!hex_roundtrip("hello", sizeof("hello") - 1, ZS_HEX_UPPERCASE)) ok = 0;
+  if (!hex_roundtrip("\x00\xff\x7f\x80", 4, ZS_HEX_LOWERCASE)) ok = 0;
+  if (!hex_expected()) ok = 0;
+
+  // Build response with hex-encoded random bytes
+  zs_u8 rand_bytes[16];
+  zs_getrandom(rand_bytes, sizeof(rand_bytes));
+  char rand_hex[64];
+  zs_s64 rand_hex_len = zs_hex_encode(rand_bytes, sizeof(rand_bytes), rand_hex, sizeof(rand_hex), ZS_HEX_LOWERCASE);
+
+  char body[256];
+  char *bp = zs_stpcpy(body, "{\"rand_hex\":\"");
+  zs_memcpy(bp, rand_hex, rand_hex_len);
+  bp += rand_hex_len;
+  bp = zs_stpcpy(bp, "\",\"hex_ok\":");
+  bp += zs_utoa10(ok, bp, 8);
+  bp = zs_stpcpy(bp, "}\n");
+
+  zs_meta_set(ZS_STR("zs.response.header.content-type"), ZS_STR("application/json"));
+  zs_respond(200, body, bp - body);
+  return 0;
+}
+`;
+
+            await Deno.writeTextFile(
+                join(scriptsDir, "10-hex-helpers.c"),
+                scriptSource,
+            );
+
+            tarPath = await packSite(siteDir);
+
+            await withZeroserve(tarPath, async (baseUrl) => {
+                const res = await fetch(`${baseUrl}/hex`);
+                assertEquals(res.status, 200);
+                const payload = (await res.json()) as {
+                    rand_hex: string;
+                    hex_ok: number;
+                };
+
+                assertEquals(payload.hex_ok, 1);
+                // Verify hex format: 16 bytes = 32 hex chars
+                assertEquals(payload.rand_hex.length, 32);
+                // Verify all lowercase hex chars
+                assert(/^[0-9a-f]+$/.test(payload.rand_hex));
+            });
+        } finally {
+            if (tarPath) {
+                await Deno.remove(tarPath).catch(() => {});
+            }
+            await Deno.remove(siteDir, { recursive: true }).catch(() => {});
+        }
+    },
+});

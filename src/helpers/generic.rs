@@ -1,24 +1,14 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_ebpf::program::HelperScope;
-use base64ct::{Base64, Base64Unpadded, Base64Url, Base64UrlUnpadded, Encoding};
-use hmac::{Hmac, Mac};
-use rand::RngCore;
-use sha2::{Digest, Sha256};
 
 use crate::{
     logging::async_log,
     script::{ScriptResponse, deref_and_write_cstr, read_utf8, with_ectx},
 };
 
-const SHA256_LEN: usize = 32;
-const HMAC_SHA256_LEN: usize = 32;
-const BASE64_ENCODING_STANDARD: u64 = 0;
-const BASE64_ENCODING_STANDARD_NO_PAD: u64 = 1;
-const BASE64_ENCODING_URL: u64 = 2;
-const BASE64_ENCODING_URL_NO_PAD: u64 = 3;
 pub fn h_log(
-    scope: &async_ebpf::program::HelperScope,
+    scope: &HelperScope,
     msg_ptr: u64,
     msg_len: u64,
     _: u64,
@@ -59,14 +49,7 @@ pub fn h_log(
     Ok(0)
 }
 
-pub fn h_now_ms(
-    _: &async_ebpf::program::HelperScope,
-    _: u64,
-    _: u64,
-    _: u64,
-    _: u64,
-    _: u64,
-) -> Result<u64, ()> {
+pub fn h_now_ms(_: &HelperScope, _: u64, _: u64, _: u64, _: u64, _: u64) -> Result<u64, ()> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
@@ -74,7 +57,7 @@ pub fn h_now_ms(
 }
 
 pub fn h_env_get(
-    scope: &async_ebpf::program::HelperScope,
+    scope: &HelperScope,
     name_ptr: u64,
     name_len: u64,
     out_ptr: u64,
@@ -86,105 +69,8 @@ pub fn h_env_get(
     deref_and_write_cstr(scope, out_ptr, out_len, &value)
 }
 
-pub fn h_getrandom(
-    scope: &async_ebpf::program::HelperScope,
-    out_ptr: u64,
-    out_len: u64,
-    _: u64,
-    _: u64,
-    _: u64,
-) -> Result<u64, ()> {
-    if out_len == 0 {
-        return Ok(0);
-    }
-    let mut out = scope.user_memory_mut(out_ptr, out_len)?;
-    rand::thread_rng().fill_bytes(&mut out[..]);
-    Ok(out_len)
-}
-
-pub fn h_sha256(
-    scope: &async_ebpf::program::HelperScope,
-    data_ptr: u64,
-    data_len: u64,
-    out_ptr: u64,
-    out_len: u64,
-    _: u64,
-) -> Result<u64, ()> {
-    if (out_len as usize) != SHA256_LEN {
-        return Err(());
-    }
-    let data = scope.user_memory(data_ptr, data_len)?;
-    let mut hasher = Sha256::new();
-    hasher.update(&data);
-    let digest = hasher.finalize();
-    let mut out = scope.user_memory_mut(out_ptr, SHA256_LEN as u64)?;
-    out.copy_from_slice(&digest);
-    Ok(SHA256_LEN as u64)
-}
-
-pub fn h_hmac_sha256(
-    scope: &async_ebpf::program::HelperScope,
-    key_ptr: u64,
-    key_len: u64,
-    msg_ptr: u64,
-    msg_len: u64,
-    out_ptr: u64,
-) -> Result<u64, ()> {
-    type HmacSha256 = Hmac<Sha256>;
-    let key = scope.user_memory(key_ptr, key_len)?;
-    let msg = scope.user_memory(msg_ptr, msg_len)?;
-    let mut mac = HmacSha256::new_from_slice(&key).map_err(|_| ())?;
-    mac.update(&msg);
-    let digest = mac.finalize().into_bytes();
-    let mut out = scope.user_memory_mut(out_ptr, HMAC_SHA256_LEN as u64)?;
-    out[..digest.len()].copy_from_slice(&digest);
-    Ok(digest.len() as u64)
-}
-
-pub fn h_base64_encode(
-    scope: &async_ebpf::program::HelperScope,
-    data_ptr: u64,
-    data_len: u64,
-    out_ptr: u64,
-    out_len: u64,
-    encoding: u64,
-) -> Result<u64, ()> {
-    let data = scope.user_memory(data_ptr, data_len)?;
-    let required_len = base64_encoded_len(encoding, &data)?;
-    if data_len != 0 && required_len == 0 {
-        return Err(());
-    }
-    if out_len == 0 {
-        return Ok(required_len as u64);
-    }
-    if required_len as u64 > out_len {
-        return Err(());
-    }
-    let mut out = scope.user_memory_mut(out_ptr, out_len)?;
-    base64_encode_into(encoding, &data, &mut out[..required_len])?;
-    Ok(required_len as u64)
-}
-
-pub fn h_base64_decode_in_place(
-    scope: &async_ebpf::program::HelperScope,
-    buf_ptr: u64,
-    buf_len: u64,
-    encoding: u64,
-    _: u64,
-    _: u64,
-) -> Result<u64, ()> {
-    if buf_len == 0 {
-        return Ok(0);
-    }
-    let mut buf = scope.user_memory_mut(buf_ptr, buf_len)?;
-    match base64_decode_in_place(encoding, &mut buf) {
-        Ok(x) => Ok(x),
-        Err(_) => Ok(-1i64 as u64),
-    }
-}
-
 pub fn h_memcpy(
-    scope: &async_ebpf::program::HelperScope,
+    scope: &HelperScope,
     dst_ptr: u64,
     src_ptr: u64,
     n: u64,
@@ -201,7 +87,7 @@ pub fn h_memcpy(
 }
 
 pub fn h_memcmp(
-    scope: &async_ebpf::program::HelperScope,
+    scope: &HelperScope,
     a_ptr: u64,
     b_ptr: u64,
     n: u64,
@@ -223,7 +109,7 @@ pub fn h_memcmp(
 }
 
 pub fn h_memset(
-    scope: &async_ebpf::program::HelperScope,
+    scope: &HelperScope,
     dst_ptr: u64,
     c: u64,
     n: u64,
@@ -239,7 +125,7 @@ pub fn h_memset(
 }
 
 pub fn h_object_free(
-    scope: &async_ebpf::program::HelperScope,
+    scope: &HelperScope,
     idx: u64,
     _: u64,
     _: u64,
@@ -256,50 +142,8 @@ pub fn h_object_free(
     })
 }
 
-fn base64_encoded_len(encoding: u64, data: &[u8]) -> Result<usize, ()> {
-    match encoding {
-        BASE64_ENCODING_STANDARD => Ok(Base64::encoded_len(data)),
-        BASE64_ENCODING_STANDARD_NO_PAD => Ok(Base64Unpadded::encoded_len(data)),
-        BASE64_ENCODING_URL => Ok(Base64Url::encoded_len(data)),
-        BASE64_ENCODING_URL_NO_PAD => Ok(Base64UrlUnpadded::encoded_len(data)),
-        _ => Err(()),
-    }
-}
-
-fn base64_encode_into(encoding: u64, data: &[u8], out: &mut [u8]) -> Result<(), ()> {
-    match encoding {
-        BASE64_ENCODING_STANDARD => Base64::encode(data, out).map(|_| ()).map_err(|_| ()),
-        BASE64_ENCODING_STANDARD_NO_PAD => Base64Unpadded::encode(data, out)
-            .map(|_| ())
-            .map_err(|_| ()),
-        BASE64_ENCODING_URL => Base64Url::encode(data, out).map(|_| ()).map_err(|_| ()),
-        BASE64_ENCODING_URL_NO_PAD => Base64UrlUnpadded::encode(data, out)
-            .map(|_| ())
-            .map_err(|_| ()),
-        _ => Err(()),
-    }
-}
-
-fn base64_decode_in_place(encoding: u64, buf: &mut [u8]) -> Result<u64, ()> {
-    match encoding {
-        BASE64_ENCODING_STANDARD => Base64::decode_in_place(buf)
-            .map(|decoded| decoded.len() as u64)
-            .map_err(|_| ()),
-        BASE64_ENCODING_STANDARD_NO_PAD => Base64Unpadded::decode_in_place(buf)
-            .map(|decoded| decoded.len() as u64)
-            .map_err(|_| ()),
-        BASE64_ENCODING_URL => Base64Url::decode_in_place(buf)
-            .map(|decoded| decoded.len() as u64)
-            .map_err(|_| ()),
-        BASE64_ENCODING_URL_NO_PAD => Base64UrlUnpadded::decode_in_place(buf)
-            .map(|decoded| decoded.len() as u64)
-            .map_err(|_| ()),
-        _ => Err(()),
-    }
-}
-
 pub fn h_req_method(
-    scope: &async_ebpf::program::HelperScope,
+    scope: &HelperScope,
     out_ptr: u64,
     out_len: u64,
     _: u64,
@@ -312,7 +156,7 @@ pub fn h_req_method(
 }
 
 pub fn h_req_path(
-    scope: &async_ebpf::program::HelperScope,
+    scope: &HelperScope,
     out_ptr: u64,
     out_len: u64,
     _: u64,
@@ -325,7 +169,7 @@ pub fn h_req_path(
 }
 
 pub fn h_req_uri(
-    scope: &async_ebpf::program::HelperScope,
+    scope: &HelperScope,
     out_ptr: u64,
     out_len: u64,
     _: u64,
@@ -338,7 +182,7 @@ pub fn h_req_uri(
 }
 
 pub fn h_req_set_uri(
-    scope: &async_ebpf::program::HelperScope,
+    scope: &HelperScope,
     uri_ptr: u64,
     uri_len: u64,
     _: u64,
@@ -353,7 +197,7 @@ pub fn h_req_set_uri(
 }
 
 pub fn h_req_query(
-    scope: &async_ebpf::program::HelperScope,
+    scope: &HelperScope,
     out_ptr: u64,
     out_len: u64,
     _: u64,
@@ -366,7 +210,7 @@ pub fn h_req_query(
 }
 
 pub fn h_req_scheme(
-    scope: &async_ebpf::program::HelperScope,
+    scope: &HelperScope,
     out_ptr: u64,
     out_len: u64,
     _: u64,
@@ -379,7 +223,7 @@ pub fn h_req_scheme(
 }
 
 pub fn h_req_peer(
-    scope: &async_ebpf::program::HelperScope,
+    scope: &HelperScope,
     out_ptr: u64,
     out_len: u64,
     _: u64,
@@ -392,7 +236,7 @@ pub fn h_req_peer(
 }
 
 pub fn h_req_header(
-    scope: &async_ebpf::program::HelperScope,
+    scope: &HelperScope,
     name_ptr: u64,
     name_len: u64,
     out_ptr: u64,
@@ -407,7 +251,7 @@ pub fn h_req_header(
 }
 
 pub fn h_req_set_header(
-    scope: &async_ebpf::program::HelperScope,
+    scope: &HelperScope,
     name_ptr: u64,
     name_len: u64,
     value_ptr: u64,
@@ -427,7 +271,7 @@ pub fn h_req_set_header(
 }
 
 pub fn h_req_query_param(
-    scope: &async_ebpf::program::HelperScope,
+    scope: &HelperScope,
     name_ptr: u64,
     name_len: u64,
     out_ptr: u64,
@@ -442,7 +286,7 @@ pub fn h_req_query_param(
 }
 
 pub fn h_meta_get(
-    scope: &async_ebpf::program::HelperScope,
+    scope: &HelperScope,
     key_ptr: u64,
     key_len: u64,
     out_ptr: u64,
@@ -461,7 +305,7 @@ pub fn h_meta_get(
 }
 
 pub fn h_meta_set(
-    scope: &async_ebpf::program::HelperScope,
+    scope: &HelperScope,
     key_ptr: u64,
     key_len: u64,
     val_ptr: u64,
@@ -481,7 +325,7 @@ pub fn h_meta_set(
 }
 
 pub fn h_respond(
-    scope: &async_ebpf::program::HelperScope,
+    scope: &HelperScope,
     status: u64,
     body_ptr: u64,
     body_len: u64,
@@ -501,7 +345,7 @@ pub fn h_respond(
 }
 
 pub fn h_reverse_proxy(
-    scope: &async_ebpf::program::HelperScope,
+    scope: &HelperScope,
     url_ptr: u64,
     url_len: u64,
     _: u64,

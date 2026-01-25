@@ -43,7 +43,7 @@ End-to-end tests live in `testing/` and are written in TypeScript for Deno.
 ```bash
 # Run all e2e tests
 cd testing
-deno test -A
+deno test -A --parallel
 ```
 
 The scripting tests require `clang` and `llc` to be available on PATH; they are skipped if the toolchain is missing.

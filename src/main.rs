@@ -15,10 +15,13 @@ mod site;
 mod thread_pool;
 mod tls;
 
+use std::io::Write;
 use std::net::TcpListener;
+use std::os::fd::FromRawFd;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::{collections::HashSet, io::Write};
+
+use crate::cli::ListenAddr;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -65,12 +68,12 @@ fn main() -> Result<()> {
         rlimit::increase_nofile_limit(1048576).with_context(|| "failed to raise fd limit")?;
     eprintln!("fd limit {}", fdlimit);
 
-    let http_listener = TcpListener::bind(&config.http_addr)
-        .with_context(|| format!("failed to bind HTTP listener on {}", config.http_addr))?;
+    let http_listener = create_listener(&config.http_addr)
+        .with_context(|| format!("failed to create HTTP listener for {}", config.http_addr))?;
     let tls_listener = if let Some(x) = &config.tls_addr {
         Some(
-            TcpListener::bind(x)
-                .with_context(|| format!("failed to bind TLS listener on {}", x))?,
+            create_listener(x)
+                .with_context(|| format!("failed to create TLS listener for {}", x))?,
         )
     } else {
         None
@@ -175,47 +178,13 @@ fn main() -> Result<()> {
         })
 }
 
-fn setup_landlock(config: &StaticConfig) -> anyhow::Result<()> {
+fn setup_landlock(_config: &StaticConfig) -> anyhow::Result<()> {
     let abi = landlock::ABI::V2;
     let access_read = AccessFs::ReadFile;
     let access_all = AccessFs::from_all(abi);
 
     let mut ruleset = Ruleset::default().handle_access(access_all)?.create()?;
-    if let Ok(x) = PathFd::new("/etc/resolv.conf") {
-        ruleset = ruleset.add_rule(PathBeneath::new(x, access_read))?;
-    }
-
-    let mut ro_paths = HashSet::new();
-
-    if let Some(x) = config.tar_path.parent() {
-        ro_paths.insert(x);
-    }
-
-    if let Some(x) = &config.cert_path {
-        if let Some(x) = x.parent() {
-            ro_paths.insert(x);
-        }
-    }
-
-    if let Some(x) = &config.key_path {
-        if let Some(x) = x.parent() {
-            ro_paths.insert(x);
-        }
-    }
-
-    if let Some(x) = &config.reload_signal_file {
-        if let Some(x) = x.parent() {
-            ro_paths.insert(x);
-        }
-    }
-
-    for x in ro_paths {
-        ruleset = ruleset.add_rule(PathBeneath::new(
-            PathFd::new(x)
-                .with_context(|| format!("failed to open for landlock: {}", x.display()))?,
-            access_read,
-        ))?
-    }
+    ruleset = ruleset.add_rule(PathBeneath::new(PathFd::new("/")?, access_read))?;
     ruleset.restrict_self()?;
     Ok(())
 }
@@ -240,6 +209,21 @@ fn setup_ns_isolation(config: &StaticConfig) -> anyhow::Result<()> {
             .with_context(|| "write gid_map")?;
     }
     Ok(())
+}
+
+fn create_listener(addr: &ListenAddr) -> std::io::Result<TcpListener> {
+    match addr {
+        ListenAddr::Socket(socket_addr) => TcpListener::bind(socket_addr),
+        ListenAddr::Fd(fd) => {
+            // SAFETY: The caller is responsible for ensuring the fd is a valid TCP listener socket.
+            // This is typically used for socket activation (e.g., systemd) where the parent process
+            // passes a pre-bound socket to the child.
+            let listener = unsafe { TcpListener::from_raw_fd(*fd) };
+            // Set non-blocking mode since we're using async I/O
+            listener.set_nonblocking(true)?;
+            Ok(listener)
+        }
+    }
 }
 
 pub fn drop_all_capabilities() -> Result<(), caps::errors::CapsError> {

@@ -227,6 +227,7 @@ async fn run_tls_listener(
     let addr = shared
         .config
         .tls_addr
+        .as_ref()
         .ok_or_else(|| anyhow!("TLS listener requested without address"))?;
     let listener = shared
         .tls_listener

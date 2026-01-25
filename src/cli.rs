@@ -1,6 +1,45 @@
-use std::{net::SocketAddr, path::PathBuf};
+use std::{net::SocketAddr, os::fd::RawFd, path::PathBuf, str::FromStr};
 
 use clap::Parser;
+
+/// A listen address: either a socket address or a file descriptor.
+#[derive(Debug, Clone)]
+pub enum ListenAddr {
+    /// Bind to a socket address.
+    Socket(SocketAddr),
+    /// Use an inherited file descriptor (e.g., from socket activation).
+    Fd(RawFd),
+}
+
+impl FromStr for ListenAddr {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if let Some(fd_str) = s.strip_prefix("fd:") {
+            let fd: RawFd = fd_str
+                .parse()
+                .map_err(|e| format!("invalid file descriptor: {e}"))?;
+            if fd < 0 {
+                return Err("file descriptor must be non-negative".into());
+            }
+            Ok(ListenAddr::Fd(fd))
+        } else {
+            let addr: SocketAddr = s
+                .parse()
+                .map_err(|e| format!("invalid socket address: {e}"))?;
+            Ok(ListenAddr::Socket(addr))
+        }
+    }
+}
+
+impl std::fmt::Display for ListenAddr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ListenAddr::Socket(addr) => write!(f, "{}", addr),
+            ListenAddr::Fd(fd) => write!(f, "fd:{}", fd),
+        }
+    }
+}
 
 pub fn must_be_positive(value: &str) -> Result<usize, String> {
     let parsed: usize = value.parse().map_err(|e| format!("invalid number: {e}"))?;
@@ -14,13 +53,13 @@ pub fn must_be_positive(value: &str) -> Result<usize, String> {
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 pub struct Cli {
-    /// Address (ip:port) to bind the HTTP server to.
+    /// Address to bind the HTTP server to. Either ip:port or fd:N for an inherited socket.
     #[arg(long, default_value = "0.0.0.0:8080")]
-    pub addr: SocketAddr,
+    pub addr: ListenAddr,
 
-    /// Optional HTTPS address (ip:port). Requires --cert and --key.
+    /// Optional HTTPS address. Either ip:port or fd:N. Requires --cert and --key.
     #[arg(long)]
-    pub tls_addr: Option<SocketAddr>,
+    pub tls_addr: Option<ListenAddr>,
 
     /// TLS certificate (PEM).
     #[arg(long)]

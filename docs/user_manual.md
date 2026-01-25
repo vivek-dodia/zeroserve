@@ -61,8 +61,10 @@ zeroserve [OPTIONS] SITE_TAR
 
 Key options:
 
-- `--addr <IP:PORT>`: HTTP bind address (default `0.0.0.0:8080`).
-- `--tls-addr <IP:PORT>`: HTTPS bind address (requires `--cert` and `--key`).
+- `--addr <ADDR>`: HTTP listen address (default `0.0.0.0:8080`). Accepts either
+  `ip:port` to bind a new socket, or `fd:N` to use an inherited file descriptor.
+- `--tls-addr <ADDR>`: HTTPS listen address (requires `--cert` and `--key`).
+  Accepts either `ip:port` or `fd:N`.
 - `--cert <FILE>`: TLS certificate PEM.
 - `--key <FILE>`: TLS private key PEM.
 - `--index <NAME>`: Default document for directories (default `index.html`).
@@ -93,6 +95,9 @@ zeroserve --addr 0.0.0.0:8080 \
 
 # HTML fallback and PROXY protocol
 zeroserve --try-html --enable-proxy-protocol site.tar
+
+# Socket activation (inherit pre-bound sockets)
+zeroserve --addr fd:3 --tls-addr fd:4 --cert cert.pem --key key.pem site.tar
 ```
 
 ## Routing and file lookup
@@ -186,6 +191,8 @@ Crypto and encoding:
 - `zs_hmac_sha256(key, key_len, msg, msg_len, out)` writes a 32-byte HMAC-SHA-256 digest.
 - `zs_base64_encode(data, data_len, out, out_len, encoding)` encodes Base64.
 - `zs_base64_decode_in_place(buf, buf_len, encoding)` decodes Base64 in place.
+- `zs_hex_encode(data, data_len, out, out_len, case)` encodes binary data to hexadecimal.
+- `zs_hex_decode_in_place(buf, buf_len)` decodes hexadecimal to binary in place.
 
 JSON parsing:
 
@@ -263,9 +270,12 @@ Helper notes:
 - `zs_hmac_sha256` requires an output buffer of at least 32 bytes.
 - `zs_base64_encode` needs an output buffer sized to the encoded length; use `out_len = 0` to query it.
 - `zs_base64_decode_in_place` uses `buf_len` bytes of input (exclude any trailing NUL).
+- `zs_hex_encode` outputs 2 hex characters per input byte; use `out_len = 0` to query the required length.
+- `zs_hex_decode_in_place` requires an even `buf_len`; returns the decoded length or -1 on error.
 - `zs_json_read_i64` writes a native-endian `i64`; `zs_json_read_bool` writes a single byte.
 - Base64 `encoding` values: `ZS_BASE64_STANDARD` (0), `ZS_BASE64_STANDARD_NO_PAD` (1),
   `ZS_BASE64_URL` (2), `ZS_BASE64_URL_NO_PAD` (3).
+- Hex `case` values: `ZS_HEX_LOWERCASE` (0), `ZS_HEX_UPPERCASE` (1).
 - Header names are matched case-insensitively.
 - `ZS_STR("literal")` expands to `(ptr, len)` using `zs_strlen`, which is handy for
   helpers that take a string pointer plus length; only use it with NUL-terminated
@@ -320,6 +330,40 @@ Zeroserve will:
 - Use the backend host (and port if non-default) for the `Host` header.
 
 Only `http` and `https` backends are supported.
+
+## Socket activation
+
+Zeroserve supports socket activation, where a process manager (such as systemd)
+pre-binds the listening sockets and passes them as inherited file descriptors.
+Use `fd:N` syntax instead of `ip:port`:
+
+```bash
+zeroserve --addr fd:3 site.tar
+```
+
+This is useful for:
+
+- Zero-downtime restarts (the socket stays open during process replacement).
+- Running without elevated privileges (the parent binds privileged ports).
+- Integration with systemd socket units.
+
+Example systemd socket unit (`zeroserve.socket`):
+
+```ini
+[Socket]
+ListenStream=80
+ListenStream=443
+
+[Install]
+WantedBy=sockets.target
+```
+
+Example systemd service unit (`zeroserve.service`):
+
+```ini
+[Service]
+ExecStart=/usr/bin/zeroserve --addr fd:3 --tls-addr fd:4 --cert /etc/certs/cert.pem --key /etc/certs/key.pem /var/www/site.tar
+```
 
 ## Operational notes
 
