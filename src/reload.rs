@@ -14,8 +14,8 @@ use futures::{
 use monoio::{fs::File, io::AsyncReadRentExt};
 
 use crate::{
-    script::ScriptRuntime, shared::SharedState, site::Site, thread_pool::CPU_TP,
-    tls::load_tls_if_configured,
+    ratelimit::spawn_cleanup_task, script::ScriptRuntime, shared::SharedState, site::Site,
+    thread_pool::CPU_TP, tls::load_tls_if_configured,
 };
 
 pub struct SighupBlocked {
@@ -119,10 +119,20 @@ async fn reload_assets(
     CPU_TP.with(|tp| {
         let shared = shared.clone();
         tp.spawn(move || {
-            let _ = tx.send(Site::load(&shared.config.tar_path).map(Arc::new));
+            let _ = tx.send(
+                Site::load(
+                    &shared.config.tar_path,
+                    shared.config.max_rate_limit_buckets,
+                )
+                .map(Arc::new),
+            );
         });
     });
     let site = rx.await.unwrap()?;
+
+    // Spawn background task to clean up expired rate limit buckets for the new site
+    spawn_cleanup_task(site.rate_limit_manager.clone());
+
     shared.site.store(site.clone());
     eprintln!("reloaded tarball {}", shared.config.tar_path.display());
     match script_runtime.reload(site).await {

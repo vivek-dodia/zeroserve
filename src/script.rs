@@ -148,6 +148,12 @@ static SCRIPT_HELPERS: &[(&str, Helper)] = &[
     ("zs_meta_set", helpers::h_meta_set),
     ("zs_respond", helpers::h_respond),
     ("zs_reverse_proxy", helpers::h_reverse_proxy),
+    (
+        "zs_aws_v4_authorization_header",
+        helpers::h_aws_v4_authorization_header,
+    ),
+    ("zs_aws_v4_presigned_url", helpers::h_aws_v4_presigned_url),
+    ("zs_rate_limit", helpers::h_rate_limit),
 ];
 
 static HELPER_TABLES: &[&[(&str, Helper)]] = &[SCRIPT_HELPERS];

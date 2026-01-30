@@ -115,6 +115,94 @@ extern zs_s64 zs_respond(zs_u64 status, const void *body, zs_u64 body_len);
 
 extern zs_s64 zs_reverse_proxy(const char *backend_url, zs_u64 backend_url_len);
 
+/* AWS SigV4 signing */
+
+typedef struct {
+  /* Credentials */
+  const void *access_key;
+  zs_u64 access_key_len;
+  const void *secret_key;
+  zs_u64 secret_key_len;
+
+  /* Request metadata */
+  const void *region;
+  zs_u64 region_len;
+  const void *service;
+  zs_u64 service_len;
+  const void *method;
+  zs_u64 method_len;
+  const void *uri;
+  zs_u64 uri_len;
+
+  /* Headers as JSON object handle */
+  zs_u64 headers_json;
+
+  /* Body hash: hex-encoded SHA256 or "UNSIGNED-PAYLOAD" */
+  const void *body_hash;
+  zs_u64 body_hash_len;
+
+  /* Unix timestamp in milliseconds */
+  zs_s64 timestamp_ms;
+
+  /* Output buffer */
+  void *out;
+  zs_u64 out_len;
+} zs_aws_v4_sign_params;
+
+/* Generate AWS SigV4 Authorization header value (not including header name).
+ * Returns the number of characters written (excluding null terminator), or -1
+ * on error. If out_len is 0, returns the required buffer size without writing.
+ * The output is always null-terminated if out_len > 0 and space permits. */
+extern zs_s64
+zs_aws_v4_authorization_header(const zs_aws_v4_sign_params *params,
+                               zs_u64 params_len);
+
+/* Generate AWS SigV4 pre-signed URL.
+ * Returns the number of characters written (excluding null terminator), or -1
+ * on error. If out_len is 0, returns the required buffer size without writing.
+ * The output is always null-terminated if out_len > 0 and space permits.
+ * The output is a URL path with query string containing the signature
+ * parameters (X-Amz-Algorithm, X-Amz-Credential, X-Amz-Date, X-Amz-Expires,
+ * X-Amz-SignedHeaders, X-Amz-Signature). */
+extern zs_s64 zs_aws_v4_presigned_url(const zs_aws_v4_sign_params *params,
+                                      zs_u64 params_len, zs_u64 expires_secs);
+
+/* Rate limiting */
+
+#define ZS_RATE_LIMIT_ALLOWED 0
+#define ZS_RATE_LIMIT_EXCEEDED_SECOND 1
+#define ZS_RATE_LIMIT_EXCEEDED_MINUTE 2
+#define ZS_RATE_LIMIT_EXCEEDED_HOUR 3
+#define ZS_RATE_LIMIT_EXCEEDED_BUCKET_LIMIT 4
+
+/* Check rate limit for a key with per-second, per-minute, and per-hour limits.
+ *
+ * Arguments:
+ *   key, key_len     - Arbitrary key bytes (e.g., IP address, API key, user ID)
+ *   per_second       - Max requests per second (0 = unlimited)
+ *   per_minute       - Max requests per minute (0 = unlimited)
+ *   per_hour         - Max requests per hour (0 = unlimited)
+ *
+ * Returns:
+ *   0 = allowed
+ *   1 = per-second limit exceeded
+ *   2 = per-minute limit exceeded
+ *   3 = per-hour limit exceeded
+ *   4 = bucket limit exceeded (too many unique keys)
+ *  -1 = error (invalid parameters or key too long)
+ *
+ * Example:
+ *   // Rate limit by IP: 10 req/s, 100 req/min, 1000 req/hour
+ *   char peer[64];
+ *   zs_req_peer(peer, sizeof(peer));
+ *   int64_t result = zs_rate_limit(ZS_STR(peer), 10, 100, 1000);
+ *   if (result == ZS_RATE_LIMIT_EXCEEDED_SECOND) {
+ *       zs_respond(429, ZS_STR("{\"error\":\"rate limit exceeded\"}"));
+ *   }
+ */
+extern zs_s64 zs_rate_limit(const void *key, zs_u64 key_len, zs_u64 per_second,
+                            zs_u64 per_minute, zs_u64 per_hour);
+
 extern void *zs_memcpy(void *dst, const void *src, size_t n);
 extern int zs_memcmp(const void *a, const void *b, size_t n);
 extern void *zs_memset(void *dst, int c, size_t n);
@@ -177,8 +265,8 @@ zs_strncmp(const char *a, const char *b, size_t n) {
   return 0;
 }
 
-static __attribute__((unused)) ZS_INLINE char *
-zs_strrchr(const char *s, int c) {
+static __attribute__((unused)) ZS_INLINE char *zs_strrchr(const char *s,
+                                                          int c) {
   const char *last = 0;
   char target = (char)c;
 

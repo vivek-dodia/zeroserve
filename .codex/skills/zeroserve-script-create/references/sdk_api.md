@@ -1,11 +1,13 @@
 # Zeroserve SDK API (summary)
 
 ## Entry point and macros
+
 - Include the SDK: `#include <zeroserve.h>`.
 - Mark the entry function with `ZS_ENTRY` (section `zeroserve.request`).
 - `ZS_STR("literal")` expands to `(ptr, len)` for NUL-terminated literals.
 
 ## Request inspection
+
 - `zs_req_method(out, out_len)`
 - `zs_req_path(out, out_len)`
 - `zs_req_uri(out, out_len)`
@@ -18,25 +20,30 @@
   empty body, body > 256KB, or invalid JSON). The body is read lazily on first call and cached.
 
 ## Request mutation
+
 - `zs_req_set_uri(uri, uri_len)`
 - `zs_req_set_header(name, name_len, value, value_len)`
-  - Pass `value_len = 0` to remove a header.
+    - Pass `value_len = 0` to remove a header.
 
 ## Metadata (per-request string map)
+
 - `zs_meta_get(key, key_len, out, out_len)`
 - `zs_meta_set(key, key_len, value, value_len)`
-  - Keys prefixed with `zs.response.header.` become response headers.
+    - Keys prefixed with `zs.response.header.` become response headers.
 
 ## Response / proxy
+
 - `zs_respond(status, body, body_len)`
 - `zs_reverse_proxy(backend_url, backend_url_len)`
 
 ## Logging, time, and environment
+
 - `zs_log(msg, len)`
 - `zs_now_ms()`
 - `zs_env_get(name, name_len, out, out_len)` reads an environment variable.
 
 ## Crypto and encoding
+
 - `zs_getrandom(out, out_len)`
 - `zs_sha256(data, data_len, out, out_len)` writes a 32-byte SHA-256 digest (requires `out_len == 32`).
 - `zs_hmac_sha256(key, key_len, msg, msg_len, out)`
@@ -46,6 +53,7 @@
 - `zs_hex_decode_in_place(buf, buf_len)` decodes hexadecimal to binary in place.
 
 ## JSON parsing (handle table)
+
 - `zs_json_parse(data, data_len)` parses JSON and returns a handle (-1 on failure).
 - `zs_load_static_json(path, path_len)` reads the static file at `path` in the tarball and
   parses JSON, returning a handle (-1 if missing or invalid JSON). The path is used verbatim
@@ -67,6 +75,7 @@
 - The handle table is limited (32 entries); free handles to avoid exhaustion.
 
 ## JSON creation and modification
+
 - `zs_json_new_object()` creates an empty JSON object `{}`; returns a handle (-1 on failure).
 - `zs_json_new_array()` creates an empty JSON array `[]`; returns a handle (-1 on failure).
 - `zs_json_clone(handle)` deep-clones a JSON value into a new independent tree; returns a handle.
@@ -87,10 +96,12 @@
 - `zs_json_set_null(handle)` replaces the node with null.
 
 ## JSON response
+
 - `zs_json_respond(status, handle)` serializes the JSON handle to a response body, sets
   `Content-Type: application/json`, and sends the response. Returns 0 on success.
 
 ## Helper notes
+
 - String helpers write C strings into the output buffer.
 - Passing `out_len = 0` returns the required length.
 - Binary helpers return the number of bytes written and do not NUL-terminate.
@@ -107,3 +118,125 @@
   `zs_memcpy`, `zs_memset`, and `zs_utoa10`.
 - `zs_req_body_json` reads the body lazily (only when called) and caches the result.
   Subsequent calls return the cached handle. The body is limited to 256KB.
+
+## AWS SigV4 signing
+
+- `zs_aws_v4_authorization_header(params, params_len)` generates an AWS Signature Version 4
+  Authorization header value. Takes a pointer to `zs_aws_v4_sign_params` and the struct size.
+  Returns the number of characters written (excluding null terminator), or -1/-2 on error.
+  If `params->out_len` is 0, returns the required buffer size without writing.
+
+  The `zs_aws_v4_sign_params` struct fields:
+  - `access_key`, `access_key_len`: AWS access key ID
+  - `secret_key`, `secret_key_len`: AWS secret access key
+  - `region`, `region_len`: AWS region (e.g., "us-east-1")
+  - `service`, `service_len`: Service name (e.g., "s3", "execute-api")
+  - `method`, `method_len`: HTTP method (e.g., "GET", "POST")
+  - `uri`, `uri_len`: Request URI including path and optional query string
+  - `headers_json`: JSON object handle with headers to sign (e.g., `{"host": "s3.amazonaws.com"}`)
+  - `body_hash`, `body_hash_len`: Hex-encoded SHA256 of body, or "UNSIGNED-PAYLOAD"
+  - `timestamp_ms`: Unix timestamp in milliseconds for the request
+  - `out`, `out_len`: Output buffer for the Authorization header value
+
+  Example usage:
+
+  ```c
+  char auth[512];
+  zs_json headers = zs_json_new_object();
+  zs_json_set_string(headers, "host", 4, "s3.amazonaws.com", 16);
+
+  zs_aws_v4_sign_params p = {
+      .access_key = "AKIA...", .access_key_len = 20,
+      .secret_key = "wJalr...", .secret_key_len = 40,
+      .region = "us-east-1", .region_len = 9,
+      .service = "s3", .service_len = 2,
+      .method = "GET", .method_len = 3,
+      .uri = "/bucket/object", .uri_len = 14,
+      .headers_json = headers,
+      .body_hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      .body_hash_len = 64,
+      .timestamp_ms = zs_now_ms(),
+      .out = auth, .out_len = sizeof(auth)
+  };
+
+  zs_s64 n = zs_aws_v4_authorization_header(&p, sizeof(p));
+  if (n > 0) {
+      zs_req_set_header("Authorization", 13, auth, n);
+  }
+  zs_object_free(headers);
+  ```
+
+- `zs_aws_v4_presigned_url(params, params_len, expires_secs)` generates an AWS Signature
+  Version 4 pre-signed URL. Takes a pointer to `zs_aws_v4_sign_params`, the struct size,
+  and the expiration time in seconds. Returns the number of characters written (excluding
+  null terminator), or -1/-2 on error. If `params->out_len` is 0, returns the required
+  buffer size without writing.
+
+  The output is a URL path with query string containing the signature parameters
+  (`X-Amz-Algorithm`, `X-Amz-Credential`, `X-Amz-Date`, `X-Amz-Expires`,
+  `X-Amz-SignedHeaders`, `X-Amz-Signature`). The body is always treated as
+  `UNSIGNED-PAYLOAD`.
+
+  Example usage:
+
+  ```c
+  char url[1024];
+  zs_json headers = zs_json_new_object();
+  zs_s64 host_val = zs_json_parse(ZS_STR("\"s3.amazonaws.com\""));
+  zs_json_set(headers, ZS_STR("host"), host_val);
+  zs_object_free(host_val);
+
+  zs_aws_v4_sign_params p = {
+      .access_key = "AKIA...", .access_key_len = 20,
+      .secret_key = "wJalr...", .secret_key_len = 40,
+      .region = "us-east-1", .region_len = 9,
+      .service = "s3", .service_len = 2,
+      .method = "GET", .method_len = 3,
+      .uri = "/bucket/object?prefix=docs/", .uri_len = 25,
+      .headers_json = headers,
+      .timestamp_ms = zs_now_ms(),
+      .out = url, .out_len = sizeof(url)
+  };
+
+  zs_s64 n = zs_aws_v4_presigned_url(&p, sizeof(p), 3600);
+  if (n > 0) {
+      // url now contains "/bucket/object?prefix=docs/&X-Amz-Algorithm=..."
+  }
+  zs_object_free(headers);
+  ```
+
+## Rate limiting
+
+- `zs_rate_limit(key, key_len, per_second, per_minute, per_hour)` checks whether a request
+  should be allowed based on rate limits for the given key. Returns:
+  - `ZS_RATE_LIMIT_ALLOWED` (0) if allowed
+  - `ZS_RATE_LIMIT_EXCEEDED_SECOND` (1) if per-second limit exceeded
+  - `ZS_RATE_LIMIT_EXCEEDED_MINUTE` (2) if per-minute limit exceeded
+  - `ZS_RATE_LIMIT_EXCEEDED_HOUR` (3) if per-hour limit exceeded
+  - `ZS_RATE_LIMIT_EXCEEDED_BUCKET_LIMIT` (4) if too many unique keys are being tracked
+  - `-1` on error (invalid parameters or key too long, max 256 bytes)
+
+  A limit of 0 means unlimited for that window. The key can be any arbitrary bytes,
+  such as an IP address (`zs_req_peer`), API key, or user ID. Rate limit state is
+  shared across all requests and persists across hot reloads.
+
+  Example (rate limit by API key):
+
+  ```c
+  ZS_ENTRY
+  zs_u64 entry(void) {
+      char api_key[128];
+      if (zs_req_header("X-API-Key", 9, api_key, sizeof(api_key)) <= 0) {
+          zs_respond(401, ZS_STR("{\"error\":\"missing api key\"}"));
+          return 0;
+      }
+
+      // Allow 5 req/s, 60 req/min per API key
+      zs_s64 result = zs_rate_limit(ZS_STR(api_key), 5, 60, 0);
+      if (result != ZS_RATE_LIMIT_ALLOWED) {
+          zs_respond(429, ZS_STR("{\"error\":\"rate limit exceeded\"}"));
+          return 0;
+      }
+      return 0;
+  }
+  ```

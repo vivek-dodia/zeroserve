@@ -136,4 +136,8 @@ pub struct Cli {
     /// Maximum external memory footprint in kilobytes per request for scripts.
     #[arg(long, default_value_t = 256, value_parser = must_be_positive)]
     pub max_request_external_memory_footprint_kb: usize,
+
+    /// Maximum number of rate limit buckets (unique keys) to track.
+    #[arg(long, default_value_t = 10000, value_parser = must_be_positive)]
+    pub max_rate_limit_buckets: usize,
 }

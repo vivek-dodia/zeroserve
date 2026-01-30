@@ -23,6 +23,7 @@ pub struct StaticConfig {
     pub debug_proxy_protocol_disable_fast_path: bool,
     pub max_buffered_body_size: usize,
     pub max_request_external_memory_footprint: u64,
+    pub max_rate_limit_buckets: usize,
 }
 
 impl TryFrom<Cli> for StaticConfig {
@@ -78,6 +79,7 @@ impl TryFrom<Cli> for StaticConfig {
             max_buffered_body_size: cli.max_buffered_body_size_kb * 1024,
             max_request_external_memory_footprint: (cli.max_request_external_memory_footprint_kb
                 * 1024) as u64,
+            max_rate_limit_buckets: cli.max_rate_limit_buckets,
         })
     }
 }

@@ -9,6 +9,7 @@ Zero-config, fast `io_uring`-based HTTPS server.
 - Built-in TLS support
 - All network and disk I/O use `io_uring`
 - Clean - does not leave any temporary files on disk. Tarballs are indexed during loading (path -> byte-range), and served via byte-range reads on the tarball directly.
+- Support for low-latency eBPF request processing middleware
 
 ## Dependencies
 

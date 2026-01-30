@@ -7,6 +7,7 @@ mod json;
 mod logging;
 mod pack;
 mod pool;
+mod ratelimit;
 mod reload;
 mod script;
 mod server;
@@ -35,6 +36,7 @@ use crate::{
     cli::Cli,
     config::StaticConfig,
     pack::ZEROSERVE_H,
+    ratelimit::spawn_cleanup_task,
     reload::start_reload_thread,
     script::{ScriptRuntime, ScriptRuntimeConfig},
     server::amain,
@@ -122,7 +124,7 @@ fn main() -> Result<()> {
     // Block SIGHUP early before spawning any threads
     let sighup_blocked = SighupBlocked::new();
 
-    let site = Arc::new(Site::load(&config.tar_path)?);
+    let site = Arc::new(Site::load(&config.tar_path, config.max_rate_limit_buckets)?);
     eprintln!(
         "loaded {} entries from {} ({} bytes)",
         site.total_entries,
@@ -148,6 +150,9 @@ fn main() -> Result<()> {
         .build()
         .expect("zeroserve: failed to build io_uring runtime")
         .block_on(async move {
+            // Spawn background task to clean up expired rate limit buckets
+            spawn_cleanup_task(site.rate_limit_manager.clone());
+
             let script_runtime = unsafe {
                 ScriptRuntime::new(ScriptRuntimeConfig {
                     preempt_timer_interval: config.preempt_timer_interval,

@@ -9,12 +9,15 @@ use std::{
 use anyhow::{Context, Result, bail};
 use tar::{Archive, EntryType};
 
+use crate::ratelimit::RateLimitManager;
+
 pub struct Site {
     pub tar_file: StdFile,
     pub entries: HashMap<String, Arc<TarEntry>>,
     pub directories: HashSet<String>,
     pub total_bytes: u64,
     pub total_entries: usize,
+    pub rate_limit_manager: Arc<RateLimitManager>,
 }
 
 #[derive(Debug)]
@@ -27,7 +30,7 @@ pub struct TarEntry {
 }
 
 impl Site {
-    pub fn load(path: &Path) -> Result<Self> {
+    pub fn load(path: &Path, max_rate_limit_buckets: usize) -> Result<Self> {
         let file = StdFile::open(path)
             .with_context(|| format!("failed to open tarball {}", path.display()))?;
         let meta = file
@@ -87,6 +90,7 @@ impl Site {
             directories,
             total_bytes: meta.len(),
             total_entries,
+            rate_limit_manager: Arc::new(RateLimitManager::new(max_rate_limit_buckets)),
         })
     }
 

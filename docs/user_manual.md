@@ -194,6 +194,66 @@ Crypto and encoding:
 - `zs_hex_encode(data, data_len, out, out_len, case)` encodes binary data to hexadecimal.
 - `zs_hex_decode_in_place(buf, buf_len)` decodes hexadecimal to binary in place.
 
+AWS Signature Version 4:
+
+- `zs_aws_v4_authorization_header(params, params_len)` generates an AWS SigV4
+  Authorization header value. Takes a pointer to `zs_aws_v4_sign_params`
+  and the struct size. Returns the number of characters written (excluding null
+  terminator), or -1/-2 on error. If `params->out_len` is 0, returns the required
+  buffer size without writing.
+
+    The `zs_aws_v4_sign_params` struct fields:
+    - `access_key`, `access_key_len`: AWS access key ID
+    - `secret_key`, `secret_key_len`: AWS secret access key
+    - `region`, `region_len`: AWS region (e.g., "us-east-1")
+    - `service`, `service_len`: Service name (e.g., "s3", "execute-api")
+    - `method`, `method_len`: HTTP method (e.g., "GET", "POST")
+    - `uri`, `uri_len`: Request URI including path and optional query string
+    - `headers_json`: JSON object handle with headers to sign
+    - `body_hash`, `body_hash_len`: Hex-encoded SHA256, or "UNSIGNED-PAYLOAD"
+    - `timestamp_ms`: Unix timestamp in milliseconds
+    - `out`, `out_len`: Output buffer for the Authorization header value
+
+- `zs_aws_v4_presigned_url(params, params_len, expires_secs)` generates an AWS SigV4
+  pre-signed URL. Takes a pointer to `zs_aws_v4_sign_params`, the struct size, and the
+  expiration time in seconds. Returns the number of characters written (excluding null
+  terminator), or -1/-2 on error. If `params->out_len` is 0, returns the required
+  buffer size without writing.
+
+  The output is a URL path with query string containing the signature parameters
+  (`X-Amz-Algorithm`, `X-Amz-Credential`, `X-Amz-Date`, `X-Amz-Expires`,
+  `X-Amz-SignedHeaders`, `X-Amz-Signature`). The body is always treated as
+  `UNSIGNED-PAYLOAD`.
+
+  The `zs_aws_v4_sign_params` struct is shared with `zs_aws_v4_authorization_header`,
+  but `body_hash` is ignored (always treated as `UNSIGNED-PAYLOAD`).
+
+Rate limiting:
+
+- `zs_rate_limit(key, key_len, per_second, per_minute, per_hour)` checks whether a
+  request should be allowed based on rate limits for the given key. Returns:
+  - `ZS_RATE_LIMIT_ALLOWED` (0) if the request is allowed
+  - `ZS_RATE_LIMIT_EXCEEDED_SECOND` (1) if per-second limit exceeded
+  - `ZS_RATE_LIMIT_EXCEEDED_MINUTE` (2) if per-minute limit exceeded
+  - `ZS_RATE_LIMIT_EXCEEDED_HOUR` (3) if per-hour limit exceeded
+  - `ZS_RATE_LIMIT_EXCEEDED_BUCKET_LIMIT` (4) if too many unique keys are being tracked
+  - `-1` on error (invalid parameters or key too long, max 256 bytes)
+
+  A limit of 0 means unlimited for that window. The key can be any arbitrary bytes,
+  such as an IP address (`zs_req_peer`), API key, or user ID. Rate limit state is
+  shared across all requests and persists across hot reloads.
+
+  Example (rate limit by IP):
+  ```c
+  char peer[64];
+  zs_req_peer(peer, sizeof(peer));
+  int64_t result = zs_rate_limit(ZS_STR(peer), 10, 100, 1000);
+  if (result == ZS_RATE_LIMIT_EXCEEDED_SECOND) {
+      zs_respond(429, ZS_STR("{\"error\":\"rate limit exceeded\"}"));
+      return 0;
+  }
+  ```
+
 JSON parsing:
 
 - `zs_json_parse(data, data_len)` parses JSON and returns a handle (-1 on failure).
