@@ -295,28 +295,26 @@ zs_u64 entry(void) {
                 const host = url.hostname;
                 const port = parseInt(url.port, 10);
 
-                // Test that encoded path segments are decoded before reaching script
+                // %2f within a segment is rejected (would create path confusion)
                 const res1 = await sendRawRequest(host, port, "/echo/foo%2fbar");
-                assertEquals(res1.status, 200);
-                // %2f should be decoded to /
-                assertEquals(decoder.decode(res1.body), "/echo/foo/bar");
+                assertEquals(res1.status, 400);
 
-                // Test that . segments are removed
+                // . segments are removed
                 const res2 = await sendRawRequest(host, port, "/echo/./subdir");
                 assertEquals(res2.status, 200);
                 assertEquals(decoder.decode(res2.body), "/echo/subdir");
 
-                // Test that .. within bounds is resolved
+                // .. within bounds is resolved
                 const res3 = await sendRawRequest(host, port, "/echo/a/../b");
                 assertEquals(res3.status, 200);
                 assertEquals(decoder.decode(res3.body), "/echo/b");
 
-                // Test that encoded space is decoded
+                // Encoded characters are re-encoded after normalization
                 const res4 = await sendRawRequest(host, port, "/echo/hello%20world");
                 assertEquals(res4.status, 200);
-                assertEquals(decoder.decode(res4.body), "/echo/hello world");
+                assertEquals(decoder.decode(res4.body), "/echo/hello%20world");
 
-                // Test .. that navigates up within allowed space
+                // .. that navigates up within allowed space
                 const res5 = await sendRawRequest(host, port, "/echo/a/b/../c");
                 assertEquals(res5.status, 200);
                 assertEquals(decoder.decode(res5.body), "/echo/a/c");

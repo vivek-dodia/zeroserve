@@ -1329,12 +1329,8 @@ fn build_script_request(
         }
     }
 
-    // Convert NormalizedPath to sanitized path string (with leading /)
-    let path = if normalized_path.relative().is_empty() {
-        "/".to_string()
-    } else {
-        format!("/{}", normalized_path.relative())
-    };
+    // Convert NormalizedPath to sanitized + urlencoded path string (with leading /)
+    let encoded_path = normalized_path.encoded_path();
 
     let query = head.uri.query().unwrap_or("").to_string();
     let mut query_params = HashMap::new();
@@ -1346,16 +1342,16 @@ fn build_script_request(
         }
     }
 
-    // Build URI as sanitized path + query (if present)
+    // Build URI from re-encoded normalized path + original query
     let uri = match head.uri.query() {
-        Some(q) => format!("{}?{}", path, q),
-        None => path.clone(),
+        Some(q) => format!("{}?{}", encoded_path, q),
+        None => encoded_path.clone(),
     };
 
     ScriptRequest {
         request_id,
         method: head.method.as_str().to_string(),
-        path,
+        path: encoded_path,
         uri,
         query,
         scheme: scheme.as_str().to_string(),
@@ -1714,7 +1710,9 @@ where
     write_response_head(w, status, &headers).await?;
 
     if !send_body {
-        drain_proxy_payload(conn, &mut resp_body).await?;
+        if !head_only {
+            drain_proxy_payload(conn, &mut resp_body).await?;
+        }
         let _ = w.flush().await;
         return Ok(ProxyOutcome {
             reuse_backend: can_reuse,
@@ -1778,7 +1776,9 @@ where
     let mut stream = respond.send_response(head, !send_body)?;
 
     if !send_body {
-        drain_proxy_payload(conn, &mut resp_body).await?;
+        if !head_only {
+            drain_proxy_payload(conn, &mut resp_body).await?;
+        }
         return Ok(can_reuse);
     }
 

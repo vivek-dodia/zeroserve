@@ -142,6 +142,7 @@ impl Site {
 #[derive(Clone)]
 pub struct NormalizedPath {
     relative: String,
+    encoded_relative: String,
     dir_hint: bool,
 }
 
@@ -161,27 +162,53 @@ impl NormalizedPath {
             format!("{}/{}", self.relative, index)
         }
     }
+
+    /// Returns the normalized path with original percent-encoding preserved.
+    pub fn encoded_path(&self) -> String {
+        if self.encoded_relative.is_empty() {
+            "/".to_string()
+        } else {
+            format!("/{}", self.encoded_relative)
+        }
+    }
 }
 
 pub fn normalize_request_path(raw: &str) -> Option<NormalizedPath> {
     let normalized_raw = if raw.is_empty() { "/" } else { raw };
     let dir_hint =
         normalized_raw == "/" || (normalized_raw.ends_with('/') && normalized_raw.len() > 1);
-    let decoded = percent_decode(normalized_raw.as_bytes())?;
-    let mut components = Vec::new();
-    for part in decoded.split(|b| *b == b'/') {
-        if part.is_empty() || part == b"." {
+    let mut decoded_components = Vec::new();
+    let mut raw_components = Vec::new();
+    for raw_part in normalized_raw.split('/') {
+        if raw_part.is_empty() {
             continue;
         }
-        if part == b".." {
-            components.pop()?;
+        let decoded = percent_decode(raw_part.as_bytes())?;
+        if decoded == b"." {
             continue;
         }
-        let segment = String::from_utf8(part.to_vec()).ok()?;
-        components.push(segment);
+        if decoded == b".." {
+            decoded_components.pop()?;
+            raw_components.pop()?;
+            continue;
+        }
+        // Reject encoded slashes within a segment — a decoded `/` would
+        // create a path separator in `relative` that doesn't exist in the
+        // encoded view, enabling access-control bypasses.
+        if decoded.contains(&b'/') {
+            return None;
+        }
+        let segment = String::from_utf8(decoded).ok()?;
+        decoded_components.push(segment);
+        raw_components.push(raw_part.to_string());
     }
-    let relative = components.join("/");
-    Some(NormalizedPath { relative, dir_hint })
+    let relative = decoded_components.join("/");
+    let encoded_relative = raw_components.join("/");
+    Some(NormalizedPath {
+        relative,
+        encoded_relative,
+        dir_hint,
+    })
 }
 
 pub fn guess_mime(path: &str) -> &'static str {
