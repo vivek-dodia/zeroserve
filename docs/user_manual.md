@@ -393,7 +393,8 @@ Zeroserve will:
 
 - Append the request path to the backend base path.
 - Merge the backend query string with the request query string.
-- Use the backend host (and port if non-default) for the `Host` header.
+- Forward the request `Host` header unchanged; scripts may change or remove it with
+  `zs_req_set_header`.
 
 Only `http` and `https` backends are supported.
 

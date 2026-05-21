@@ -1442,15 +1442,6 @@ async fn reverse_proxy_request(
     let mut headers = head.headers;
     strip_hop_headers(&mut headers, is_ws_request);
     apply_proxy_request_headers(&mut headers, &body);
-    let host_header = target.host_header();
-    let host_header_value = match ::http::HeaderValue::from_str(&host_header) {
-        Ok(value) => value,
-        Err(_) => {
-            drain_payload(reader, &mut body).await;
-            return Err(anyhow!("invalid backend host header"));
-        }
-    };
-    headers.insert(::http::header::HOST, host_header_value);
 
     head.uri = uri;
     head.headers = headers;
@@ -1533,14 +1524,6 @@ async fn reverse_proxy_request_h2(
     let mut headers = head.headers;
     strip_hop_headers(&mut headers, false);
     let chunked = apply_proxy_request_headers_h2(&mut headers, has_body);
-    let host_header = target.host_header();
-    let host_header_value = match ::http::HeaderValue::from_str(&host_header) {
-        Ok(value) => value,
-        Err(_) => {
-            return Err(anyhow!("invalid backend host header"));
-        }
-    };
-    headers.insert(::http::header::HOST, host_header_value);
 
     head.uri = uri;
     head.headers = headers;
@@ -2134,15 +2117,6 @@ enum BackendScheme {
     Https,
 }
 
-impl BackendScheme {
-    fn default_port(self) -> u16 {
-        match self {
-            BackendScheme::Http => 80,
-            BackendScheme::Https => 443,
-        }
-    }
-}
-
 struct BackendTarget {
     scheme: BackendScheme,
     host: String,
@@ -2155,18 +2129,6 @@ struct BackendTarget {
 impl BackendTarget {
     fn authority(&self) -> String {
         format_host_port(&self.host, self.port, self.is_ipv6)
-    }
-
-    fn host_header(&self) -> String {
-        if self.port == self.scheme.default_port() {
-            if self.is_ipv6 {
-                format!("[{}]", self.host)
-            } else {
-                self.host.clone()
-            }
-        } else {
-            self.authority()
-        }
     }
 }
 
