@@ -1,4 +1,5 @@
 use std::{
+    io,
     os::fd::FromRawFd,
     path::{Path, PathBuf},
     rc::Rc,
@@ -84,7 +85,15 @@ async fn reload_task(
     }
     loop {
         monoio::select! {
-            _ = wait_for_signal(&mut sfile) => {},
+            res = wait_for_signal(&mut sfile) => {
+                if let Err(err) = res {
+                    if is_io_canceled(&err) {
+                        continue;
+                    }
+                    eprintln!("signalfd read failed: {err:?}");
+                    continue;
+                }
+            },
             x = file_rx.next() => {
                 if x.is_none() {
                     panic!("file watcher exited unexpectedly");
@@ -97,13 +106,17 @@ async fn reload_task(
     }
 }
 
-async fn wait_for_signal(sfile: &mut File) {
+async fn wait_for_signal(sfile: &mut File) -> io::Result<()> {
     let (res, _) = sfile
         .read_exact(Vec::with_capacity(std::mem::size_of::<
             libc::signalfd_siginfo,
         >()))
         .await;
-    res.expect("signalfd read");
+    res.map(|_| ())
+}
+
+fn is_io_canceled(err: &io::Error) -> bool {
+    err.raw_os_error() == Some(libc::ECANCELED)
 }
 
 async fn read_signal_file(path: &Path) -> Option<Vec<u8>> {
@@ -153,4 +166,23 @@ async fn reload_assets(
         Err(err) => eprintln!("TLS reload failed: {err:?}"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identifies_io_uring_cancellation() {
+        let err = io::Error::from_raw_os_error(libc::ECANCELED);
+
+        assert!(is_io_canceled(&err));
+    }
+
+    #[test]
+    fn does_not_treat_other_io_errors_as_canceled() {
+        let err = io::Error::from_raw_os_error(libc::EIO);
+
+        assert!(!is_io_canceled(&err));
+    }
 }
