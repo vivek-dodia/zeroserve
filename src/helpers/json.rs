@@ -541,7 +541,11 @@ pub fn h_json_respond(
             "zs.response.header.content-type".to_string(),
             "application/json".to_string(),
         );
-        ctx.response = Some(ScriptResponse { status, body });
+        ctx.response = Some(ScriptResponse {
+            status,
+            body,
+            headers: Vec::new(),
+        });
         Ok(0)
     })
 }

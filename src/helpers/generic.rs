@@ -339,7 +339,11 @@ pub fn h_respond(
         scope.user_memory(body_ptr, body_len)?.to_vec()
     };
     with_ectx(scope, |ctx| {
-        ctx.response = Some(ScriptResponse { status, body });
+        ctx.response = Some(ScriptResponse {
+            status,
+            body,
+            headers: Vec::new(),
+        });
         Ok(0)
     })
 }

@@ -11,7 +11,7 @@ arc-swap = "1"
 chrono = "0.4"
 async-ebpf = "0.2.2"
 # async-ebpf = { path = "../async-ebpf" }
-base64ct = "1"
+base64ct = { version = "1", features = ["alloc"] }
 dashmap = "6"
 blake3 = "1"
 bytes = "1"
@@ -47,6 +47,7 @@ url = "2"
 webpki-roots = "0.26"
 moka = { version = "0.12", features = ["future"] }
 tar = "0.4"
+chacha20poly1305 = "0.10"
 
 [patch.crates-io]
 monoio = { git = "https://github.com/bytedance/monoio", rev = "212fde187f3d41f65ecd35b9cac80f7e246bb58e" }

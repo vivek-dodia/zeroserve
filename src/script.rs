@@ -154,6 +154,10 @@ static SCRIPT_HELPERS: &[(&str, Helper)] = &[
     ),
     ("zs_aws_v4_presigned_url", helpers::h_aws_v4_presigned_url),
     ("zs_rate_limit", helpers::h_rate_limit),
+    ("zs_oidc_begin_login", helpers::h_oidc_begin_login),
+    ("zs_oidc_handle_callback", helpers::h_oidc_handle_callback),
+    ("zs_oidc_session_verify", helpers::h_oidc_session_verify),
+    ("zs_oidc_logout", helpers::h_oidc_logout),
 ];
 
 static HELPER_TABLES: &[&[(&str, Helper)]] = &[SCRIPT_HELPERS];
@@ -250,6 +254,10 @@ fn parse_query_params(query: &str) -> HashMap<String, String> {
 pub struct ScriptResponse {
     pub status: u16,
     pub body: Vec<u8>,
+    /// Extra response headers set by a helper (e.g. `Location`, `Set-Cookie`).
+    /// Emitted in order with `HeaderMap::append`, so repeated names (multiple
+    /// `Set-Cookie`) are preserved.
+    pub headers: Vec<(String, String)>,
 }
 
 #[derive(Debug)]
@@ -533,6 +541,7 @@ async fn run_request_scripts(
                 response: Some(ScriptResponse {
                     status: 500,
                     body: vec![],
+                    headers: Vec::new(),
                 }),
                 reverse_proxy: None,
             };

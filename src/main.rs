@@ -5,6 +5,7 @@ mod http;
 mod hupwatch;
 mod json;
 mod logging;
+mod oidc;
 mod pack;
 mod pool;
 mod ratelimit;

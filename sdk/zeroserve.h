@@ -203,6 +203,68 @@ extern zs_s64 zs_aws_v4_presigned_url(const zs_aws_v4_sign_params *params,
 extern zs_s64 zs_rate_limit(const void *key, zs_u64 key_len, zs_u64 per_second,
                             zs_u64 per_minute, zs_u64 per_hour);
 
+/* OAuth2 / OIDC login (Authorization Code + PKCE)
+ *
+ * zeroserve acts as the OAuth2 client (Relying Party). The three flow steps map
+ * to terminal helpers (they set the HTTP response, so the script should return
+ * right after calling them):
+ *
+ *   - zs_oidc_begin_login: redirect an unauthenticated user to the IdP.
+ *   - zs_oidc_handle_callback: handle the IdP redirect on your redirect_uri path.
+ *   - zs_oidc_session_verify: check the session cookie on every other request.
+ *   - zs_oidc_logout: clear the session.
+ *
+ * Configuration is passed as a JSON object handle (`cfg`), built with
+ * zs_json_parse or zs_json_new_object + zs_json_set_string. Recognised keys:
+ *
+ *   "issuer"                 (string, optional)  - enables OIDC discovery
+ *   "authorization_endpoint" (string, optional)  - overrides discovery
+ *   "token_endpoint"         (string, optional)  - overrides discovery
+ *   "client_id"              (string, required)
+ *   "client_secret"          (string, required)
+ *   "redirect_uri"           (string, required)  - must match the IdP config
+ *   "scope"                  (string, optional)  - default "openid profile email"
+ *   "cookie_secret"          (string, required)  - >= 16 bytes, keep STABLE
+ *   "session_ttl_secs"       (number, optional)  - default 3600
+ *
+ * Provide either "issuer" (for discovery) or the two explicit endpoints
+ * (explicit endpoints take precedence). Login state (PKCE verifier, CSRF state,
+ * nonce) and the session are carried in sealed (encrypted + authenticated,
+ * XChaCha20-Poly1305) cookies; there is no server-side session store. The
+ * "cookie_secret" must stay stable across restarts/instances or existing
+ * sessions are invalidated.
+ *
+ * NOTE: The id_token is fetched directly from the token endpoint over a
+ * server-validated TLS connection, so per OIDC Core 3.1.3.7 its claims
+ * (iss/aud/exp/nonce) are validated but its signature is NOT separately
+ * verified against a JWKS.
+ */
+
+/* Begin login: set the sealed state cookie and 302-redirect to the IdP.
+ * `return_to` is stored and the user is sent back there after callback.
+ * Terminal. Returns 0, or <0 on configuration error (the run then fails 500). */
+extern zs_s64 zs_oidc_begin_login(zs_s64 cfg, const char *return_to,
+                                  zs_u64 return_to_len);
+
+/* Handle the IdP redirect: reads `code` and `state` from the current request,
+ * validates state against the state cookie, exchanges the code (+PKCE verifier)
+ * at the token endpoint, validates id_token claims, sets the sealed session
+ * cookie, and 302-redirects to the stored return_to. Terminal. Returns 0; sets a
+ * 400 on a bad/missing state and a 502 if the token exchange fails. */
+extern zs_s64 zs_oidc_handle_callback(zs_s64 cfg);
+
+/* Verify the session cookie on the current request. Returns a JSON object handle
+ * of the identity claims (e.g. "sub", "email") on success, 0 if there is no
+ * valid session, or <0 on internal error. NOT terminal: the script decides what
+ * to do (e.g. call zs_oidc_begin_login when 0). Free the handle with
+ * zs_object_free. */
+extern zs_s64 zs_oidc_session_verify(zs_s64 cfg);
+
+/* Clear the session cookie. If `end_session_url` is non-empty, 302-redirect
+ * there (e.g. the IdP end-session endpoint); otherwise respond 200. Terminal. */
+extern zs_s64 zs_oidc_logout(zs_s64 cfg, const char *end_session_url,
+                             zs_u64 end_session_url_len);
+
 extern void *zs_memcpy(void *dst, const void *src, size_t n);
 extern int zs_memcmp(const void *a, const void *b, size_t n);
 extern void *zs_memset(void *dst, int c, size_t n);

@@ -917,15 +917,14 @@ async fn send_script_response_h2(
     metadata: &HashMap<String, String>,
 ) -> Result<()> {
     let status = StatusCode::from_u16(response.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    send_h2_bytes_response(
-        respond,
-        status,
-        "text/plain; charset=utf-8",
-        response.body,
-        head_only,
-        metadata,
-    )
-    .await
+    let mut headers = build_base_headers(response.body.len() as u64, "text/plain; charset=utf-8");
+    append_script_response_headers(&mut headers, &response.headers);
+    let mut res = ::http::Response::builder()
+        .status(status)
+        .body(Bytes::from(response.body))
+        .map_err(|err| anyhow!("failed to build h2 response: {err}"))?;
+    *res.headers_mut() = headers;
+    send_h2_response(respond, res, head_only, metadata).await
 }
 
 async fn send_h2_data(
@@ -1405,15 +1404,37 @@ async fn send_script_response(
     metadata: &HashMap<String, String>,
 ) {
     let status = StatusCode::from_u16(response.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    send_bytes_response(
-        w,
-        status,
-        "text/plain; charset=utf-8",
-        response.body,
-        head_only,
-        metadata,
-    )
-    .await;
+    let mut headers = build_base_headers(response.body.len() as u64, "text/plain; charset=utf-8");
+    apply_metadata_response_headers(&mut headers, metadata);
+    append_script_response_headers(&mut headers, &response.headers);
+    let _ = write_response_head(w, status, &headers).await;
+    if !head_only {
+        let _ = w.write_all(response.body).await;
+    }
+    let _ = w.flush().await;
+}
+
+/// Append helper-provided response headers (`ScriptResponse::headers`) onto a
+/// response. `Content-Type` replaces the default; `Content-Length` is ignored
+/// (already computed); everything else is appended so repeated names such as
+/// `Set-Cookie` are all emitted.
+fn append_script_response_headers(headers: &mut ::http::HeaderMap, extra: &[(String, String)]) {
+    for (name, value) in extra {
+        let Ok(header_name) = HeaderName::from_bytes(name.as_bytes()) else {
+            continue;
+        };
+        if header_name == ::http::header::CONTENT_LENGTH {
+            continue;
+        }
+        let Ok(header_value) = HeaderValue::from_str(value) else {
+            continue;
+        };
+        if header_name == ::http::header::CONTENT_TYPE {
+            headers.insert(header_name, header_value);
+        } else {
+            headers.append(header_name, header_value);
+        }
+    }
 }
 
 async fn reverse_proxy_request(
@@ -1565,7 +1586,7 @@ async fn reverse_proxy_request_h2(
     Ok(())
 }
 
-async fn connect_backend(target: &BackendTarget) -> Result<PooledConnection> {
+pub(crate) async fn connect_backend(target: &BackendTarget) -> Result<PooledConnection> {
     thread_local! {
         static DNS_CACHE: RefCell<mini_moka::unsync::Cache<String, Arc<Vec<SocketAddr>>>> =
             RefCell::new(mini_moka::unsync::CacheBuilder::new(128)
@@ -2115,18 +2136,18 @@ fn strip_hop_headers(headers: &mut ::http::HeaderMap, keep_upgrade: bool) {
 }
 
 #[derive(Clone, Copy)]
-enum BackendScheme {
+pub(crate) enum BackendScheme {
     Http,
     Https,
 }
 
-struct BackendTarget {
-    scheme: BackendScheme,
-    host: String,
-    is_ipv6: bool,
-    port: u16,
-    base_path: String,
-    base_query: Option<String>,
+pub(crate) struct BackendTarget {
+    pub(crate) scheme: BackendScheme,
+    pub(crate) host: String,
+    pub(crate) is_ipv6: bool,
+    pub(crate) port: u16,
+    pub(crate) base_path: String,
+    pub(crate) base_query: Option<String>,
 }
 
 impl BackendTarget {
@@ -2135,7 +2156,7 @@ impl BackendTarget {
     }
 }
 
-fn parse_backend_target(raw: &str) -> Result<BackendTarget> {
+pub(crate) fn parse_backend_target(raw: &str) -> Result<BackendTarget> {
     let url = Url::parse(raw).map_err(|err| anyhow!("invalid backend url: {err}"))?;
     let scheme = match url.scheme() {
         "http" => BackendScheme::Http,

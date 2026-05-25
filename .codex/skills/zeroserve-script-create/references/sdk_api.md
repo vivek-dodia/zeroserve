@@ -240,3 +240,47 @@
       return 0;
   }
   ```
+
+## OIDC login (Authorization Code + PKCE)
+
+zeroserve is the OAuth2 client (Relying Party). Config is passed as a JSON object
+handle (keys: `issuer` or `authorization_endpoint`+`token_endpoint`, `client_id`,
+`client_secret`, `redirect_uri`, optional `scope`, `cookie_secret`,
+`session_ttl_secs`). Login state and the session live in sealed cookies (no
+server-side store). `cookie_secret` must be >= 16 bytes and stable across
+restarts. The id_token claims are validated (`iss`/`aud`/`exp`/`nonce`) but its
+signature is not separately checked (it is fetched over TLS from the token
+endpoint; OIDC Core 3.1.3.7).
+
+- `zs_oidc_begin_login(cfg, return_to, return_to_len)` — set state cookie, 302 to
+  the IdP, return to `return_to` afterward. Terminal.
+- `zs_oidc_handle_callback(cfg)` — on the `redirect_uri` path: validate state,
+  exchange the code, set the session cookie, 302 to `return_to`. Terminal.
+- `zs_oidc_session_verify(cfg)` — JSON claims handle if logged in, `0` if not,
+  `<0` on error. Not terminal; free the handle with `zs_object_free`.
+- `zs_oidc_logout(cfg, end_session_url, end_session_url_len)` — clear the session
+  cookie and optionally 302 to the IdP end-session URL. Terminal.
+
+  Example (gate the site, with /callback and /logout routes):
+  ```c
+  zs_s64 cfg = zs_json_parse(ZS_STR(
+      "{\"issuer\":\"https://idp.example\","
+       "\"client_id\":\"cid\",\"client_secret\":\"csecret\","
+       "\"redirect_uri\":\"https://app.example/callback\","
+       "\"cookie_secret\":\"stable-16+byte-secret\"}"));
+  if (cfg < 0) { zs_respond(500, ZS_STR("config error")); return 0; }
+
+  char path[256];
+  zs_req_path(path, sizeof(path));
+  if (zs_memcmp(path, "/callback", 9) == 0) { zs_oidc_handle_callback(cfg); return 0; }
+  if (zs_memcmp(path, "/logout", 7) == 0)  { zs_oidc_logout(cfg, ZS_STR("")); return 0; }
+
+  zs_s64 session = zs_oidc_session_verify(cfg);
+  if (session <= 0) {
+      char uri[512]; zs_req_uri(uri, sizeof(uri));
+      zs_oidc_begin_login(cfg, ZS_STR(uri));
+      return 0;
+  }
+  zs_object_free(session);
+  return 0;  // authenticated
+  ```

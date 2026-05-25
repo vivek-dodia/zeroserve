@@ -260,6 +260,78 @@ Rate limiting:
   }
   ```
 
+OAuth2 / OIDC login (Authorization Code + PKCE):
+
+zeroserve can act as an OpenID Connect Relying Party to put an identity-provider
+login in front of the site. There is no server-side session store: the transient
+login state and the session are carried in sealed (encrypted + authenticated,
+XChaCha20-Poly1305) cookies. Configuration is passed as a **JSON object handle**
+(built with `zs_json_parse` or `zs_json_new_object`); recognised keys are
+`issuer` (or explicit `authorization_endpoint`/`token_endpoint`), `client_id`,
+`client_secret`, `redirect_uri`, optional `scope`, `cookie_secret` (>= 16 bytes,
+**must stay stable across restarts** or all sessions are invalidated), and
+optional `session_ttl_secs`.
+
+All four helpers take the config JSON handle as their first argument.
+
+- `zs_oidc_begin_login(cfg, return_to, return_to_len)` sets the state cookie and
+  302-redirects to the IdP. After login the user returns to `return_to`. Terminal.
+- `zs_oidc_handle_callback(cfg)` runs on your `redirect_uri` path. It validates
+  the CSRF `state`, exchanges the `code` (with the PKCE verifier) at the token
+  endpoint, validates the id_token claims, sets the session cookie, and redirects
+  back to the stored `return_to`. Terminal (400 on bad state, 502 if the exchange
+  fails).
+- `zs_oidc_session_verify(cfg)` returns a JSON object handle of the identity
+  claims when a valid session cookie is present, `0` if not, `<0` on error. Not
+  terminal — free the handle with `zs_object_free`.
+- `zs_oidc_logout(cfg, end_session_url, end_session_url_len)` clears the session
+  cookie and (optionally) redirects to the IdP end-session URL. Terminal.
+
+> The id_token is fetched directly from the token endpoint over a server-validated
+> TLS connection, so per OIDC Core 3.1.3.7 its claims (`iss`/`aud`/`exp`/`nonce`)
+> are validated but its signature is not separately checked against a JWKS.
+
+Example (gate the whole site behind login):
+```c
+#include <zeroserve.h>
+
+ZS_ENTRY
+zs_u64 entry(void) {
+    // Config as a JSON object. Keep cookie_secret stable and secret.
+    zs_s64 cfg = zs_json_parse(ZS_STR(
+        "{"
+          "\"issuer\":\"https://accounts.example.com\","
+          "\"client_id\":\"my-client-id\","
+          "\"client_secret\":\"my-client-secret\","
+          "\"redirect_uri\":\"https://app.example.com/callback\","
+          "\"cookie_secret\":\"keep-this-secret-stable-please\""
+        "}"));
+    if (cfg < 0) { zs_respond(500, ZS_STR("config error")); return 0; }
+
+    char path[256];
+    zs_req_path(path, sizeof(path));
+
+    if (zs_memcmp(path, "/callback", 9) == 0) {
+        zs_oidc_handle_callback(cfg);
+        return 0;
+    }
+    if (zs_memcmp(path, "/logout", 7) == 0) {
+        zs_oidc_logout(cfg, ZS_STR("https://accounts.example.com/logout"));
+        return 0;
+    }
+
+    zs_s64 session = zs_oidc_session_verify(cfg);
+    if (session <= 0) {
+        char uri[512];
+        zs_req_uri(uri, sizeof(uri));
+        zs_oidc_begin_login(cfg, ZS_STR(uri));  // 302 to the IdP
+        return 0;
+    }
+    zs_object_free(session);
+    return 0;  // authenticated: fall through to static serving
+}
+```
+
 JSON parsing:
 
 - `zs_json_parse(data, data_len)` parses JSON and returns a handle (-1 on failure).
