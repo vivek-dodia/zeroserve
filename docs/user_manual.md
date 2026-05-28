@@ -137,7 +137,7 @@ This is useful for replacing the tarball and certificate in place without downti
 ## TLS
 
 To enable HTTPS, provide a TLS address plus certificate and key. HTTPS supports
-HTTP/2 via ALPN (h2) with HTTP/1.1 fallback:
+TLS 1.3 only, with HTTP/2 via ALPN (h2) and HTTP/1.1 fallback:
 
 ```bash
 zeroserve --tls-addr 0.0.0.0:8443 --cert certificate.pem --key key.pem site.tar

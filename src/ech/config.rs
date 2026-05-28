@@ -168,10 +168,6 @@ impl<'a> Reader<'a> {
         self.remaining() == 0
     }
 
-    pub fn position(&self) -> usize {
-        self.pos
-    }
-
     pub fn read_u8(&mut self) -> Result<u8> {
         if self.remaining() < 1 {
             bail!("short read u8");

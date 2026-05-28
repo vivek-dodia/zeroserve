@@ -17,7 +17,7 @@ use anyhow::{Context, Result, anyhow};
 use boring::ex_data::Index;
 use boring::ssl::{
     AlpnError, ErrorCode, HandshakeError, Ssl, SslConnector, SslContext, SslContextBuilder,
-    SslFiletype, SslMethod, SslStream, SslStreamBuilder, select_next_proto,
+    SslFiletype, SslMethod, SslStream, SslStreamBuilder, SslVersion, select_next_proto,
 };
 use monoio::{
     BufResult,
@@ -93,6 +93,12 @@ impl BoringAcceptor {
     ) -> Result<Self> {
         let mut builder = SslContextBuilder::new(SslMethod::tls())
             .context("creating BoringSSL server context")?;
+        builder
+            .set_min_proto_version(Some(SslVersion::TLS1_3))
+            .context("setting minimum TLS version")?;
+        builder
+            .set_max_proto_version(Some(SslVersion::TLS1_3))
+            .context("setting maximum TLS version")?;
         builder
             .set_certificate_chain_file(cert_path)
             .with_context(|| format!("loading cert chain {}", cert_path.display()))?;
@@ -201,6 +207,12 @@ pub fn init_client_from_system_roots() -> Result<()> {
         })?;
     let mut builder =
         SslConnector::builder(SslMethod::tls()).context("creating BoringSSL client context")?;
+    builder
+        .set_min_proto_version(Some(SslVersion::TLS1_3))
+        .context("setting minimum TLS client version")?;
+    builder
+        .set_max_proto_version(Some(SslVersion::TLS1_3))
+        .context("setting maximum TLS client version")?;
     builder
         .set_ca_file(bundle)
         .with_context(|| format!("loading CA bundle {}", bundle.display()))?;

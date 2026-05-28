@@ -1381,23 +1381,6 @@ fn etag_header_value(etag: &str) -> HeaderValue {
     HeaderValue::from_str(&value).unwrap_or_else(|_| HeaderValue::from_static("\"\""))
 }
 
-async fn send_bytes_response(
-    w: &mut impl AsyncWriteRent,
-    status: StatusCode,
-    content_type: &str,
-    body: Vec<u8>,
-    head_only: bool,
-    metadata: &HashMap<String, String>,
-) {
-    let mut headers = build_base_headers(body.len() as u64, content_type);
-    apply_metadata_response_headers(&mut headers, metadata);
-    let _ = write_response_head(w, status, &headers).await;
-    if !head_only {
-        let _ = w.write_all(body).await;
-    }
-    let _ = w.flush().await;
-}
-
 fn build_script_request(
     request_id: Ulid,
     head: &RequestHead,
