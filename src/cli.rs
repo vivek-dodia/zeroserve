@@ -57,17 +57,21 @@ pub struct Cli {
     #[arg(long, default_value = "0.0.0.0:8080")]
     pub addr: ListenAddr,
 
-    /// Optional HTTPS address. Either ip:port or fd:N. Requires --cert and --key.
+    /// Optional HTTPS address. Either ip:port or fd:N. Requires --cert/--key or --cert-dir.
     #[arg(long)]
     pub tls_addr: Option<ListenAddr>,
 
     /// TLS certificate (PEM).
-    #[arg(long)]
+    #[arg(long, conflicts_with = "cert_dir")]
     pub cert: Option<PathBuf>,
 
     /// TLS private key (PEM).
-    #[arg(long)]
+    #[arg(long, conflicts_with = "cert_dir")]
     pub key: Option<PathBuf>,
+
+    /// Directory containing TLS certificate PEMs and private key PEMs.
+    #[arg(long, value_name = "DIR", conflicts_with_all = ["cert", "key"])]
+    pub cert_dir: Option<PathBuf>,
 
     /// Default document to serve from directories.
     #[arg(long, default_value_t = String::from(crate::DEFAULT_INDEX))]

@@ -10,6 +10,7 @@ pub struct StaticConfig {
     pub tar_path: PathBuf,
     pub cert_path: Option<PathBuf>,
     pub key_path: Option<PathBuf>,
+    pub cert_dir_path: Option<PathBuf>,
     pub ech_key_path: Option<PathBuf>,
     pub reload_signal_file: Option<PathBuf>,
     pub index_file: String,
@@ -33,29 +34,37 @@ impl TryFrom<Cli> for StaticConfig {
 
     fn try_from(cli: Cli) -> Result<Self> {
         let http_addr = cli.addr;
-        let tls_requested = cli.tls_addr.is_some() || cli.cert.is_some() || cli.key.is_some();
-        let (tls_addr, cert_path, key_path) = if tls_requested {
-            let cert = cli
-                .cert
-                .clone()
-                .ok_or_else(|| anyhow!("--cert is required when enabling TLS"))?;
-            let key = cli
-                .key
-                .clone()
-                .ok_or_else(|| anyhow!("--key is required when enabling TLS"))?;
+        let tls_requested = cli.tls_addr.is_some()
+            || cli.cert.is_some()
+            || cli.key.is_some()
+            || cli.cert_dir.is_some();
+        let (tls_addr, cert_path, key_path, cert_dir_path) = if tls_requested {
             let tls_addr = cli
                 .tls_addr
                 .ok_or_else(|| anyhow!("--tls-addr is required when enabling TLS"))?;
-            (Some(tls_addr), Some(cert), Some(key))
+
+            if let Some(cert_dir) = cli.cert_dir.clone() {
+                (Some(tls_addr), None, None, Some(cert_dir))
+            } else {
+                let cert = cli
+                    .cert
+                    .clone()
+                    .ok_or_else(|| anyhow!("--cert is required when enabling TLS"))?;
+                let key = cli
+                    .key
+                    .clone()
+                    .ok_or_else(|| anyhow!("--key is required when enabling TLS"))?;
+                (Some(tls_addr), Some(cert), Some(key), None)
+            }
         } else {
-            (None, None, None)
+            (None, None, None, None)
         };
 
         let ech_key_path = match cli.ech_key {
             Some(path) => {
                 if !tls_requested {
                     return Err(anyhow!(
-                        "--ech-key requires TLS to be enabled (provide --tls-addr, --cert, --key)"
+                        "--ech-key requires TLS to be enabled (provide --tls-addr with --cert/--key or --cert-dir)"
                     ));
                 }
                 Some(path)
@@ -79,6 +88,7 @@ impl TryFrom<Cli> for StaticConfig {
             tar_path,
             cert_path,
             key_path,
+            cert_dir_path,
             ech_key_path,
             reload_signal_file: cli.reload_signal_file,
             index_file,

@@ -1,10 +1,16 @@
-use std::sync::Arc;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use boring::hpke::HpkeKey;
+use boring::pkey::{PKey, Private};
 use boring::ssl::SslEchKeys;
+use boring::x509::X509;
 
-use crate::boringtls::BoringAcceptor;
+use crate::boringtls::{BoringAcceptor, ServerIdentity};
 use crate::config::StaticConfig;
 use crate::ech::key::EchKeySet;
 
@@ -20,8 +26,8 @@ pub struct TlsRuntime {
 }
 
 pub fn load_tls_if_configured(config: &Arc<StaticConfig>) -> Result<Option<TlsRuntime>> {
-    match (&config.tls_addr, &config.cert_path, &config.key_path) {
-        (Some(_addr), Some(cert), Some(key)) => {
+    match &config.tls_addr {
+        Some(_addr) => {
             // Load ECH keys first (if configured) so we can install them on the
             // context during construction.
             let ech_keys = match &config.ech_key_path {
@@ -37,7 +43,7 @@ pub fn load_tls_if_configured(config: &Arc<StaticConfig>) -> Result<Option<TlsRu
             };
 
             let ech_enabled = ech_keys.is_some();
-            let acceptor = BoringAcceptor::build(cert, key, |builder| {
+            let configure = |builder: &mut boring::ssl::SslContextBuilder| {
                 if let Some(set) = &ech_keys {
                     let mut ech = SslEchKeys::builder()
                         .map_err(|e| anyhow!("SSL_ECH_KEYS_new failed: {e}"))?;
@@ -67,7 +73,29 @@ pub fn load_tls_if_configured(config: &Arc<StaticConfig>) -> Result<Option<TlsRu
                         .map_err(|e| anyhow!("SSL_CTX_set1_ech_keys failed: {e}"))?;
                 }
                 Ok(())
-            })?;
+            };
+
+            let acceptor = if let Some(cert_dir) = &config.cert_dir_path {
+                let identities = load_cert_dir(cert_dir).with_context(|| {
+                    format!("loading TLS certificates from {}", cert_dir.display())
+                })?;
+                eprintln!(
+                    "loaded {} TLS certificate identity(s) from {}",
+                    identities.len(),
+                    cert_dir.display()
+                );
+                BoringAcceptor::build_with_identities(identities, configure)?
+            } else {
+                let cert = config
+                    .cert_path
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("TLS certificate path missing"))?;
+                let key = config
+                    .key_path
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("TLS private key path missing"))?;
+                BoringAcceptor::build(cert, key, configure)?
+            };
 
             let mut ech_public_name = None;
             if let Some(set) = &ech_keys {
@@ -98,6 +126,121 @@ pub fn load_tls_if_configured(config: &Arc<StaticConfig>) -> Result<Option<TlsRu
                 ech_public_name,
             }))
         }
-        _ => Ok(None),
+        None => Ok(None),
+    }
+}
+
+struct CertFile {
+    path: PathBuf,
+    certs: Vec<X509>,
+}
+
+struct KeyFile {
+    path: PathBuf,
+    key: PKey<Private>,
+}
+
+fn load_cert_dir(dir: &Path) -> Result<Vec<ServerIdentity>> {
+    let mut paths = fs::read_dir(dir)
+        .with_context(|| format!("reading TLS certificate directory {}", dir.display()))?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()
+        .with_context(|| format!("reading entries in {}", dir.display()))?;
+    paths.sort();
+
+    let mut cert_files = Vec::new();
+    let mut key_files = Vec::new();
+    for path in paths {
+        let metadata = fs::metadata(&path)
+            .with_context(|| format!("stat TLS directory entry {}", path.display()))?;
+        if !metadata.is_file() {
+            continue;
+        }
+
+        let data = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        if let Ok(certs) = X509::stack_from_pem(&data) {
+            if !certs.is_empty() {
+                cert_files.push(CertFile {
+                    path: path.clone(),
+                    certs,
+                });
+            }
+        }
+        if let Ok(key) = PKey::private_key_from_pem(&data) {
+            key_files.push(KeyFile {
+                path: path.clone(),
+                key,
+            });
+        }
+    }
+
+    if cert_files.is_empty() {
+        bail!("no TLS certificate PEMs found in {}", dir.display());
+    }
+    if key_files.is_empty() {
+        bail!("no TLS private key PEMs found in {}", dir.display());
+    }
+
+    let mut identities = Vec::new();
+    for cert_file in cert_files {
+        let leaf = cert_file
+            .certs
+            .into_iter()
+            .next()
+            .expect("cert files are non-empty");
+        let public_key = leaf
+            .public_key()
+            .with_context(|| format!("reading public key from {}", cert_file.path.display()))?;
+        let Some(key_file) = key_files
+            .iter()
+            .find(|key_file| public_key.public_eq(&key_file.key))
+        else {
+            eprintln!(
+                "warning: no matching private key found for TLS certificate {}",
+                cert_file.path.display()
+            );
+            continue;
+        };
+        identities.push(ServerIdentity::from_leaf(
+            cert_file.path,
+            key_file.path.clone(),
+            leaf,
+        ));
+    }
+
+    if identities.is_empty() {
+        bail!(
+            "no TLS certificate PEMs in {} matched any private key PEM",
+            dir.display()
+        );
+    }
+    Ok(identities)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cert_dir_matches_certificate_to_key_by_public_key() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let cert = root.join("certificate.pem");
+        let key = root.join("key.pem");
+        if !cert.exists() || !key.exists() {
+            eprintln!("skipping: test cert/key not present");
+            return;
+        }
+
+        let dir =
+            std::env::temp_dir().join(format!("zeroserve-cert-dir-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir(&dir).unwrap();
+        fs::copy(&cert, dir.join("02-cert.pem")).unwrap();
+        fs::copy(&key, dir.join("01-key.pem")).unwrap();
+
+        let identities = load_cert_dir(&dir).unwrap();
+        assert_eq!(identities.len(), 1);
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

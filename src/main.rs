@@ -207,9 +207,14 @@ fn setup_landlock(config: &StaticConfig) -> anyhow::Result<()> {
     let mut ruleset = Ruleset::default().handle_access(access_all)?.create()?;
     ruleset = ruleset.add_rule(PathBeneath::new(PathFd::new("/")?, access_read))?;
 
-    // The broad rule above grants ReadFile everywhere but not ReadDir. When
-    // --ech-key points at a directory we need to enumerate it (file-mode is
-    // already covered by ReadFile).
+    // The broad rule above grants ReadFile everywhere but not ReadDir. Directory
+    // based TLS and ECH configuration need enumeration on reload.
+    if let Some(cert_dir) = &config.cert_dir_path {
+        ruleset = ruleset.add_rule(PathBeneath::new(
+            PathFd::new(cert_dir)?,
+            AccessFs::ReadFile | AccessFs::ReadDir,
+        ))?;
+    }
     if let Some(ech_path) = &config.ech_key_path {
         let meta = std::fs::metadata(ech_path)
             .with_context(|| format!("stat ECH key path {}", ech_path.display()))?;

@@ -61,10 +61,14 @@ Key options:
 
 - `--addr <ADDR>`: HTTP listen address (default `0.0.0.0:8080`). Accepts either
   `ip:port` to bind a new socket, or `fd:N` to use an inherited file descriptor.
-- `--tls-addr <ADDR>`: HTTPS listen address (requires `--cert` and `--key`).
+- `--tls-addr <ADDR>`: HTTPS listen address (requires `--cert`/`--key` or
+  `--cert-dir`).
   Accepts either `ip:port` or `fd:N`.
 - `--cert <FILE>`: TLS certificate PEM.
 - `--key <FILE>`: TLS private key PEM.
+- `--cert-dir <DIR>`: Directory of TLS certificate PEMs and private key PEMs.
+  Zeroserve matches keys to certificates automatically and selects certificates
+  by SNI.
 - `--ech-key <PATH>`: Path to an ECH key PEM file or directory of files.
   Requires TLS to be configured. See the ECH section below.
 - `--gen-ech-key`: Generate a new ECH keypair and ECHConfig. Writes the PEM
@@ -136,14 +140,20 @@ This is useful for replacing the tarball and certificate in place without downti
 
 ## TLS
 
-To enable HTTPS, provide a TLS address plus certificate and key. HTTPS supports
-TLS 1.3 only, with HTTP/2 via ALPN (h2) and HTTP/1.1 fallback:
+To enable HTTPS, provide a TLS address plus either a certificate/key pair or a
+certificate directory. HTTPS supports TLS 1.3 only, with HTTP/2 via ALPN (h2)
+and HTTP/1.1 fallback:
 
 ```bash
 zeroserve --tls-addr 0.0.0.0:8443 --cert certificate.pem --key key.pem site.tar
 ```
 
-Reloading TLS assets uses the same hot-reload mechanism as the tarball.
+With `--cert-dir`, zeroserve scans regular files in the directory, treats PEMs
+with certificates as certificate chains, treats PEMs with private keys as keys,
+and matches keys to certificates by public key. For SNI connections, it serves
+the first non-expired certificate, in lexicographic path order, whose DNS SAN
+matches the SNI; wildcard SANs match a single label. Reloading TLS assets uses
+the same hot-reload mechanism as the tarball.
 
 ## Encrypted Client Hello (ECH)
 
@@ -595,7 +605,8 @@ ExecStart=/usr/bin/zeroserve --addr fd:3 --tls-addr fd:4 --cert /etc/certs/cert.
 
 ## Troubleshooting
 
-- TLS startup errors: `--tls-addr` requires both `--cert` and `--key`.
+- TLS startup errors: `--tls-addr` requires either `--cert` plus `--key`, or
+  `--cert-dir`.
 - `--pack expects a directory`: pass a directory path, not a file.
 - `tarball ... does not contain any regular files`: ensure your site has files.
 - Script compilation fails: verify `clang` and `llc` are on `PATH`.

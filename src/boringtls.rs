@@ -10,15 +10,20 @@
 //!
 //! No tokio: `boring` (unlike `tokio-boring`) has no async-runtime dependency.
 
+use std::cmp::Ordering;
 use std::io::{self, Read, Write};
-use std::sync::OnceLock;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result, anyhow};
+use boring::asn1::Asn1Time;
 use boring::ex_data::Index;
 use boring::ssl::{
-    AlpnError, ErrorCode, HandshakeError, Ssl, SslConnector, SslContext, SslContextBuilder,
-    SslFiletype, SslMethod, SslStream, SslStreamBuilder, SslVersion, select_next_proto,
+    AlpnError, ClientHello, ErrorCode, HandshakeError, NameType, SelectCertError, Ssl,
+    SslConnector, SslContext, SslContextBuilder, SslFiletype, SslMethod, SslStream,
+    SslStreamBuilder, SslVersion, select_next_proto,
 };
+use boring::x509::{X509, X509Ref};
 use monoio::{
     BufResult,
     buf::{IoBuf, IoBufMut, IoVecBuf, IoVecBufMut},
@@ -31,6 +36,47 @@ const READ_CHUNK: usize = 16 * 1024;
 // Wire-format ALPN list the server offers, in preference order: h2, http/1.1.
 const ALPN_WIRE: &[u8] = b"\x02h2\x08http/1.1";
 static JA4_EX_INDEX: OnceLock<Index<Ssl, String>> = OnceLock::new();
+
+pub struct ServerIdentity {
+    pub cert_path: PathBuf,
+    pub key_path: PathBuf,
+    leaf: X509,
+    dns_names: Vec<String>,
+}
+
+impl ServerIdentity {
+    pub fn from_paths(cert_path: &Path, key_path: &Path) -> Result<Self> {
+        let cert_pem = std::fs::read(cert_path)
+            .with_context(|| format!("reading cert chain {}", cert_path.display()))?;
+        let certs = X509::stack_from_pem(&cert_pem)
+            .with_context(|| format!("parsing cert chain {}", cert_path.display()))?;
+        let leaf = certs
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("no certificate found in {}", cert_path.display()))?;
+        Ok(Self::from_leaf(
+            cert_path.to_path_buf(),
+            key_path.to_path_buf(),
+            leaf,
+        ))
+    }
+
+    pub fn from_leaf(cert_path: PathBuf, key_path: PathBuf, leaf: X509) -> Self {
+        let dns_names = dns_sans(&leaf);
+        Self {
+            cert_path,
+            key_path,
+            leaf,
+            dns_names,
+        }
+    }
+}
+
+struct SelectableIdentity {
+    context: Option<SslContext>,
+    leaf: X509,
+    dns_names: Vec<String>,
+}
 
 /// In-memory bridge that boring's `SslStream<S>` reads/writes synchronously.
 /// `inbound` holds ciphertext received from the peer that the SSL state machine
@@ -91,35 +137,93 @@ impl BoringAcceptor {
         key_path: &std::path::Path,
         configure: impl FnOnce(&mut SslContextBuilder) -> Result<()>,
     ) -> Result<Self> {
+        let identity = ServerIdentity::from_paths(cert_path, key_path)?;
         let mut builder = SslContextBuilder::new(SslMethod::tls())
             .context("creating BoringSSL server context")?;
-        builder
-            .set_min_proto_version(Some(SslVersion::TLS1_3))
-            .context("setting minimum TLS version")?;
-        builder
-            .set_max_proto_version(Some(SslVersion::TLS1_3))
-            .context("setting maximum TLS version")?;
-        builder
-            .set_certificate_chain_file(cert_path)
-            .with_context(|| format!("loading cert chain {}", cert_path.display()))?;
-        builder
-            .set_private_key_file(key_path, SslFiletype::PEM)
-            .with_context(|| format!("loading private key {}", key_path.display()))?;
-        builder
-            .check_private_key()
-            .context("certificate/key mismatch")?;
-        builder.set_alpn_select_callback(|_ssl, client| {
-            select_next_proto(ALPN_WIRE, client).ok_or(AlpnError::NOACK)
-        });
+        configure_server_context(&mut builder, &identity)?;
         builder.set_select_certificate_callback(|mut client_hello| {
-            if let Some(fingerprint) = ja4::tls_client_fingerprint(client_hello.as_bytes()) {
-                client_hello
-                    .ssl_mut()
-                    .set_ex_data(ja4_ex_index(), fingerprint);
-            }
+            record_ja4(&mut client_hello);
             Ok(())
         });
         configure(&mut builder)?;
+        Ok(Self {
+            ctx: builder.build(),
+        })
+    }
+
+    /// Build a server acceptor from multiple certificate identities. The first
+    /// non-expired identity is the default for clients without SNI; clients
+    /// with SNI are switched to the first non-expired identity whose DNS SAN
+    /// matches that SNI.
+    pub fn build_with_identities(
+        identities: Vec<ServerIdentity>,
+        configure: impl Fn(&mut SslContextBuilder) -> Result<()>,
+    ) -> Result<Self> {
+        if identities.is_empty() {
+            return Err(anyhow!("no TLS certificates loaded"));
+        }
+
+        let default_idx = identities
+            .iter()
+            .position(|identity| !cert_is_expired(&identity.leaf).unwrap_or(true))
+            .ok_or_else(|| anyhow!("all TLS certificates are expired"))?;
+
+        let mut alternate_contexts = Vec::with_capacity(identities.len().saturating_sub(1));
+        for (idx, identity) in identities.iter().enumerate() {
+            if idx == default_idx {
+                continue;
+            }
+            let mut builder = SslContextBuilder::new(SslMethod::tls())
+                .context("creating BoringSSL server context")?;
+            configure_server_context(&mut builder, identity)?;
+            configure(&mut builder)?;
+            alternate_contexts.push((idx, builder.build()));
+        }
+
+        let choices: Vec<SelectableIdentity> = identities
+            .iter()
+            .enumerate()
+            .map(|(idx, identity)| SelectableIdentity {
+                context: alternate_contexts
+                    .iter()
+                    .find(|(context_idx, _)| *context_idx == idx)
+                    .map(|(_, context)| context.clone()),
+                leaf: identity.leaf.to_owned(),
+                dns_names: identity.dns_names.clone(),
+            })
+            .collect();
+        let choices = Arc::new(choices);
+
+        let default_identity = &identities[default_idx];
+        let mut builder = SslContextBuilder::new(SslMethod::tls())
+            .context("creating BoringSSL server context")?;
+        configure_server_context(&mut builder, default_identity)?;
+        configure(&mut builder)?;
+        builder.set_select_certificate_callback(move |mut client_hello| {
+            record_ja4(&mut client_hello);
+
+            let Some(sni) = client_hello
+                .servername(NameType::HOST_NAME)
+                .map(str::to_ascii_lowercase)
+            else {
+                return Ok(());
+            };
+
+            let Some(choice) = choices.iter().find(|choice| {
+                !cert_is_expired(&choice.leaf).unwrap_or(true) && cert_matches_sni(choice, &sni)
+            }) else {
+                return Err(SelectCertError::ERROR);
+            };
+
+            if let Some(ctx) = &choice.context {
+                client_hello
+                    .ssl_mut()
+                    .set_ssl_context(ctx)
+                    .map_err(|_| SelectCertError::ERROR)?;
+            }
+            Ok(())
+        });
+
         Ok(Self {
             ctx: builder.build(),
         })
@@ -135,6 +239,87 @@ impl BoringAcceptor {
         let mid = SslStreamBuilder::new(ssl, MemBridge::new()).setup_accept();
         drive_handshake(mid, io).await
     }
+}
+
+fn configure_server_context(
+    builder: &mut SslContextBuilder,
+    identity: &ServerIdentity,
+) -> Result<()> {
+    builder
+        .set_min_proto_version(Some(SslVersion::TLS1_3))
+        .context("setting minimum TLS version")?;
+    builder
+        .set_max_proto_version(Some(SslVersion::TLS1_3))
+        .context("setting maximum TLS version")?;
+    builder
+        .set_certificate_chain_file(&identity.cert_path)
+        .with_context(|| format!("loading cert chain {}", identity.cert_path.display()))?;
+    builder
+        .set_private_key_file(&identity.key_path, SslFiletype::PEM)
+        .with_context(|| format!("loading private key {}", identity.key_path.display()))?;
+    builder.check_private_key().with_context(|| {
+        format!(
+            "certificate/key mismatch: {} and {}",
+            identity.cert_path.display(),
+            identity.key_path.display()
+        )
+    })?;
+    builder.set_alpn_select_callback(|_ssl, client| {
+        select_next_proto(ALPN_WIRE, client).ok_or(AlpnError::NOACK)
+    });
+    Ok(())
+}
+
+fn record_ja4(client_hello: &mut ClientHello<'_>) {
+    if let Some(fingerprint) = ja4::tls_client_fingerprint(client_hello.as_bytes()) {
+        client_hello
+            .ssl_mut()
+            .set_ex_data(ja4_ex_index(), fingerprint);
+    }
+}
+
+fn cert_is_expired(cert: &X509Ref) -> Result<bool> {
+    let now = Asn1Time::days_from_now(0).context("creating ASN.1 current time")?;
+    Ok(cert
+        .not_after()
+        .compare(&now)
+        .context("comparing certificate expiry")?
+        == Ordering::Less)
+}
+
+fn cert_matches_sni(choice: &SelectableIdentity, sni: &str) -> bool {
+    choice
+        .dns_names
+        .iter()
+        .any(|name| dns_name_matches(name, sni))
+}
+
+fn dns_sans(cert: &X509Ref) -> Vec<String> {
+    cert.subject_alt_names()
+        .map(|names| {
+            names
+                .iter()
+                .filter_map(|name| name.dnsname().map(str::to_ascii_lowercase))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn dns_name_matches(pattern: &str, sni: &str) -> bool {
+    let pattern = pattern.to_ascii_lowercase();
+    let sni = sni.to_ascii_lowercase();
+
+    if !pattern.contains('*') {
+        return pattern == sni;
+    }
+
+    let Some(suffix) = pattern.strip_prefix("*.") else {
+        return false;
+    };
+    let Some(prefix) = sni.strip_suffix(suffix) else {
+        return false;
+    };
+    prefix.ends_with('.') && !prefix[..prefix.len() - 1].contains('.')
 }
 
 /// Drive a mid-handshake `SslStream` to completion over `io`, pumping records
@@ -524,6 +709,16 @@ unsafe impl<IO: monoio::io::Split> monoio::io::Split for BoringStream<IO> {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dns_san_matching_handles_exact_and_single_label_wildcards() {
+        assert!(dns_name_matches("example.com", "example.com"));
+        assert!(dns_name_matches("*.example.com", "www.example.com"));
+        assert!(dns_name_matches("*.example.com", "WWW.EXAMPLE.COM"));
+        assert!(!dns_name_matches("*.example.com", "example.com"));
+        assert!(!dns_name_matches("*.example.com", "a.b.example.com"));
+        assert!(!dns_name_matches("w*.example.com", "www.example.com"));
+    }
 
     // A localhost client+server TLS handshake driven entirely over monoio,
     // proving the WANT_READ/WANT_WRITE pump and record framing are correct.

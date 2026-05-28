@@ -27,6 +27,9 @@ zeroserve --addr 0.0.0.0:8080 site.tar
 # Serve HTTP on port 8080, and HTTPS on port 8443
 zeroserve --addr 0.0.0.0:8080 --tls-addr 0.0.0.0:8443 --cert certificate.pem --key key.pem site.tar
 
+# Serve HTTPS with SNI certificate selection from a certificate directory
+zeroserve --addr 0.0.0.0:8080 --tls-addr 0.0.0.0:8443 --cert-dir /etc/zeroserve/certs site.tar
+
 # Fall back to <path>.html when a request path is missing
 zeroserve --addr 0.0.0.0:8080 --try-html site.tar
 
