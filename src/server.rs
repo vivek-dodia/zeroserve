@@ -311,8 +311,13 @@ async fn run_tls_listener(
                     } else {
                         None
                     };
+                    // Prefer the actual outer SNI the client sent (recovered
+                    // from the wire ClientHello); fall back to the configured
+                    // public name only when it is unambiguous and parsing failed.
                     let outer_sni = if ech_ok {
-                        tls_state.ech_public_name.clone()
+                        tls_stream
+                            .outer_server_name()
+                            .or_else(|| tls_state.ech_public_name.clone())
                     } else {
                         None
                     };

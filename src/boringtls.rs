@@ -405,6 +405,11 @@ async fn drive_handshake<IO>(
 where
     IO: AsyncReadRent + AsyncWriteRent,
 {
+    // Snapshot of the peer's first flight (the ClientHello on the server path),
+    // taken from the first non-empty inbound read so it survives the handshake's
+    // later consumption/compaction of the bridge. Used to recover the cleartext
+    // outer SNI when ECH is accepted.
+    let mut first_flight: Option<Vec<u8>> = None;
     let stream = loop {
         match mid.handshake() {
             Ok(mut s) => {
@@ -416,6 +421,12 @@ where
                 flush_out(m.get_mut(), &mut io).await?;
                 if !fill_in(m.get_mut(), &mut io).await? {
                     return Err(anyhow!("peer closed during TLS handshake"));
+                }
+                if first_flight.is_none() {
+                    let inbound = &m.get_ref().inbound;
+                    if !inbound.is_empty() {
+                        first_flight = Some(inbound.clone());
+                    }
                 }
                 mid = m;
             }
@@ -440,12 +451,36 @@ where
             }
         }
     };
+    // When ECH was accepted, the negotiated `servername()` is the decrypted
+    // inner name; recover the cleartext outer SNI from the wire ClientHello.
+    let outer_sni = if stream.ssl().ech_accepted() {
+        first_flight.as_deref().and_then(outer_sni_from_record)
+    } else {
+        None
+    };
     Ok(AcceptOutcome::Stream(BoringStream {
         ssl: stream,
         io,
         scratch: vec![0u8; READ_CHUNK],
         shutdown_sent: false,
+        outer_sni,
     }))
+}
+
+/// Parse the cleartext SNI from a buffered TLS handshake record holding a
+/// ClientHello. The wire ClientHello is always the *outer* one (the inner is
+/// encrypted inside the ECH extension), so this yields the public/outer name.
+/// Returns `None` if the bytes are not a single self-contained ClientHello
+/// record (e.g. fragmented across records) or carry no SNI.
+fn outer_sni_from_record(record: &[u8]) -> Option<String> {
+    // TLSPlaintext: type(1) = handshake(0x16), legacy_version(2), length(2),
+    // then the handshake message fragment.
+    if record.len() < 5 || record[0] != 0x16 {
+        return None;
+    }
+    let len = u16::from_be_bytes([record[3], record[4]]) as usize;
+    let fragment = record.get(5..5 + len)?;
+    ja4::client_hello_sni(fragment)
 }
 
 /// Process-wide TLS client connector for the reverse proxy, built once at
@@ -561,6 +596,10 @@ pub struct BoringStream<IO> {
     io: IO,
     scratch: Vec<u8>,
     shutdown_sent: bool,
+    /// The cleartext outer SNI parsed from the wire ClientHello, set only when
+    /// ECH was accepted (BoringSSL replaces `servername()` with the decrypted
+    /// inner name, so the public/outer name is otherwise unrecoverable).
+    outer_sni: Option<String>,
 }
 
 impl<IO> BoringStream<IO> {
@@ -583,6 +622,13 @@ impl<IO> BoringStream<IO> {
             .ssl()
             .servername(boring::ssl::NameType::HOST_NAME)
             .map(str::to_string)
+    }
+
+    /// The cleartext outer SNI (the ECH public name the client actually sent),
+    /// recovered from the wire ClientHello. `Some` only when ECH was accepted on
+    /// this connection and the name could be parsed; `None` otherwise.
+    pub fn outer_server_name(&self) -> Option<String> {
+        self.outer_sni.clone()
     }
 
     /// JA4 TLS client fingerprint computed from the ClientHello, if available.
@@ -968,14 +1014,24 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let acceptor = BoringAcceptor::build(&cert, &key, Vec::new(), move |builder| {
-            let mut keys = SslEchKeys::builder().unwrap();
-            let hpke = boring::hpke::HpkeKey::dhkem_p256_sha256(&priv_raw).unwrap();
-            keys.add_key(true, &config_bytes, hpke).unwrap();
-            builder.set_ech_keys(&keys.build()).unwrap();
-            Ok(())
-        })
+        // Configure relay for the public name *and* use a cert that does not
+        // cover it: this is the real "don't stick out" deployment. A legitimate
+        // ECH client must still be accepted and served (not relayed), proving
+        // the cert-selection callback observes ECH acceptance + the inner SNI.
+        let acceptor = BoringAcceptor::build(
+            &cert,
+            &key,
+            vec!["public.example.com".to_string()],
+            move |builder| {
+                let mut keys = SslEchKeys::builder().unwrap();
+                let hpke = boring::hpke::HpkeKey::dhkem_p256_sha256(&priv_raw).unwrap();
+                keys.add_key(true, &config_bytes, hpke).unwrap();
+                builder.set_ech_keys(&keys.build()).unwrap();
+                Ok(())
+            },
+        )
         .unwrap();
+        let expected_outer = "public.example.com";
 
         let server = async move {
             let (sock, _) = listener.accept().await.unwrap();
@@ -984,6 +1040,9 @@ mod tests {
                     // With ECH accepted, servername() must be the INNER name the
                     // client protected, not the public/outer name.
                     assert_eq!(tls.server_name().as_deref(), Some("secret.internal"));
+                    // The cleartext OUTER SNI is recovered from the wire
+                    // ClientHello (BoringSSL only exposes the inner name).
+                    assert_eq!(tls.outer_server_name().as_deref(), Some(expected_outer));
                     Some(tls.ech_accepted())
                 }
                 Ok(AcceptOutcome::Relay { .. }) => {

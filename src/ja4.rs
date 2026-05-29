@@ -78,6 +78,38 @@ pub fn tls_client_fingerprint(client_hello: &[u8]) -> Option<String> {
     ))
 }
 
+/// Extract the first `host_name` from the SNI extension of a ClientHello
+/// *handshake message* (i.e. the bytes starting with the handshake type byte
+/// `0x01`, length, then body). Returns `None` for any other handshake type or
+/// when no SNI extension is present. Used to recover the cleartext **outer**
+/// SNI from the wire ClientHello when ECH is accepted — BoringSSL only exposes
+/// the decrypted inner name after acceptance.
+pub fn client_hello_sni(handshake_message: &[u8]) -> Option<String> {
+    let body = strip_handshake_header(handshake_message)?;
+    let parsed = parse_client_hello(body)?;
+    let ext = parsed.extensions.iter().find(|ext| ext.ty == EXT_SNI)?;
+    parse_sni_host_name(ext.body)
+}
+
+// SNI extension body is a ServerNameList: u16 list length, then entries of
+// { name_type: u8, name: opaque<0..2^16-1> }. name_type 0 is `host_name`.
+fn parse_sni_host_name(body: &[u8]) -> Option<String> {
+    const SNI_HOST_NAME: u8 = 0x00;
+    let mut reader = Reader::new(body);
+    let list_len = reader.u16()? as usize;
+    let list = reader.bytes(list_len)?;
+    let mut entries = Reader::new(list);
+    while !entries.remaining().is_empty() {
+        let name_type = entries.u8()?;
+        let name_len = entries.u16()? as usize;
+        let name = entries.bytes(name_len)?;
+        if name_type == SNI_HOST_NAME {
+            return std::str::from_utf8(name).ok().map(str::to_ascii_lowercase);
+        }
+    }
+    None
+}
+
 struct ParsedClientHello<'a> {
     legacy_version: u16,
     supported_version: Option<u16>,
