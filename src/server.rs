@@ -32,7 +32,7 @@ use ulid::Ulid;
 use url::Url;
 
 use crate::{
-    boringtls::BoringStream,
+    boringtls::{AcceptOutcome, BoringStream},
     config::StaticConfig,
     http::h1::{self, HttpError, Request, RequestHead, StreamHint},
     logging::async_log,
@@ -281,7 +281,26 @@ async fn run_tls_listener(
             // ServerHello acceptance signal, retry_configs on rejection), so the
             // listener just does a normal accept and reads the negotiated state.
             match tls_state.acceptor.accept(stream).await {
-                Ok(tls_stream) => {
+                Ok(AcceptOutcome::Relay {
+                    target,
+                    prelude,
+                    io,
+                }) => {
+                    // ECH "don't stick out" fallback: a client reached one of our
+                    // ECH public names without a decryptable inner ClientHello,
+                    // and we hold no certificate for that name. Transparently
+                    // relay the raw TLS connection to the real public-name server.
+                    if let Err(err) = relay_tls_connection(io, &target, prelude).await {
+                        async_log(
+                            format!(
+                                "[listener] ECH relay of {reported_peer} to {target:?} failed: {err:?}\n"
+                            )
+                            .into_bytes(),
+                        )
+                        .await;
+                    }
+                }
+                Ok(AcceptOutcome::Stream(tls_stream)) => {
                     let alpn = tls_stream
                         .alpn_protocol()
                         .and_then(|p| String::from_utf8(p).ok());
@@ -366,6 +385,83 @@ fn log_tls_error(peer: std::net::SocketAddr, error: &anyhow::Error) {
         }
     }
     eprintln!("TLS handshake with {peer} failed: {error:?}");
+}
+
+/// Transparently relay a raw TCP connection to the real public-name server on
+/// port 443 (the ECH "don't stick out" fallback). The buffered `prelude` — the
+/// ClientHello bytes already read off the wire during the aborted handshake — is
+/// replayed to the upstream first, then both directions are spliced until either
+/// side closes. The relay is byte-for-byte, so the client's connection is
+/// indistinguishable from a normal direct connection to the public name.
+async fn relay_tls_connection(client: TcpStream, target: &str, prelude: Vec<u8>) -> Result<()> {
+    const RELAY_PORT: u16 = 443;
+
+    // Resolve the public name off the runtime thread (blocking getaddrinfo).
+    let host = target.to_string();
+    let (tx, rx) = oneshot::channel();
+    DNS_TP.with(|tp| {
+        tp.spawn(move || {
+            let resolved = (host.as_str(), RELAY_PORT)
+                .to_socket_addrs()
+                .map(|it| it.collect::<Vec<_>>());
+            let _ = tx.send(resolved);
+        });
+    });
+    let addrs = rx
+        .await
+        .map_err(|_| anyhow!("DNS resolver dropped"))?
+        .with_context(|| format!("resolving ECH relay target {target:?}"))?;
+    if addrs.is_empty() {
+        return Err(anyhow!(
+            "ECH relay target {target:?} resolved to no addresses"
+        ));
+    }
+
+    let mut upstream = TcpStream::connect(&addrs[..])
+        .await
+        .with_context(|| format!("connecting to ECH relay target {target:?}"))?;
+    let _ = upstream.set_nodelay(true);
+
+    // Replay the bytes the client already sent (the ClientHello) before splicing.
+    if !prelude.is_empty() {
+        let (res, _) = upstream.write_all(prelude).await;
+        res.context("replaying buffered ClientHello to ECH relay target")?;
+    }
+
+    let (client_r, client_w) = client.into_split();
+    let (upstream_r, upstream_w) = upstream.into_split();
+    monoio::join!(
+        relay_copy(client_r, upstream_w),
+        relay_copy(upstream_r, client_w)
+    );
+    Ok(())
+}
+
+/// Copy bytes from `reader` to `writer` until EOF or error, then shut the
+/// writer down. Errors are swallowed: one relay half closing is routine.
+async fn relay_copy<R, W>(mut reader: R, mut writer: W)
+where
+    R: AsyncReadRent,
+    W: AsyncWriteRent,
+{
+    // Scope the `IoBuf` trait locally so its `slice` method doesn't shadow
+    // `bytes::Bytes::slice` elsewhere in this module.
+    use monoio::buf::IoBuf;
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        let (res, b) = reader.read(buf).await;
+        buf = b;
+        let n = match res {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        let (res, slice) = writer.write_all(buf.slice(0..n)).await;
+        buf = slice.into_inner();
+        if res.is_err() {
+            break;
+        }
+    }
+    let _ = writer.shutdown().await;
 }
 
 async fn is_h2c_preface(stream: &TcpStream) -> std::io::Result<bool> {

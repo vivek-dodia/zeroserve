@@ -36,6 +36,12 @@ const READ_CHUNK: usize = 16 * 1024;
 // Wire-format ALPN list the server offers, in preference order: h2, http/1.1.
 const ALPN_WIRE: &[u8] = b"\x02h2\x08http/1.1";
 static JA4_EX_INDEX: OnceLock<Index<Ssl, String>> = OnceLock::new();
+// Set by the certificate-selection callback when a connection should be
+// transparently relayed (ECH "don't stick out" fallback) instead of
+// terminated. Holds the relay target (the cleartext outer SNI / ECH public
+// name). The handshake is then deliberately aborted and `drive_handshake`
+// recovers this marker plus the buffered ClientHello.
+static RELAY_EX_INDEX: OnceLock<Index<Ssl, String>> = OnceLock::new();
 
 pub struct ServerIdentity {
     pub cert_path: PathBuf,
@@ -128,6 +134,25 @@ pub struct BoringAcceptor {
     ctx: SslContext,
 }
 
+/// The result of a server-side accept. Normally a negotiated TLS stream, but
+/// when ECH is enabled and a client connects to one of the ECH public names
+/// without a decryptable inner ClientHello (and we hold no certificate for that
+/// public name), the handshake is not terminated here — instead the raw
+/// connection is handed back for transparent relay to the real public-name
+/// server. See `RELAY_EX_INDEX`.
+pub enum AcceptOutcome<IO> {
+    /// A negotiated TLS stream, ready for the h1/h2 handlers.
+    Stream(BoringStream<IO>),
+    /// Relay the raw TCP bytes to `target`. `prelude` is the verbatim
+    /// ClientHello (and any other already-buffered) bytes that must be replayed
+    /// to the upstream before splicing `io` in both directions.
+    Relay {
+        target: String,
+        prelude: Vec<u8>,
+        io: IO,
+    },
+}
+
 impl BoringAcceptor {
     /// Build a server context from PEM cert + key files, offering h2/http1.1
     /// via ALPN. `configure` runs against the builder before it is finalized
@@ -135,14 +160,22 @@ impl BoringAcceptor {
     pub fn build(
         cert_path: &std::path::Path,
         key_path: &std::path::Path,
+        relay_public_names: Vec<String>,
         configure: impl FnOnce(&mut SslContextBuilder) -> Result<()>,
     ) -> Result<Self> {
         let identity = ServerIdentity::from_paths(cert_path, key_path)?;
         let mut builder = SslContextBuilder::new(SslMethod::tls())
             .context("creating BoringSSL server context")?;
         configure_server_context(&mut builder, &identity)?;
-        builder.set_select_certificate_callback(|mut client_hello| {
+        let dns_names = identity.dns_names.clone();
+        builder.set_select_certificate_callback(move |mut client_hello| {
             record_ja4(&mut client_hello);
+            if let Some(target) = relay_target(&client_hello, &relay_public_names, |sni| {
+                dns_names.iter().any(|name| dns_name_matches(name, sni))
+            }) {
+                client_hello.ssl_mut().set_ex_data(relay_ex_index(), target);
+                return Err(SelectCertError::ERROR);
+            }
             Ok(())
         });
         configure(&mut builder)?;
@@ -157,6 +190,7 @@ impl BoringAcceptor {
     /// matches that SNI.
     pub fn build_with_identities(
         identities: Vec<ServerIdentity>,
+        relay_public_names: Vec<String>,
         configure: impl Fn(&mut SslContextBuilder) -> Result<()>,
     ) -> Result<Self> {
         if identities.is_empty() {
@@ -212,6 +246,12 @@ impl BoringAcceptor {
             let Some(choice) = choices.iter().find(|choice| {
                 !cert_is_expired(&choice.leaf).unwrap_or(true) && cert_matches_sni(choice, &sni)
             }) else {
+                // No certificate covers this SNI. If it is an ECH public name
+                // and ECH was not accepted, mark the connection for transparent
+                // relay to the real public-name server rather than failing.
+                if let Some(target) = relay_target(&client_hello, &relay_public_names, |_| false) {
+                    client_hello.ssl_mut().set_ex_data(relay_ex_index(), target);
+                }
                 return Err(SelectCertError::ERROR);
             };
 
@@ -231,7 +271,7 @@ impl BoringAcceptor {
 
     /// Perform the server-side TLS handshake over `io`, pumping records
     /// through the in-memory bridge.
-    pub async fn accept<IO>(&self, io: IO) -> Result<BoringStream<IO>>
+    pub async fn accept<IO>(&self, io: IO) -> Result<AcceptOutcome<IO>>
     where
         IO: AsyncReadRent + AsyncWriteRent,
     {
@@ -239,6 +279,39 @@ impl BoringAcceptor {
         let mid = SslStreamBuilder::new(ssl, MemBridge::new()).setup_accept();
         drive_handshake(mid, io).await
     }
+}
+
+/// Decide whether a connection should be transparently relayed instead of
+/// terminated. Returns the relay target (the cleartext outer SNI) when ECH was
+/// *not* accepted (no decryptable inner ClientHello), the cleartext SNI is one
+/// of the configured ECH public names, and `cert_covers` reports that none of
+/// our certificates cover that name.
+fn relay_target(
+    client_hello: &ClientHello<'_>,
+    relay_public_names: &[String],
+    cert_covers: impl Fn(&str) -> bool,
+) -> Option<String> {
+    if relay_public_names.is_empty() {
+        return None;
+    }
+    // ECH accepted means we decrypted the inner ClientHello and are serving the
+    // protected name — never relay those.
+    if client_hello.ssl().ech_accepted() {
+        return None;
+    }
+    let sni = client_hello
+        .servername(NameType::HOST_NAME)?
+        .to_ascii_lowercase();
+    if !relay_public_names
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(&sni))
+    {
+        return None;
+    }
+    if cert_covers(&sni) {
+        return None;
+    }
+    Some(sni)
 }
 
 fn configure_server_context(
@@ -328,7 +401,7 @@ fn dns_name_matches(pattern: &str, sni: &str) -> bool {
 async fn drive_handshake<IO>(
     mut mid: boring::ssl::MidHandshakeSslStream<MemBridge>,
     mut io: IO,
-) -> Result<BoringStream<IO>>
+) -> Result<AcceptOutcome<IO>>
 where
     IO: AsyncReadRent + AsyncWriteRent,
 {
@@ -347,6 +420,19 @@ where
                 mid = m;
             }
             Err(HandshakeError::Failure(m)) => {
+                // The certificate-selection callback may have aborted the
+                // handshake to request a transparent relay (ECH "don't stick
+                // out" fallback). Recover the target and the verbatim bytes the
+                // client already sent (the ClientHello), discarding any alert
+                // BoringSSL queued so the client sees a clean relayed stream.
+                if let Some(target) = m.ssl().ex_data(relay_ex_index()).cloned() {
+                    let prelude = m.get_ref().inbound.clone();
+                    return Ok(AcceptOutcome::Relay {
+                        target,
+                        prelude,
+                        io,
+                    });
+                }
                 return Err(anyhow!("TLS handshake failed: {}", m.error()));
             }
             Err(HandshakeError::SetupFailure(e)) => {
@@ -354,12 +440,12 @@ where
             }
         }
     };
-    Ok(BoringStream {
+    Ok(AcceptOutcome::Stream(BoringStream {
         ssl: stream,
         io,
         scratch: vec![0u8; READ_CHUNK],
         shutdown_sent: false,
-    })
+    }))
 }
 
 /// Process-wide TLS client connector for the reverse proxy, built once at
@@ -428,7 +514,14 @@ where
         .with_context(|| format!("invalid TLS server name {sni:?}"))?;
     let mut builder = SslStreamBuilder::new(ssl, MemBridge::new());
     builder.set_connect_state();
-    drive_handshake(builder.setup_connect(), io).await
+    match drive_handshake(builder.setup_connect(), io).await? {
+        AcceptOutcome::Stream(stream) => Ok(stream),
+        // Relay is only ever requested by the server cert-selection callback;
+        // the client path installs no such marker.
+        AcceptOutcome::Relay { .. } => Err(anyhow!(
+            "unexpected relay outcome during client TLS connect"
+        )),
+    }
 }
 
 /// Flush any ciphertext BoringSSL has queued in `bridge.outbound` to the socket.
@@ -500,6 +593,10 @@ impl<IO> BoringStream<IO> {
 
 fn ja4_ex_index() -> Index<Ssl, String> {
     *JA4_EX_INDEX.get_or_init(|| Ssl::new_ex_index::<String>().expect("SSL ex-data index"))
+}
+
+fn relay_ex_index() -> Index<Ssl, String> {
+    *RELAY_EX_INDEX.get_or_init(|| Ssl::new_ex_index::<String>().expect("SSL ex-data index"))
 }
 
 impl<IO: AsyncWriteRent> BoringStream<IO> {
@@ -748,11 +845,14 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let acceptor = BoringAcceptor::build(&cert, &key, |_| Ok(())).unwrap();
+        let acceptor = BoringAcceptor::build(&cert, &key, Vec::new(), |_| Ok(())).unwrap();
 
         let server = async move {
             let (sock, _) = listener.accept().await.unwrap();
-            let mut tls = acceptor.accept(sock).await.unwrap();
+            let mut tls = match acceptor.accept(sock).await.unwrap() {
+                AcceptOutcome::Stream(s) => s,
+                AcceptOutcome::Relay { .. } => panic!("unexpected relay outcome"),
+            };
             let ja4 = tls.ja4_fingerprint().unwrap();
             assert!(ja4.starts_with('t'));
             assert_eq!(ja4.len(), 36);
@@ -868,7 +968,7 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let acceptor = BoringAcceptor::build(&cert, &key, move |builder| {
+        let acceptor = BoringAcceptor::build(&cert, &key, Vec::new(), move |builder| {
             let mut keys = SslEchKeys::builder().unwrap();
             let hpke = boring::hpke::HpkeKey::dhkem_p256_sha256(&priv_raw).unwrap();
             keys.add_key(true, &config_bytes, hpke).unwrap();
@@ -880,11 +980,15 @@ mod tests {
         let server = async move {
             let (sock, _) = listener.accept().await.unwrap();
             match acceptor.accept(sock).await {
-                Ok(tls) => {
+                Ok(AcceptOutcome::Stream(tls)) => {
                     // With ECH accepted, servername() must be the INNER name the
                     // client protected, not the public/outer name.
                     assert_eq!(tls.server_name().as_deref(), Some("secret.internal"));
                     Some(tls.ech_accepted())
+                }
+                Ok(AcceptOutcome::Relay { .. }) => {
+                    eprintln!("server unexpectedly chose relay");
+                    None
                 }
                 Err(e) => {
                     eprintln!("server accept error: {e:?}");
@@ -939,5 +1043,81 @@ mod tests {
         let (server_ech, client_ech) = monoio::join!(server, client);
         assert_eq!(client_ech, Some(true), "client: ECH should be accepted");
         assert_eq!(server_ech, Some(true), "server: ECH should be accepted");
+    }
+
+    // A client connecting with the ECH public name as its cleartext SNI but no
+    // decryptable inner ClientHello (here, plain TLS with no ECH at all), while
+    // the server holds no certificate covering that name, must yield a Relay
+    // outcome carrying the public name and the buffered ClientHello — the core
+    // of the ECH "don't stick out" fallback.
+    #[test]
+    fn relay_when_outer_sni_uncovered_and_inner_undecryptable() {
+        monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+            .enable_timer()
+            .build()
+            .unwrap()
+            .block_on(relay_when_outer_sni_uncovered_and_inner_undecryptable_inner());
+    }
+
+    async fn relay_when_outer_sni_uncovered_and_inner_undecryptable_inner() {
+        use boring::ssl::{SslConnector, SslVerifyMode};
+        use monoio::net::{TcpListener, TcpStream};
+
+        let cert = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("certificate.pem");
+        let key = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("key.pem");
+        if !cert.exists() || !key.exists() {
+            eprintln!("skipping: test cert/key not present");
+            return;
+        }
+
+        // The repo test cert covers 127.0.0.1/localhost, not this public name.
+        let public_name = "public.example.com";
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let acceptor =
+            BoringAcceptor::build(&cert, &key, vec![public_name.to_string()], |_| Ok(())).unwrap();
+
+        let server = async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            match acceptor.accept(sock).await {
+                Ok(AcceptOutcome::Relay {
+                    target, prelude, ..
+                }) => Some((target, prelude)),
+                Ok(AcceptOutcome::Stream(_)) => {
+                    eprintln!("server unexpectedly terminated instead of relaying");
+                    None
+                }
+                Err(e) => {
+                    eprintln!("server accept error: {e:?}");
+                    None
+                }
+            }
+        };
+
+        // The client only needs to emit its ClientHello; the server aborts the
+        // handshake to relay, so no ServerHello ever comes back. The flushed
+        // bytes stay queued in the kernel and are delivered to the server even
+        // after the client returns and the socket is torn down.
+        let client = async move {
+            let mut io = TcpStream::connect(addr).await.unwrap();
+            let mut cfg = SslConnector::builder(SslMethod::tls()).unwrap();
+            cfg.set_verify(SslVerifyMode::NONE);
+            let conf = cfg.build().configure().unwrap();
+            let ssl = conf.into_ssl(public_name).unwrap();
+            let mid = SslStreamBuilder::new(ssl, MemBridge::new()).setup_connect();
+            if let Err(HandshakeError::WouldBlock(mut m)) = mid.handshake() {
+                let _ = flush_out(m.get_mut(), &mut io).await;
+            }
+        };
+
+        let (relayed, ()) = monoio::join!(server, client);
+        let (target, prelude) = relayed.expect("server should choose relay");
+        assert_eq!(target, public_name);
+        assert!(
+            !prelude.is_empty(),
+            "relay prelude (ClientHello) must be present"
+        );
+        // A TLS 1.3 ClientHello record starts with handshake content type 0x16.
+        assert_eq!(prelude[0], 0x16, "prelude should be a TLS handshake record");
     }
 }

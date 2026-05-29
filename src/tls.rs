@@ -43,6 +43,25 @@ pub fn load_tls_if_configured(config: &Arc<StaticConfig>) -> Result<Option<TlsRu
             };
 
             let ech_enabled = ech_keys.is_some();
+
+            // The distinct ECH public names. When a client connects to one of
+            // these without a decryptable inner ClientHello and we hold no
+            // certificate covering it, the acceptor transparently relays the
+            // raw TLS connection to the real public-name server.
+            let relay_public_names: Vec<String> = match &ech_keys {
+                Some(set) => {
+                    let mut names: Vec<String> = set
+                        .pairs
+                        .iter()
+                        .map(|p| p.config.public_name.clone())
+                        .collect();
+                    names.sort_unstable();
+                    names.dedup();
+                    names
+                }
+                None => Vec::new(),
+            };
+
             let configure = |builder: &mut boring::ssl::SslContextBuilder| {
                 if let Some(set) = &ech_keys {
                     let mut ech = SslEchKeys::builder()
@@ -84,7 +103,11 @@ pub fn load_tls_if_configured(config: &Arc<StaticConfig>) -> Result<Option<TlsRu
                     identities.len(),
                     cert_dir.display()
                 );
-                BoringAcceptor::build_with_identities(identities, configure)?
+                BoringAcceptor::build_with_identities(
+                    identities,
+                    relay_public_names.clone(),
+                    configure,
+                )?
             } else {
                 let cert = config
                     .cert_path
@@ -94,7 +117,7 @@ pub fn load_tls_if_configured(config: &Arc<StaticConfig>) -> Result<Option<TlsRu
                     .key_path
                     .as_deref()
                     .ok_or_else(|| anyhow!("TLS private key path missing"))?;
-                BoringAcceptor::build(cert, key, configure)?
+                BoringAcceptor::build(cert, key, relay_public_names.clone(), configure)?
             };
 
             let mut ech_public_name = None;
@@ -111,6 +134,10 @@ pub fn load_tls_if_configured(config: &Arc<StaticConfig>) -> Result<Option<TlsRu
                     set.pairs.len(),
                     names,
                     list_b64
+                );
+                eprintln!(
+                    "ECH relay enabled for public name(s) {:?}: connections to those names without a decryptable inner ClientHello and without a matching certificate will be transparently relayed to the real server on port 443",
+                    relay_public_names
                 );
                 // Report the outer SNI only when it is unambiguous.
                 names.sort_unstable();

@@ -218,6 +218,25 @@ then retry immediately with a fresh config, so a stale DNS cache self-heals
 within one extra handshake. Scripts can observe per-connection ECH status via
 `zs_connection_info()` (the `ech.accepted` field).
 
+### Transparent relay fallback ("don't stick out")
+
+The reject behaviour above assumes the configured certificate covers the ECH
+public name. If it does **not** — i.e. ECH is enabled but no loaded certificate
+matches the public name — zeroserve cannot complete the handshake for that name.
+In that case, when a client connects with the public name as its (cleartext)
+outer SNI and there is **no decryptable inner ClientHello** (no ECH offered,
+GREASE ECH, or a stale/undecryptable config), zeroserve transparently relays the
+raw TLS connection to the real server for that public name on port 443.
+
+The relay is byte-for-byte: the buffered ClientHello is replayed to the upstream
+and both directions are then spliced, so the connection is indistinguishable
+from a direct connection to the public name. This lets you point an ECH public
+name at a genuine, separately-hosted domain (e.g. a large shared front-end)
+without that domain's certificate, exactly as recommended by the ECH spec to
+avoid "sticking out". Connections whose inner ClientHello *does* decrypt are
+terminated normally and served the protected site; this fallback only applies to
+the undecryptable case. It is enabled automatically whenever ECH is configured.
+
 ## Request scripting (eBPF)
 
 Zeroserve can run eBPF programs on every request. Scripts are loaded from
