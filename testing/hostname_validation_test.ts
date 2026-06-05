@@ -1,6 +1,6 @@
 import { assertEquals } from "@std/assert";
 import { join } from "@std/path";
-import { packSite, withZeroserve, getZeroservePath } from "./test_utils.ts";
+import { packSite, withZeroserve, withZeroserveTls, getZeroservePath } from "./test_utils.ts";
 import * as http2 from "node:http2";
 import { Buffer } from "node:buffer";
 
@@ -113,6 +113,183 @@ function h2cRequestWithHost(
 
         req.end();
     });
+}
+
+async function h2TlsRequestsWithAuthorities(
+    hostname: string,
+    port: number,
+    caPath: string,
+    requests: { path: string; authority: string }[],
+    serverName = hostname,
+): Promise<{ status: number; body: string }[]> {
+    const script = `
+const http2 = require("node:http2");
+const fs = require("node:fs");
+const [hostname, port, caPath, serverName, requestsJson] = process.argv.slice(1);
+const requests = JSON.parse(requestsJson);
+const client = http2.connect(\`https://\${hostname}:\${port}\`, {
+  ca: fs.readFileSync(caPath),
+  rejectUnauthorized: true,
+  servername: serverName,
+});
+const results = [];
+let completed = 0;
+let done = false;
+function fail(err) {
+  if (done) return;
+  done = true;
+  client.close();
+  console.error(err && err.stack ? err.stack : String(err));
+  process.exit(1);
+}
+client.on("error", fail);
+for (let i = 0; i < requests.length; i++) {
+  const item = requests[i];
+  const req = client.request({
+    ":path": item.path,
+    ":method": "GET",
+    ":authority": item.authority,
+  });
+  let status = 0;
+  const chunks = [];
+  req.on("response", (hdrs) => {
+    status = hdrs[":status"];
+  });
+  req.on("data", (chunk) => chunks.push(chunk));
+  req.on("error", fail);
+  req.on("end", () => {
+    results[i] = {
+      status,
+      body: Buffer.concat(chunks).toString("utf-8"),
+    };
+    completed++;
+    if (completed === requests.length && !done) {
+      done = true;
+      client.close();
+      console.log(JSON.stringify(results));
+    }
+  });
+  req.end();
+}
+`;
+    const output = await new Deno.Command("node", {
+        args: [
+            "-e",
+            script,
+            hostname,
+            String(port),
+            caPath,
+            serverName,
+            JSON.stringify(requests),
+        ],
+        stdout: "piped",
+        stderr: "piped",
+    }).output();
+    if (!output.success) {
+        throw new Error(new TextDecoder().decode(output.stderr));
+    }
+    return JSON.parse(new TextDecoder().decode(output.stdout));
+}
+
+async function generateCaSignedLocalhostCert(): Promise<{
+    caPath: string;
+    certPath: string;
+    keyPath: string;
+    cleanup: () => Promise<void>;
+}> {
+    const dir = await Deno.makeTempDir();
+    const caPath = join(dir, "ca.pem");
+    const caKeyPath = join(dir, "ca-key.pem");
+    const certPath = join(dir, "certificate.pem");
+    const keyPath = join(dir, "key.pem");
+    const csrPath = join(dir, "leaf.csr");
+    const serialPath = join(dir, "ca.srl");
+    const extPath = join(dir, "leaf.ext");
+
+    await runOpenSsl([
+        "req",
+        "-x509",
+        "-newkey",
+        "rsa:2048",
+        "-keyout",
+        caKeyPath,
+        "-out",
+        caPath,
+        "-days",
+        "1",
+        "-nodes",
+        "-subj",
+        "/CN=zeroserve-test-ca",
+        "-addext",
+        "basicConstraints=critical,CA:TRUE",
+        "-addext",
+        "keyUsage=critical,keyCertSign,cRLSign",
+    ]);
+
+    await runOpenSsl([
+        "req",
+        "-newkey",
+        "rsa:2048",
+        "-keyout",
+        keyPath,
+        "-out",
+        csrPath,
+        "-nodes",
+        "-subj",
+        "/CN=localhost",
+    ]);
+
+    await Deno.writeTextFile(
+        extPath,
+        [
+            "basicConstraints=CA:FALSE",
+            "keyUsage=digitalSignature,keyEncipherment",
+            "extendedKeyUsage=serverAuth",
+            "subjectAltName=DNS:localhost,IP:127.0.0.1",
+            "",
+        ].join("\n"),
+    );
+
+    await runOpenSsl([
+        "x509",
+        "-req",
+        "-in",
+        csrPath,
+        "-CA",
+        caPath,
+        "-CAkey",
+        caKeyPath,
+        "-CAserial",
+        serialPath,
+        "-CAcreateserial",
+        "-out",
+        certPath,
+        "-days",
+        "1",
+        "-sha256",
+        "-extfile",
+        extPath,
+    ]);
+
+    return {
+        caPath,
+        certPath,
+        keyPath,
+        cleanup: async () => {
+            await Deno.remove(dir, { recursive: true }).catch(() => {});
+        },
+    };
+}
+
+async function runOpenSsl(args: string[]): Promise<void> {
+    const output = await new Deno.Command("openssl", {
+        args,
+        stdout: "null",
+        stderr: "piped",
+    }).output();
+    if (!output.success) {
+        throw new Error(new TextDecoder().decode(output.stderr));
+    }
 }
 
 async function withZeroserveHostnames(
@@ -384,6 +561,50 @@ Deno.test("e2e: h2c hostname validation rejects non-matching hostname with 421",
             assertEquals(res.body, "Misdirected Request");
         });
     } finally {
+        if (tarPath) {
+            await Deno.remove(tarPath).catch(() => {});
+        }
+        await Deno.remove(siteDir, { recursive: true }).catch(() => {});
+    }
+});
+
+Deno.test("e2e: h2 TLS rejects authority that differs from SNI", async () => {
+    const siteDir = await Deno.makeTempDir();
+    let tarPath: string | null = null;
+    const cert = await generateCaSignedLocalhostCert();
+    try {
+        await Deno.writeTextFile(
+            join(siteDir, "index.html"),
+            "<h1>h2 sni hello</h1>\n",
+        );
+
+        tarPath = await packSite(siteDir);
+
+        await withZeroserveTls(
+            tarPath,
+            cert.certPath,
+            cert.keyPath,
+            async (_httpUrl, httpsUrl) => {
+                const url = new URL(httpsUrl);
+                const results = await h2TlsRequestsWithAuthorities(
+                    url.hostname,
+                    Number(url.port),
+                    cert.caPath,
+                    [
+                        { path: "/", authority: "localhost" },
+                        { path: "/", authority: "evil.com" },
+                    ],
+                    "localhost",
+                );
+
+                assertEquals(results[0].status, 200);
+                assertEquals(results[0].body, "<h1>h2 sni hello</h1>\n");
+                assertEquals(results[1].status, 421);
+                assertEquals(results[1].body, "Misdirected Request");
+            },
+        );
+    } finally {
+        await cert.cleanup();
         if (tarPath) {
             await Deno.remove(tarPath).catch(() => {});
         }

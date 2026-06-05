@@ -669,6 +669,13 @@ async fn handle_request<R: AsyncReadRent + 'static>(
     let (body_source, body_state) =
         create_h1_body_source(reader, body, shared.config.max_buffered_body_size);
 
+    if request_authority_sni_mismatch(&head, connection) {
+        let (mut reader, mut body) = body_state.borrow_mut().take().unwrap();
+        drain_payload(&mut reader, &mut body).await;
+        send_fixed(w, misdirected_request(), &HashMap::new()).await;
+        return (true, reader);
+    }
+
     // Validate hostname if configured
     if !shared.config.validate_hostnames.is_empty() {
         let host = head
@@ -830,19 +837,28 @@ where
         headers,
     };
     ensure_host_header(&mut head);
+    let head_only = head.method == Method::HEAD;
+
+    if request_authority_sni_mismatch(&head, &connection) {
+        send_h2_bytes_response(
+            &mut respond,
+            StatusCode::MISDIRECTED_REQUEST,
+            "text/plain; charset=utf-8",
+            b"Misdirected Request".to_vec(),
+            head_only,
+            &HashMap::new(),
+        )
+        .await?;
+        return Ok(());
+    }
 
     if !shared.config.disable_request_logging {
         log_request(request_id, peer, scheme, &head.method, &head.uri).await;
     }
-    let head_only = head.method == Method::HEAD;
 
     // Validate hostname if configured
     if !shared.config.validate_hostnames.is_empty() {
-        let host = head
-            .headers
-            .get(::http::header::HOST)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
+        let host = request_authority_or_host(&head).unwrap_or("");
         if !is_valid_hostname(host, &shared.config.validate_hostnames) {
             send_h2_bytes_response(
                 &mut respond,
@@ -1049,6 +1065,27 @@ fn ensure_host_header(head: &mut RequestHead) {
     if let Ok(value) = HeaderValue::from_str(authority.as_str()) {
         head.headers.insert(::http::header::HOST, value);
     }
+}
+
+fn request_authority_or_host(head: &RequestHead) -> Option<&str> {
+    head.uri
+        .authority()
+        .map(|authority| authority.as_str())
+        .or_else(|| {
+            head.headers
+                .get(::http::header::HOST)
+                .and_then(|value| value.to_str().ok())
+        })
+}
+
+fn request_authority_sni_mismatch(head: &RequestHead, connection: &ConnectionInfo) -> bool {
+    let Some(sni) = connection.inner_sni.as_deref() else {
+        return false;
+    };
+    let Some(authority) = request_authority_or_host(head) else {
+        return true;
+    };
+    !same_hostname(authority, sni)
 }
 
 async fn send_h2_response(
@@ -2418,22 +2455,34 @@ fn is_valid_hostname(host: &str, allowed: &[String]) -> bool {
     if allowed.is_empty() {
         return true;
     }
-    // Strip port if present, handling IPv6 bracket notation
-    let host_without_port = if host.starts_with('[') {
-        // IPv6 literal: [::1] or [2001:db8::1]:8080
-        host.split("]:")
-            .next()
-            .map(|s| s.trim_start_matches('[').trim_end_matches(']'))
-            .unwrap_or(host)
-    } else {
-        // IPv4 or hostname: strip :port
-        host.split(':').next().unwrap_or(host)
-    };
+    let host_without_port = hostname_without_port(host);
     // Case-insensitive comparison
     let host_lower = host_without_port.to_ascii_lowercase();
     allowed
         .iter()
-        .any(|allowed| allowed.to_ascii_lowercase() == host_lower)
+        .any(|allowed| hostname_without_port(allowed).to_ascii_lowercase() == host_lower)
+}
+
+fn same_hostname(left: &str, right: &str) -> bool {
+    hostname_without_port(left).eq_ignore_ascii_case(hostname_without_port(right))
+}
+
+fn hostname_without_port(host: &str) -> &str {
+    if host.starts_with('[') {
+        // IPv6 literal: [::1] or [2001:db8::1]:8080
+        return host
+            .split("]:")
+            .next()
+            .map(|s| s.trim_start_matches('[').trim_end_matches(']'))
+            .unwrap_or(host);
+    }
+    // IPv4 or hostname: strip :port. Bare IPv6 literals are configuration-only
+    // values in normal use and are left intact.
+    if host.matches(':').count() > 1 {
+        host
+    } else {
+        host.split(':').next().unwrap_or(host)
+    }
 }
 
 async fn log_request(
