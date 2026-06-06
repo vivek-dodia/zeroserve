@@ -153,7 +153,7 @@ fn compile_script(source: &Path, temp_dir: &Path, header_dir: &Path) -> Result<C
             "-Wall",
             "-target",
             "bpf",
-            "-fno-builtin-memcpy",
+            "-fno-builtin",
             "-emit-llvm",
             "-c",
         ])
