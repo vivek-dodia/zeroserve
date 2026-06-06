@@ -467,10 +467,7 @@ impl ScriptRuntime {
         }
     }
 
-    pub(crate) async fn load_scripts(
-        &self,
-        site: Arc<Site>,
-    ) -> anyhow::Result<Rc<Vec<(String, Program)>>> {
+    async fn load_site_scripts(&self, site: Arc<Site>) -> anyhow::Result<Vec<(String, Program)>> {
         let pl = Arc::new(ProgramLoader::new(
             &mut rand::thread_rng(),
             Arc::new(EventListener),
@@ -537,17 +534,22 @@ impl ScriptRuntime {
             scripts.push((name, program.pin_to_current_thread(self.t)));
         }
         scripts.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(scripts)
+    }
+
+    pub(crate) async fn load_scripts_from_sites(
+        &self,
+        sites: &[Arc<Site>],
+    ) -> anyhow::Result<Rc<Vec<(String, Program)>>> {
+        let mut scripts = Vec::new();
+        for site in sites {
+            scripts.extend(self.load_site_scripts(site.clone()).await?);
+        }
         Ok(Rc::new(scripts))
     }
 
     pub(crate) fn install_scripts(&self, scripts: Rc<Vec<(String, Program)>>) {
         *self.scripts.borrow_mut() = scripts;
-    }
-
-    pub async fn reload(&self, site: Arc<Site>) -> anyhow::Result<()> {
-        let scripts = self.load_scripts(site).await?;
-        self.install_scripts(scripts);
-        Ok(())
     }
 
     pub async fn run_request(

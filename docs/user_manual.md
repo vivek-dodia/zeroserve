@@ -78,6 +78,9 @@ Key options:
   ECHConfig (used only with `--gen-ech-key`).
 - `--index <NAME>`: Default document for directories (default `index.html`).
 - `--try-html`: Try `<path>.html` when a request path is missing.
+- `--plugin <PLUGIN_TAR[,PLUGIN_TAR...]>`: Load scripts from one or more
+  plugin tarballs before scripts from `SITE_TAR`. Plugin tarballs use the same
+  layout as site tarballs; eBPF objects are read from `.zeroserve/scripts/*.o`.
 - `--chunk-size <BYTES>`: Streaming chunk size for tar reads (default 65536).
 - `--max-buffered-body-size-kb <KB>`: Maximum request body size in KB for script
   body reads via `zs_req_body_json` (default 256).
@@ -109,6 +112,9 @@ zeroserve --addr 0.0.0.0:8080 \
 
 # HTML fallback and PROXY protocol
 zeroserve --try-html --enable-proxy-protocol site.tar
+
+# Plugin scripts before site scripts
+zeroserve --plugin auth.tar,headers.tar site.tar
 
 # Socket activation (inherit pre-bound sockets)
 zeroserve --addr fd:3 --tls-addr fd:4 --cert cert.pem --key key.pem site.tar
@@ -240,7 +246,9 @@ the undecryptable case. It is enabled automatically whenever ECH is configured.
 ## Request scripting (eBPF)
 
 Zeroserve can run eBPF programs on every request. Scripts are loaded from
-`.zeroserve/scripts/*.o` inside the tarball and executed in sorted path order.
+`.zeroserve/scripts/*.o` inside plugin tarballs and the site tarball. Scripts in
+plugins run first, in the order given to `--plugin`; scripts inside each tarball
+run in sorted path order, followed by site scripts in sorted path order.
 
 Flow and behavior:
 
@@ -283,6 +291,20 @@ llc -march=bpf -bpf-stack-size=4096 -mcpu=v3 -filetype=obj tmp.bc -o out.o
 ```
 
 Put the `.o` files at `.zeroserve/scripts/` in the tarball.
+
+### Plugin tarballs
+
+Plugin tarballs use the same layout as site tarballs, but only their eBPF script
+objects are loaded. Static file serving and helpers such as
+`zs_load_static_json` read from the main site tarball.
+
+```bash
+zeroserve --plugin auth.tar,headers.tar site.tar
+```
+
+Hot reload reloads plugin tarballs, site scripts, site files, and TLS assets
+together. If any plugin or site script fails to load during reload, Zeroserve
+keeps serving the previous site and script chain.
 
 ### Helper API overview
 

@@ -85,6 +85,15 @@ pub struct Cli {
     #[arg(long)]
     pub try_html: bool,
 
+    /// Comma-separated plugin tarballs. Scripts from plugins run before site scripts.
+    #[arg(
+        long,
+        value_name = "PLUGIN_TAR",
+        value_delimiter = ',',
+        conflicts_with_all = ["pack", "dump_sdk", "gen_ech_key"]
+    )]
+    pub plugin: Vec<PathBuf>,
+
     /// Pack a directory to stdout as a site tarball.
     #[arg(long, value_name = "DIR", conflicts_with = "tarball")]
     pub pack: Option<PathBuf>,

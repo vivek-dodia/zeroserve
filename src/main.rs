@@ -140,6 +140,7 @@ fn main() -> Result<()> {
     // Block SIGHUP early before spawning any threads
     let sighup_blocked = SighupBlocked::new();
 
+    let plugin_sites = load_plugin_sites(&config)?;
     let site = Arc::new(Site::load(&config.tar_path, config.max_rate_limit_buckets)?);
     eprintln!(
         "loaded {} entries from {} ({} bytes)",
@@ -181,10 +182,16 @@ fn main() -> Result<()> {
                 config.preempt_timer_interval
             );
 
-            script_runtime
-                .reload(site.clone())
+            let script_sources = plugin_sites
+                .iter()
+                .cloned()
+                .chain(std::iter::once(site.clone()))
+                .collect::<Vec<_>>();
+            let scripts = script_runtime
+                .load_scripts_from_sites(&script_sources)
                 .await
                 .with_context(|| "failed to load scripts")?;
+            script_runtime.install_scripts(scripts);
 
             let shared = Arc::new(SharedState::new(
                 config.clone(),
@@ -197,6 +204,21 @@ fn main() -> Result<()> {
 
             amain(shared, script_runtime).await
         })
+}
+
+fn load_plugin_sites(config: &StaticConfig) -> Result<Vec<Arc<Site>>> {
+    let mut sites = Vec::with_capacity(config.plugin_paths.len());
+    for plugin_path in &config.plugin_paths {
+        let site = Arc::new(Site::load(plugin_path, config.max_rate_limit_buckets)?);
+        eprintln!(
+            "loaded {} entries from plugin {} ({} bytes)",
+            site.total_entries,
+            plugin_path.display(),
+            site.total_bytes
+        );
+        sites.push(site);
+    }
+    Ok(sites)
 }
 
 fn setup_landlock(config: &StaticConfig) -> anyhow::Result<()> {

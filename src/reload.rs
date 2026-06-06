@@ -127,24 +127,31 @@ async fn reload_assets(
     shared: &Arc<SharedState>,
     script_runtime: &Rc<ScriptRuntime>,
 ) -> Result<()> {
-    eprintln!("reloading site and TLS assets");
+    eprintln!("reloading plugin, site, and TLS assets");
     let (tx, rx) = oneshot::channel();
     CPU_TP.with(|tp| {
         let shared = shared.clone();
         tp.spawn(move || {
-            let _ = tx.send(
+            let loaded = load_script_sites(&shared).and_then(|plugin_sites| {
                 Site::load(
                     &shared.config.tar_path,
                     shared.config.max_rate_limit_buckets,
                 )
-                .map(Arc::new),
-            );
+                .map(Arc::new)
+                .map(|site| (plugin_sites, site))
+            });
+            let _ = tx.send(loaded);
         });
     });
-    let site = rx.await.unwrap()?;
+    let (plugin_sites, site) = rx.await.unwrap()?;
+    let script_sources = plugin_sites
+        .iter()
+        .cloned()
+        .chain(std::iter::once(site.clone()))
+        .collect::<Vec<_>>();
 
     let scripts = script_runtime
-        .load_scripts(site.clone())
+        .load_scripts_from_sites(&script_sources)
         .await
         .with_context(|| "failed to reload scripts")?;
 
@@ -153,6 +160,9 @@ async fn reload_assets(
     // Spawn background task to clean up expired rate limit buckets for the new site
     spawn_cleanup_task(site.rate_limit_manager.clone());
     eprintln!("reloaded tarball {}", shared.config.tar_path.display());
+    for plugin_path in &shared.config.plugin_paths {
+        eprintln!("reloaded plugin {}", plugin_path.display());
+    }
     eprintln!("reloaded scripts");
 
     match load_tls_if_configured(&shared.config) {
@@ -168,6 +178,17 @@ async fn reload_assets(
         Err(err) => eprintln!("TLS reload failed: {err:?}"),
     }
     Ok(())
+}
+
+fn load_script_sites(shared: &Arc<SharedState>) -> Result<Vec<Arc<Site>>> {
+    let mut sites = Vec::with_capacity(shared.config.plugin_paths.len());
+    for plugin_path in &shared.config.plugin_paths {
+        sites.push(Arc::new(Site::load(
+            plugin_path,
+            shared.config.max_rate_limit_buckets,
+        )?));
+    }
+    Ok(sites)
 }
 
 #[cfg(test)]
