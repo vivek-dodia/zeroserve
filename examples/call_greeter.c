@@ -12,11 +12,11 @@
  */
 #include <zeroserve.h>
 
-ZS_CALL(greet) {
+ZS_CALL_ENTRY(greet, input) {
   char name[128];
   name[0] = '\0';
 
-  zs_s64 name_node = zs_json_get(json_handle, ZS_STR("name"));
+  zs_s64 name_node = zs_json_get(input, ZS_STR("name"));
   if (name_node >= 0) {
     zs_json_read_string(name_node, name, sizeof(name));
     zs_object_free(name_node);

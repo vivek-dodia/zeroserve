@@ -251,8 +251,9 @@ Flow and behavior:
 - If a script calls `zs_respond`, its response is sent and later scripts are skipped.
 - If a script calls `zs_reverse_proxy`, the request is proxied and later scripts are skipped.
 - Script failures are logged but do not abort the chain.
-- A script may also export `zeroserve.call.<name>` functions (via `ZS_CALL`) that
-  other scripts invoke with `zs_call`; see "Inter-script calls" below.
+- A script may also export `zeroserve.call.<name>` functions (via
+  `ZS_CALL_ENTRY`) that other scripts invoke with `zs_call`; see
+  "Inter-script calls" below.
 
 ### Entry point
 
@@ -494,14 +495,14 @@ Inter-script calls:
   trapped or returned a negative handle, or the maximum call depth (8) was
   reached. `script` names the target script file with or without the `.o`
   extension.
-- Expose a callable from a script with the `ZS_CALL(name)` macro. It places the
-  function in the `zeroserve.call.<name>` code section and gives it the
-  signature `zs_s64 on_call(zs_s64 json_handle)` — it receives the inbound JSON
-  handle by value and returns a JSON handle:
+- Expose a callable from a script with the `ZS_CALL_ENTRY(name, input)` macro.
+  It places the function in the `zeroserve.call.<name>` code section and gives
+  it the signature `zs_s64 on_call(zs_s64 input)` — it receives the inbound JSON
+  handle by value through the user-named parameter and returns a JSON handle:
 
   ```c
   // greeter.c — callee; exposes greet, but no request entrypoint of its own.
-  ZS_CALL(greet) {
+  ZS_CALL_ENTRY(greet, input) {
     zs_s64 out = zs_json_new_object();
     zs_s64 value = zs_json_new_object();
     zs_json_set_string(value, ZS_STR("Hello!"));

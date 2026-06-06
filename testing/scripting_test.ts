@@ -2560,8 +2560,8 @@ static ZS_INLINE zs_s64 get_i64(zs_s64 obj, const char *key, zs_u64 klen) {
   return value;
 }
 
-ZS_CALL(recurse) {
-  zs_s64 remaining = get_i64(json_handle, ZS_STR("remaining"));
+ZS_CALL_ENTRY(recurse, input) {
+  zs_s64 remaining = get_i64(input, ZS_STR("remaining"));
 
   zs_s64 out = zs_json_new_object();
   if (remaining <= 0) {
@@ -2699,14 +2699,16 @@ Deno.test({
 // letting us prove the server stayed healthy after the chain was torn down.
 const SPIN_SCRIPT = String.raw`#include <zeroserve.h>
 
-ZS_CALL(inner) {
+ZS_CALL_ENTRY(inner, input) {
+  (void)input;
   volatile zs_u64 place = 0;
   while (1)
     place += 1;
   return 0; /* unreachable */
 }
 
-ZS_CALL(outer) {
+ZS_CALL_ENTRY(outer, payload) {
+  (void)payload;
   zs_s64 in = zs_json_new_object();
   zs_s64 r = zs_call(ZS_STR("spin"), ZS_STR("inner"), in);
   zs_object_free(in);

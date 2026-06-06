@@ -20,23 +20,24 @@ typedef long ssize_t;
 #define ZS_INLINE __attribute__((always_inline))
 
 /* Define a function callable from other scripts via
- * zs_call(script, ..., "<name>", ..., json_handle). It is placed in the
+ * zs_call(script, ..., "<name>", ..., input). It is placed in the
  * "zeroserve.call.<name>" code section and receives the inbound JSON handle by
- * value, returning a JSON handle (or a negative value to signal failure):
+ * value through the user-named parameter, returning a JSON handle (or a
+ * negative value to signal failure):
  *
- *   ZS_CALL(greet) {
+ *   ZS_CALL_ENTRY(greet, input) {
  *     zs_s64 out = zs_json_new_object();
  *     zs_json_set_string(out, ZS_STR("hello"));
- *     return out;            // json_handle is the caller's argument
+ *     return out;            // input is the caller's argument
  *   }
  */
-#define ZS_CALL(name)                                                          \
-  static zs_s64 zs__call_body_##name(zs_s64 json_handle);                      \
+#define ZS_CALL_ENTRY(name, input)                                             \
+  static zs_s64 zs__call_body_##name(zs_s64 input);                            \
   ZS_SECTION("zeroserve.call." #name)                                          \
   zs_s64 zs__call_entry_##name(zs_s64 *zs__call_input) {                       \
     return zs__call_body_##name(*zs__call_input);                              \
   }                                                                            \
-  static zs_s64 zs__call_body_##name(zs_s64 json_handle)
+  static zs_s64 zs__call_body_##name(zs_s64 input)
 #define ZS_MIN(a, b) ((a) < (b) ? (a) : (b))
 #define ZS_MAX(a, b) ((a) > (b) ? (a) : (b))
 
@@ -110,8 +111,8 @@ extern zs_s64 zs_json_set_null(zs_u64 json);
 extern zs_s64 zs_json_respond(zs_u64 status, zs_u64 json);
 
 /* Invoke another script's `zeroserve.call.<func>` entrypoint (defined with
- * ZS_CALL), passing a JSON handle and receiving one back. `script` names the
- * target script file (with or without the `.o` extension); `func` is the
+ * ZS_CALL_ENTRY), passing a JSON handle and receiving one back. `script` names
+ * the target script file (with or without the `.o` extension); `func` is the
  * exported call name. The input JSON is deep-copied into the callee, and its
  * returned JSON is copied back as a fresh handle in the caller's object table.
  *
