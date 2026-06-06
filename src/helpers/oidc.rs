@@ -108,7 +108,7 @@ pub fn h_oidc_begin_login(
     let return_to = opt_string(scope, return_to_ptr, return_to_len)?
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "/".to_string());
-    let secure = with_ectx(scope, |ctx| Ok(ctx.request.scheme == "https"))?;
+    let secure = with_ectx(scope, |ctx| Ok(ctx.request.borrow().scheme == "https"))?;
 
     scope.post_task(async move {
         let result = async {
@@ -181,10 +181,11 @@ pub fn h_oidc_handle_callback(
 
     // Pull request-scoped inputs synchronously.
     let (code, query_state, cookie_header, secure) = with_ectx(scope, |ctx| {
-        let code = ctx.request.query_param("code").map(str::to_string);
-        let state = ctx.request.query_param("state").map(str::to_string);
-        let cookie = ctx.request.header("cookie").map(str::to_string);
-        Ok((code, state, cookie, ctx.request.scheme == "https"))
+        let request = ctx.request.borrow();
+        let code = request.query_param("code").map(str::to_string);
+        let state = request.query_param("state").map(str::to_string);
+        let cookie = request.header("cookie").map(str::to_string);
+        Ok((code, state, cookie, request.scheme == "https"))
     })?;
 
     // Validate the CSRF state and recover the PKCE verifier from the state cookie.
@@ -289,7 +290,7 @@ pub fn h_oidc_session_verify(
     }
 
     with_ectx(scope, |ctx| {
-        let Some(cookie_header) = ctx.request.header("cookie").map(str::to_string) else {
+        let Some(cookie_header) = ctx.request.borrow().header("cookie").map(str::to_string) else {
             return Ok(0);
         };
         let Some(sealed) = oidc::cookie_value(&cookie_header, SESSION_COOKIE) else {
@@ -322,7 +323,7 @@ pub fn h_oidc_logout(
         opt_string(scope, end_session_ptr, end_session_len)?.filter(|s| !s.is_empty());
 
     with_ectx(scope, |ctx| {
-        let secure = ctx.request.scheme == "https";
+        let secure = ctx.request.borrow().scheme == "https";
         let clear = oidc::clear_cookie(SESSION_COOKIE, secure);
         match end_session_url {
             Some(url) => respond(

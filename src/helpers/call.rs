@@ -69,13 +69,15 @@ pub fn h_call(
             ctx.t,
             ctx.request.clone(),
             ctx.body_source.clone(),
+            ctx.metadata.clone(),
             ctx.site.clone(),
             ctx.call_depth,
             ctx.max_memory_footprint,
         )))
     })?;
 
-    let Some((input, scripts, t, request, body_source, site, call_depth, max_mem)) = prepared
+    let Some((input, scripts, t, request, body_source, metadata, site, call_depth, max_mem)) =
+        prepared
     else {
         return Ok(-1i64 as u64);
     };
@@ -99,6 +101,7 @@ pub fn h_call(
                 input,
                 request,
                 body_source,
+                metadata,
                 script_name.clone(),
                 site,
                 scripts.clone(),

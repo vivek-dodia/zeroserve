@@ -121,23 +121,26 @@ pub fn h_connection_info(
     _: u64,
 ) -> Result<u64, ()> {
     with_ectx(scope, |ctx| {
-        let conn = &ctx.request.connection;
-        let ech = match conn.ech_accepted {
-            Some(accepted) => serde_json::json!({ "accepted": accepted }),
-            None => serde_json::Value::Null,
+        let json = {
+            let request = ctx.request.borrow();
+            let conn = &request.connection;
+            let ech = match conn.ech_accepted {
+                Some(accepted) => serde_json::json!({ "accepted": accepted }),
+                None => serde_json::Value::Null,
+            };
+            serde_json::json!({
+                "tls": conn.tls,
+                "alpn": conn.alpn,
+                "sni": {
+                    "inner": conn.inner_sni,
+                    "outer": conn.outer_sni,
+                },
+                "ech": ech,
+                "fingerprint": {
+                    "ja4": conn.tls_client_ja4,
+                },
+            })
         };
-        let json = serde_json::json!({
-            "tls": conn.tls,
-            "alpn": conn.alpn,
-            "sni": {
-                "inner": conn.inner_sni,
-                "outer": conn.outer_sni,
-            },
-            "ech": ech,
-            "fingerprint": {
-                "ja4": conn.tls_client_ja4,
-            },
-        });
         ctx.alloc_memory_footprint(estimate_json_memory_usage(&json) as u64)?;
         let r = JsonRef::new(json);
         ctx.alloc_extobj(r)
@@ -595,7 +598,7 @@ pub fn h_json_respond(
             .view(|x| serde_json::to_vec(x))
             .inspect_err(|()| ctx.error = INVALID_JSON_REF_ERROR.into())?
             .map_err(|_| ())?;
-        ctx.metadata.insert(
+        ctx.metadata.borrow_mut().insert(
             "zs.response.header.content-type".to_string(),
             "application/json".to_string(),
         );

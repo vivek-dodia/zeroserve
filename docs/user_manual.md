@@ -526,9 +526,13 @@ Inter-script calls:
   }
   ```
 
-  The input JSON is deep-copied into a fresh, isolated context for the callee
-  and its return value is copied back, so the two scripts never share mutable
-  state. Calls may nest (a callee can `zs_call` again) up to a depth of 8; the
+  The JSON argument is deep-copied into the callee and its return value is copied
+  back, so JSON handles are not shared across the call. The **request** and the
+  **metadata map**, however, are shared by reference for the whole request: a
+  callee's `zs_req_set_header`/`zs_req_set_uri` and `zs_meta_set` are visible to
+  the caller and propagate out to the wire (including `zs.response.header.*`
+  metadata). Each callee gets its own response/reverse-proxy slot and JSON object
+  table. Calls may nest (a callee can `zs_call` again) up to a depth of 8; the
   whole chain is torn down immediately if the client disconnects. See
   `examples/call_gateway.c` and `examples/call_greeter.c`.
 

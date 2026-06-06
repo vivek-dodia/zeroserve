@@ -34,7 +34,7 @@ pub fn h_log(
         }
         let output = format!(
             "[user_log] {}: {}: {}\n",
-            ctx.request.request_id,
+            ctx.request.borrow().request_id,
             ctx.script_name,
             std::str::from_utf8(&buf).unwrap_or("(invalid)")
         );
@@ -151,7 +151,7 @@ pub fn h_req_method(
     _: u64,
 ) -> Result<u64, ()> {
     with_ectx(scope, |ctx| {
-        deref_and_write_cstr(scope, out_ptr, out_len, &ctx.request.method)
+        deref_and_write_cstr(scope, out_ptr, out_len, &ctx.request.borrow().method)
     })
 }
 
@@ -164,7 +164,7 @@ pub fn h_req_path(
     _: u64,
 ) -> Result<u64, ()> {
     with_ectx(scope, |ctx| {
-        deref_and_write_cstr(scope, out_ptr, out_len, &ctx.request.path)
+        deref_and_write_cstr(scope, out_ptr, out_len, &ctx.request.borrow().path)
     })
 }
 
@@ -177,7 +177,7 @@ pub fn h_req_uri(
     _: u64,
 ) -> Result<u64, ()> {
     with_ectx(scope, |ctx| {
-        deref_and_write_cstr(scope, out_ptr, out_len, &ctx.request.uri)
+        deref_and_write_cstr(scope, out_ptr, out_len, &ctx.request.borrow().uri)
     })
 }
 
@@ -191,7 +191,7 @@ pub fn h_req_set_uri(
 ) -> Result<u64, ()> {
     let uri = read_utf8(scope, uri_ptr, uri_len)?;
     with_ectx(scope, |ctx| {
-        ctx.request.set_uri(uri)?;
+        ctx.request.borrow_mut().set_uri(uri)?;
         Ok(0)
     })
 }
@@ -205,7 +205,7 @@ pub fn h_req_query(
     _: u64,
 ) -> Result<u64, ()> {
     with_ectx(scope, |ctx| {
-        deref_and_write_cstr(scope, out_ptr, out_len, &ctx.request.query)
+        deref_and_write_cstr(scope, out_ptr, out_len, &ctx.request.borrow().query)
     })
 }
 
@@ -218,7 +218,7 @@ pub fn h_req_scheme(
     _: u64,
 ) -> Result<u64, ()> {
     with_ectx(scope, |ctx| {
-        deref_and_write_cstr(scope, out_ptr, out_len, &ctx.request.scheme)
+        deref_and_write_cstr(scope, out_ptr, out_len, &ctx.request.borrow().scheme)
     })
 }
 
@@ -231,7 +231,7 @@ pub fn h_req_peer(
     _: u64,
 ) -> Result<u64, ()> {
     with_ectx(scope, |ctx| {
-        deref_and_write_cstr(scope, out_ptr, out_len, &ctx.request.peer)
+        deref_and_write_cstr(scope, out_ptr, out_len, &ctx.request.borrow().peer)
     })
 }
 
@@ -245,7 +245,8 @@ pub fn h_req_header(
 ) -> Result<u64, ()> {
     let name = read_utf8(scope, name_ptr, name_len)?;
     with_ectx(scope, |ctx| {
-        let value = ctx.request.header(name.trim()).unwrap_or("");
+        let request = ctx.request.borrow();
+        let value = request.header(name.trim()).unwrap_or("");
         deref_and_write_cstr(scope, out_ptr, out_len, value)
     })
 }
@@ -265,7 +266,7 @@ pub fn h_req_set_header(
         Some(read_utf8(scope, value_ptr, value_len)?)
     };
     with_ectx(scope, |ctx| {
-        ctx.request.set_header(name, value)?;
+        ctx.request.borrow_mut().set_header(name, value)?;
         Ok(0)
     })
 }
@@ -280,7 +281,8 @@ pub fn h_req_query_param(
 ) -> Result<u64, ()> {
     let name = read_utf8(scope, name_ptr, name_len)?;
     with_ectx(scope, |ctx| {
-        let value = ctx.request.query_param(name.trim()).unwrap_or("");
+        let request = ctx.request.borrow();
+        let value = request.query_param(name.trim()).unwrap_or("");
         deref_and_write_cstr(scope, out_ptr, out_len, value)
     })
 }
@@ -295,11 +297,8 @@ pub fn h_meta_get(
 ) -> Result<u64, ()> {
     let key = read_utf8(scope, key_ptr, key_len)?;
     with_ectx(scope, |ctx| {
-        let value = ctx
-            .metadata
-            .get(key.trim())
-            .map(String::as_str)
-            .unwrap_or("");
+        let metadata = ctx.metadata.borrow();
+        let value = metadata.get(key.trim()).map(String::as_str).unwrap_or("");
         deref_and_write_cstr(scope, out_ptr, out_len, value)
     })
 }
@@ -319,7 +318,7 @@ pub fn h_meta_set(
     }
     let value = read_utf8(scope, val_ptr, val_len)?.to_string();
     with_ectx(scope, |ctx| {
-        ctx.metadata.insert(key, value);
+        ctx.metadata.borrow_mut().insert(key, value);
         Ok(0)
     })
 }

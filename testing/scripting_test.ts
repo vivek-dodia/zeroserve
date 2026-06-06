@@ -2804,3 +2804,91 @@ Deno.test({
         }
     },
 });
+
+// A single script that is both gateway and callee. Its `mutate` call mutates the
+// shared request and metadata, then the request handler reads those back —
+// proving that request mutations and metadata set by a callee propagate to the
+// caller and out to the wire.
+const PROPAGATE_SCRIPT = String.raw`#include <zeroserve.h>
+
+ZS_CALL(mutate) {
+  zs_req_set_header(ZS_STR("x-from-callee"), ZS_STR("yes"));
+  zs_meta_set(ZS_STR("callee-note"), ZS_STR("hi"));
+  zs_meta_set(ZS_STR("zs.response.header.x-callee"), ZS_STR("1"));
+  return zs_json_new_object();
+}
+
+ZS_ENTRY
+zs_u64 entry(void) {
+  char path[32];
+  zs_req_path(path, sizeof(path));
+  if (zs_strcmp(path, "/propagate") != 0)
+    return 0;
+
+  zs_s64 payload = zs_json_new_object();
+  zs_s64 reply = zs_call(ZS_STR("propagate"), ZS_STR("mutate"), payload);
+  zs_object_free(payload);
+  if (reply < 0) {
+    zs_respond(502, ZS_STR("call failed\n"));
+    return 0;
+  }
+  zs_object_free(reply);
+
+  /* Read back the request header and metadata the callee set on the shared
+     state. */
+  char hdr[32];
+  hdr[0] = '\0';
+  zs_req_header(ZS_STR("x-from-callee"), hdr, sizeof(hdr));
+  char note[32];
+  note[0] = '\0';
+  zs_meta_get(ZS_STR("callee-note"), note, sizeof(note));
+
+  zs_s64 result = zs_json_new_object();
+  zs_s64 hv = zs_json_new_object();
+  zs_json_set_string(hv, ZS_STR(hdr));
+  zs_json_set(result, ZS_STR("header"), hv);
+  zs_object_free(hv);
+  zs_s64 mv = zs_json_new_object();
+  zs_json_set_string(mv, ZS_STR(note));
+  zs_json_set(result, ZS_STR("meta"), mv);
+  zs_object_free(mv);
+
+  zs_json_respond(200, result);
+  zs_object_free(result);
+  return 0;
+}
+`;
+
+Deno.test({
+    name: "e2e: callee shares the caller's request and metadata",
+    ignore: !canRunScripts,
+    fn: async () => {
+        const siteDir = await Deno.makeTempDir();
+        let tarPath: string | null = null;
+        try {
+            await Deno.writeTextFile(join(siteDir, "index.html"), "propagate\n");
+            const scriptsDir = join(siteDir, ".zeroserve", "scripts");
+            await Deno.mkdir(scriptsDir, { recursive: true });
+            await Deno.writeTextFile(
+                join(scriptsDir, "propagate.c"),
+                PROPAGATE_SCRIPT,
+            );
+            tarPath = await packSite(siteDir);
+
+            await withZeroserve(tarPath, async (baseUrl) => {
+                const res = await fetch(`${baseUrl}/propagate`);
+                assertEquals(res.status, 200);
+                // Request header + metadata the callee set are visible to the
+                // caller through the shared context.
+                assertEquals(await res.json(), { header: "yes", meta: "hi" });
+                // Metadata the callee set also propagated out to the response.
+                assertEquals(res.headers.get("x-callee"), "1");
+            });
+        } finally {
+            if (tarPath) {
+                await Deno.remove(tarPath).catch(() => {});
+            }
+            await Deno.remove(siteDir, { recursive: true }).catch(() => {});
+        }
+    },
+});

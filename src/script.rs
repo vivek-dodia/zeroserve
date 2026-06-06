@@ -323,9 +323,14 @@ impl ScriptOutcome {
 }
 
 pub struct ScriptExecutionContext {
-    pub request: ScriptRequest,
+    /// The live request, shared by reference across an inter-script call chain:
+    /// a callee sees the caller's request and its mutations (set_header/set_uri)
+    /// propagate back to the caller and out to the wire.
+    pub request: Rc<RefCell<ScriptRequest>>,
     pub body_source: BodySource,
-    pub metadata: HashMap<String, String>,
+    /// The per-request metadata map, shared by reference across a call chain so a
+    /// callee's `zs_meta_set` is visible to the caller.
+    pub metadata: Rc<RefCell<HashMap<String, String>>>,
     pub response: Option<ScriptResponse>,
     pub reverse_proxy: Option<String>,
     pub script_name: String,
@@ -352,8 +357,9 @@ impl ScriptExecutionContext {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn for_call(
         input: serde_json::Value,
-        request: ScriptRequest,
+        request: Rc<RefCell<ScriptRequest>>,
         body_source: BodySource,
+        metadata: Rc<RefCell<HashMap<String, String>>>,
         script_name: String,
         site: Arc<Site>,
         scripts: Rc<Vec<(String, Program)>>,
@@ -372,7 +378,7 @@ impl ScriptExecutionContext {
         ScriptExecutionContext {
             request,
             body_source,
-            metadata: HashMap::new(),
+            metadata,
             response: None,
             reverse_proxy: None,
             script_name,
@@ -591,8 +597,11 @@ async fn run_request_scripts(
         return ScriptOutcome::from_request(request);
     }
 
-    let mut request = request;
-    let mut metadata: HashMap<String, String> = HashMap::new();
+    // The request and metadata are shared by reference for the whole request:
+    // each script (and any `zs_call` callee it spawns) holds a clone of these
+    // `Rc`s, so mutations are seen by every later script and propagate out.
+    let request = Rc::new(RefCell::new(request));
+    let metadata: Rc<RefCell<HashMap<String, String>>> = Rc::new(RefCell::new(HashMap::new()));
     let mut response: Option<ScriptResponse> = None;
     let mut reverse_proxy: Option<String> = None;
     let preemption = PreemptionEnabled::new(t);
@@ -603,9 +612,9 @@ async fn run_request_scripts(
         }
 
         let mut ctx = ScriptExecutionContext {
-            request,
+            request: request.clone(),
             body_source: body_source.clone(),
-            metadata,
+            metadata: metadata.clone(),
             response: None,
             reverse_proxy: None,
             script_name: name.clone(),
@@ -634,8 +643,6 @@ async fn run_request_scripts(
             )
             .await;
 
-        metadata = ctx.metadata;
-        request = ctx.request;
         if let Err(err) = run {
             async_log(
                 format!(
@@ -652,8 +659,8 @@ async fn run_request_scripts(
             )
             .await;
             return ScriptOutcome {
-                request,
-                metadata,
+                request: request.borrow().clone(),
+                metadata: metadata.borrow().clone(),
                 response: Some(ScriptResponse {
                     status: 500,
                     body: vec![],
@@ -673,8 +680,8 @@ async fn run_request_scripts(
     }
 
     ScriptOutcome {
-        request,
-        metadata,
+        request: request.borrow().clone(),
+        metadata: metadata.borrow().clone(),
         response,
         reverse_proxy,
     }
@@ -728,7 +735,8 @@ impl ProgramEventListener for EventListener {
         with_ectx(scope, |ctx| {
             let msg = format!(
                 "[script_runtime] {}: {}: throttling\n",
-                ctx.request.request_id, ctx.script_name
+                ctx.request.borrow().request_id,
+                ctx.script_name
             );
             Ok(Some(async_log(msg.into_bytes()).boxed_local()))
         })
