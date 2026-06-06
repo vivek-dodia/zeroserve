@@ -2811,7 +2811,8 @@ Deno.test({
 // caller and out to the wire.
 const PROPAGATE_SCRIPT = String.raw`#include <zeroserve.h>
 
-ZS_CALL(mutate) {
+ZS_CALL_ENTRY(mutate, input) {
+  (void)input;
   zs_req_set_header(ZS_STR("x-from-callee"), ZS_STR("yes"));
   zs_meta_set(ZS_STR("callee-note"), ZS_STR("hi"));
   zs_meta_set(ZS_STR("zs.response.header.x-callee"), ZS_STR("1"));
