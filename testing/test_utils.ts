@@ -6,7 +6,7 @@ export const repoRoot = fromFileUrl(new URL("..", import.meta.url));
 let zeroservePathPromise: Promise<string> | null = null;
 
 export async function getZeroservePath(): Promise<string> {
-  return join(repoRoot, "target", "release", "zeroserve")
+  return join(repoRoot, "target", "release", "zeroserve");
 }
 
 export async function packSite(siteRoot: string): Promise<string> {
@@ -89,7 +89,7 @@ export async function hasBpfToolchain(): Promise<boolean> {
   return await hasCommand("clang") && await hasCommand("llc");
 }
 
-async function waitForServer(
+export async function waitForServer(
   hostname: string,
   port: number,
   statusPromise: Promise<Deno.CommandStatus>,
@@ -114,7 +114,7 @@ async function waitForServer(
   throw new Error(`timed out waiting for zeroserve at ${hostname}:${port}`);
 }
 
-async function stopProcess(
+export async function stopProcess(
   child: Deno.ChildProcess,
   statusPromise: Promise<Deno.CommandStatus>,
 ): Promise<void> {
@@ -137,7 +137,7 @@ async function stopProcess(
   await statusPromise;
 }
 
-async function getFreePort(): Promise<number> {
+export async function getFreePort(): Promise<number> {
   const listener = Deno.listen({ hostname: "127.0.0.1", port: 0 });
   const port = (listener.addr as Deno.NetAddr).port;
   listener.close();
@@ -181,11 +181,11 @@ async function hasCommand(command: string): Promise<boolean> {
   }
 }
 
-function delay(ms: number): Promise<void> {
+export function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function checkExited(
+export async function checkExited(
   statusPromise: Promise<Deno.CommandStatus>,
 ): Promise<Deno.CommandStatus | null> {
   const exited = await Promise.race([
@@ -195,7 +195,7 @@ async function checkExited(
   return exited ?? null;
 }
 
-async function raceWithTimeout<T>(
+export async function raceWithTimeout<T>(
   promise: Promise<T>,
   timeoutMs: number,
 ): Promise<T | null> {

@@ -143,15 +143,17 @@ async fn reload_assets(
     });
     let site = rx.await.unwrap()?;
 
-    // Spawn background task to clean up expired rate limit buckets for the new site
-    spawn_cleanup_task(site.rate_limit_manager.clone());
+    let scripts = script_runtime
+        .load_scripts(site.clone())
+        .await
+        .with_context(|| "failed to reload scripts")?;
 
     shared.site.store(site.clone());
+    script_runtime.install_scripts(scripts);
+    // Spawn background task to clean up expired rate limit buckets for the new site
+    spawn_cleanup_task(site.rate_limit_manager.clone());
     eprintln!("reloaded tarball {}", shared.config.tar_path.display());
-    match script_runtime.reload(site).await {
-        Ok(()) => eprintln!("reloaded scripts"),
-        Err(err) => eprintln!("failed to reload scripts: {err:?}"),
-    }
+    eprintln!("reloaded scripts");
 
     match load_tls_if_configured(&shared.config) {
         Ok(runtime_opt) => {

@@ -6,7 +6,7 @@ use ::http::{
     Uri,
     header::{HeaderName, HeaderValue},
 };
-use anyhow::Context;
+use anyhow::{Context, bail};
 use async_ebpf::{
     helpers::{Helper, write_cstr},
     program::{
@@ -398,7 +398,10 @@ impl ScriptRuntime {
         }
     }
 
-    pub async fn reload(&self, site: Arc<Site>) -> anyhow::Result<()> {
+    pub(crate) async fn load_scripts(
+        &self,
+        site: Arc<Site>,
+    ) -> anyhow::Result<Rc<Vec<(String, Program)>>> {
         let pl = Arc::new(ProgramLoader::new(
             &mut rand::thread_rng(),
             Arc::new(EventListener),
@@ -409,61 +412,72 @@ impl ScriptRuntime {
             .try_clone()
             .and_then(File::from_std)
             .with_context(|| "failed to prepare tar file")?;
-        let scripts: RefCell<HashMap<String, UnboundProgram>> = RefCell::new(HashMap::new());
-        futures::future::join_all(site.entries.iter().map(|(path, entry)| {
-            let scripts = &scripts;
-            let file = &file;
-            let pl = pl.clone();
-            async move {
-                let Some(name) = path.strip_prefix(".zeroserve/scripts/") else {
-                    return;
-                };
+
+        let script_entries: Vec<(String, Arc<_>)> = site
+            .entries
+            .iter()
+            .filter_map(|(path, entry)| {
+                let name = path.strip_prefix(".zeroserve/scripts/")?;
                 if !name.ends_with(".o") {
-                    return;
+                    return None;
                 }
-                let (Ok(()), buf) = file
-                    .read_exact_at(vec![0u8; entry.size as usize], entry.offset)
-                    .await
-                else {
-                    return;
-                };
-                let prog_len = buf.len();
-                let (tx, rx) = oneshot::channel();
-                CPU_TP.with(|tp| {
-                    tp.spawn(move || {
-                        let _ = tx.send(pl.load(&mut rand::thread_rng(), &buf));
-                    });
-                });
-                let prog = rx.await.unwrap();
-                let prog = match prog {
-                    Ok(x) => x,
-                    Err(err) => {
-                        async_log(
-                            format!(
-                                "failed to load script '{}' ({} bytes): {:?}\n",
-                                name, prog_len, err
-                            )
-                            .into_bytes(),
-                        )
-                        .await;
-                        return;
-                    }
-                };
-                async_log(
-                    format!("compiled script '{}' ({} bytes)\n", name, prog_len).into_bytes(),
-                )
-                .await;
-                scripts.borrow_mut().insert(name.to_string(), prog);
-            }
-        }))
-        .await;
-        let scripts = scripts.into_inner();
-        let mut scripts: Vec<(String, Program)> = scripts
-            .into_iter()
-            .map(|(k, v)| (k, v.pin_to_current_thread(self.t)))
+                Some((name.to_string(), entry.clone()))
+            })
             .collect();
+
+        let loaded_scripts =
+            futures::future::join_all(script_entries.into_iter().map(|(name, entry)| {
+                let file = &file;
+                let pl = pl.clone();
+                async move {
+                    let size = usize::try_from(entry.size)
+                        .with_context(|| format!("script '{}' is too large to load", name))?;
+                    let (res, buf) = file.read_exact_at(vec![0u8; size], entry.offset).await;
+                    res.with_context(|| format!("failed to read script '{}'", name))?;
+                    let prog_len = buf.len();
+                    let (tx, rx) = oneshot::channel();
+                    CPU_TP.with(|tp| {
+                        tp.spawn(move || {
+                            let _ = tx.send(pl.load(&mut rand::thread_rng(), &buf));
+                        });
+                    });
+                    let prog = rx.await.with_context(|| {
+                        format!("script loader exited before loading '{}'", name)
+                    })?;
+                    let prog = match prog {
+                        Ok(x) => x,
+                        Err(err) => bail!(
+                            "failed to load script '{}' ({} bytes): {:?}",
+                            name,
+                            prog_len,
+                            err
+                        ),
+                    };
+                    async_log(
+                        format!("compiled script '{}' ({} bytes)\n", name, prog_len).into_bytes(),
+                    )
+                    .await;
+                    Ok::<(String, UnboundProgram), anyhow::Error>((name, prog))
+                }
+            }))
+            .await;
+
+        let mut scripts = Vec::with_capacity(loaded_scripts.len());
+        for script in loaded_scripts {
+            let (name, program): (String, UnboundProgram) = script?;
+            scripts.push((name, program.pin_to_current_thread(self.t)));
+        }
         scripts.sort_by(|a, b| a.0.cmp(&b.0));
-        *self.scripts.borrow_mut() = Rc::new(scripts);
+        Ok(Rc::new(scripts))
+    }
+
+    pub(crate) fn install_scripts(&self, scripts: Rc<Vec<(String, Program)>>) {
+        *self.scripts.borrow_mut() = scripts;
+    }
+
+    pub async fn reload(&self, site: Arc<Site>) -> anyhow::Result<()> {
+        let scripts = self.load_scripts(site).await?;
+        self.install_scripts(scripts);
         Ok(())
     }
 
