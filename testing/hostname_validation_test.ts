@@ -399,7 +399,7 @@ async function raceWithTimeout<T>(
     promise: Promise<T>,
     timeoutMs: number,
 ): Promise<T | null> {
-    let timer: number | null = null;
+    let timer: ReturnType<typeof setTimeout> | null = null;
     try {
         return await Promise.race([
             promise,

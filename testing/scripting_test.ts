@@ -139,7 +139,7 @@ async function assertWebsocketEcho(url: string, payload: string): Promise<void> 
     await new Promise<void>((resolve, reject) => {
         const ws = new WebSocket(url);
         let done = false;
-        let timer: number | null = null;
+        let timer: ReturnType<typeof setTimeout> | null = null;
         const closePromise = new Promise<void>((resolveClose) => {
             ws.onclose = () => resolveClose();
         });
@@ -2766,7 +2766,7 @@ Deno.test({
                 await new Promise((r) => setTimeout(r, 300));
                 controller.abort();
 
-                let cancelTimer: number | undefined;
+                let cancelTimer: ReturnType<typeof setTimeout> | undefined;
                 const cancelDeadline = new Promise<string>((resolve) => {
                     cancelTimer = setTimeout(() => resolve("timeout"), 5000);
                 });
@@ -2780,7 +2780,7 @@ Deno.test({
 
                 // The single-threaded worker must be free again immediately: a
                 // normal request right after cancellation still succeeds fast.
-                let afterTimer: number | undefined;
+                let afterTimer: ReturnType<typeof setTimeout> | undefined;
                 const afterDeadline = new Promise<Response | null>((resolve) => {
                     afterTimer = setTimeout(() => resolve(null), 5000);
                 });
