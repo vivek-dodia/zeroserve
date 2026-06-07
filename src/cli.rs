@@ -147,6 +147,11 @@ pub struct Cli {
     #[arg(long, conflicts_with = "disable_ns_isolation")]
     pub enable_netns_isolation: bool,
 
+    /// Number of worker threads, each running its own isolated event loop
+    /// (independently compiled eBPF programs, listeners via SO_REUSEPORT).
+    #[arg(long, default_value_t = 1, value_parser = must_be_positive)]
+    pub threads: usize,
+
     /// eBPF async preemption timer interval.
     #[arg(long, default_value_t = 2, value_parser = must_be_positive)]
     pub preempt_timer_interval_ms: usize,

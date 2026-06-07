@@ -1,10 +1,6 @@
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
-use futures::channel::oneshot;
-
-use crate::thread_pool::CPU_TP;
 
 /// Result of a rate limit check
 #[repr(u64)]
@@ -147,22 +143,4 @@ impl RateLimitManager {
         self.buckets
             .retain(|_, bucket| bucket.hour_ts == current_hour);
     }
-}
-
-/// Spawn a background task to periodically clean up expired rate limit buckets
-pub fn spawn_cleanup_task(manager: Arc<RateLimitManager>) {
-    monoio::spawn(async move {
-        loop {
-            monoio::time::sleep(Duration::from_secs(60)).await;
-            let manager = manager.clone();
-            let (tx, rx) = oneshot::channel();
-            CPU_TP.with(|tp| {
-                tp.spawn(move || {
-                    manager.cleanup_expired();
-                    let _ = tx.send(());
-                });
-            });
-            let _ = rx.await;
-        }
-    });
 }

@@ -1,23 +1,14 @@
 use std::{
-    io,
-    os::fd::FromRawFd,
-    path::{Path, PathBuf},
+    os::fd::RawFd,
     rc::Rc,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
-use futures::{
-    StreamExt,
-    channel::{mpsc, oneshot},
-};
-use monoio::{fs::File, io::AsyncReadRentExt};
+use futures::{StreamExt, channel::mpsc};
 
-use crate::{
-    ratelimit::spawn_cleanup_task, script::ScriptRuntime, shared::SharedState, site::Site,
-    thread_pool::CPU_TP, tls::load_tls_if_configured,
-};
+use crate::{script::ScriptRuntime, shared::SharedState, site::Site, tls::load_tls_if_configured};
 
 pub struct SighupBlocked {
     mask: libc::sigset_t,
@@ -34,178 +25,218 @@ impl SighupBlocked {
         Self { mask }
     }
 }
-pub fn start_reload_thread(
+
+/// A request handed to a worker telling it to recompile its eBPF programs from a
+/// freshly loaded set of sites. The canary worker is given a `reply` channel so
+/// the coordinator can wait for its result before committing the reload to the
+/// rest of the fleet.
+pub struct ReloadRequest {
+    pub sites: Vec<Arc<Site>>,
+    pub reply: Option<std::sync::mpsc::Sender<Result<(), String>>>,
+}
+
+/// How often the coordinator wakes to poll the reload signal file and run the
+/// periodic rate-limit cleanup. A SIGHUP wakes it immediately via the signalfd.
+const COORDINATOR_TICK: Duration = Duration::from_secs(1);
+/// How often expired rate-limit buckets are swept from the (shared) current site.
+const RATE_LIMIT_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
+/// How long to wait for the canary worker to validate a reload before giving up
+/// and aborting it (leaving the previous configuration in place).
+const CANARY_RELOAD_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Spawn the coordinator: a single dedicated OS thread (no event loop) that owns
+/// all process-global background duties — reacting to reload triggers and
+/// periodically cleaning up rate-limit state.
+///
+/// A reload is staged, not broadcast: the coordinator loads the new assets from
+/// disk once, asks a single canary worker to recompile against them, and only if
+/// the canary succeeds does it commit the new shared assets and notify the
+/// remaining workers. A canary failure aborts the reload with nothing changed.
+pub fn spawn_coordinator(
     shared: Arc<SharedState>,
-    script_runtime: Rc<ScriptRuntime>,
+    worker_txs: Vec<mpsc::UnboundedSender<ReloadRequest>>,
     sighup_blocked: SighupBlocked,
 ) -> Result<()> {
-    let reload_signal_file = shared.config.reload_signal_file.clone();
-
-    // Create signalfd for SIGHUP
     let sfd = unsafe { libc::signalfd(-1, &sighup_blocked.mask, libc::SFD_CLOEXEC) };
     if sfd < 0 {
         return Err(std::io::Error::last_os_error()).context("failed to create signalfd");
     }
 
-    let sfile = unsafe {
-        File::from_std(std::fs::File::from_raw_fd(sfd)).context("failed to wrap signalfd")?
-    };
-
-    monoio::spawn(reload_task(
-        shared,
-        script_runtime,
-        reload_signal_file,
-        sfile,
-    ));
+    std::thread::Builder::new()
+        .name("coordinator".into())
+        .spawn(move || coordinator_loop(shared, worker_txs, sfd))
+        .context("failed to spawn coordinator thread")?;
     Ok(())
 }
 
-async fn reload_task(
+fn coordinator_loop(
     shared: Arc<SharedState>,
-    script_runtime: Rc<ScriptRuntime>,
-    path: Option<PathBuf>,
-    mut sfile: File,
-) {
-    let (mut file_tx, mut file_rx) = mpsc::channel(1);
-    if let Some(path) = path {
-        monoio::spawn(async move {
-            let mut last_signal_contents = read_signal_file(path.as_path()).await;
-            loop {
-                monoio::time::sleep(Duration::from_secs(5)).await;
-                if let Some(contents) = read_signal_file(path.as_path()).await {
-                    if last_signal_contents.as_ref() != Some(&contents) {
-                        last_signal_contents = Some(contents);
-                        let _ = file_tx.try_send(());
-                    }
+    mut worker_txs: Vec<mpsc::UnboundedSender<ReloadRequest>>,
+    sfd: RawFd,
+) -> ! {
+    let signal_file = shared.config.reload_signal_file.clone();
+    let mut last_file_contents = signal_file.as_ref().and_then(|p| std::fs::read(p).ok());
+    let mut last_cleanup = Instant::now();
+
+    loop {
+        let mut should_reload = false;
+
+        // Block until SIGHUP arrives on the signalfd or the tick elapses.
+        let mut pfd = libc::pollfd {
+            fd: sfd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ret = unsafe { libc::poll(&mut pfd, 1, COORDINATOR_TICK.as_millis() as libc::c_int) };
+        if ret > 0 && (pfd.revents & libc::POLLIN) != 0 {
+            // Drain the signalfd so it doesn't stay readable.
+            let mut buf = [0u8; std::mem::size_of::<libc::signalfd_siginfo>()];
+            unsafe {
+                libc::read(sfd, buf.as_mut_ptr().cast(), buf.len());
+            }
+            should_reload = true;
+        } else if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EINTR) {
+                eprintln!("coordinator poll failed: {err:?}");
+            }
+        }
+
+        // Poll the reload signal file for content changes.
+        if let Some(path) = &signal_file {
+            if let Ok(contents) = std::fs::read(path) {
+                if last_file_contents.as_ref() != Some(&contents) {
+                    last_file_contents = Some(contents);
+                    should_reload = true;
                 }
             }
-        });
-    } else {
-        std::mem::forget(file_tx);
-    }
-    loop {
-        monoio::select! {
-            res = wait_for_signal(&mut sfile) => {
-                if let Err(err) = res {
-                    if is_io_canceled(&err) {
-                        continue;
-                    }
-                    eprintln!("signalfd read failed: {err:?}");
-                    continue;
-                }
-            },
-            x = file_rx.next() => {
-                if x.is_none() {
-                    panic!("file watcher exited unexpectedly");
-                }
-            },
         }
-        if let Err(err) = reload_assets(&shared, &script_runtime).await {
-            eprintln!("reload failed: {err:?}");
+
+        if should_reload {
+            if let Err(err) = perform_reload(&shared, &mut worker_txs) {
+                eprintln!("reload failed: {err:?}");
+            }
+        }
+
+        if last_cleanup.elapsed() >= RATE_LIMIT_CLEANUP_INTERVAL {
+            shared.site.load().rate_limit_manager.cleanup_expired();
+            last_cleanup = Instant::now();
         }
     }
 }
 
-async fn wait_for_signal(sfile: &mut File) -> io::Result<()> {
-    let (res, _) = sfile
-        .read_exact(Vec::with_capacity(std::mem::size_of::<
-            libc::signalfd_siginfo,
-        >()))
-        .await;
-    res.map(|_| ())
-}
-
-fn is_io_canceled(err: &io::Error) -> bool {
-    err.raw_os_error() == Some(libc::ECANCELED)
-}
-
-async fn read_signal_file(path: &Path) -> Option<Vec<u8>> {
-    monoio::fs::read(path).await.ok()
-}
-
-async fn reload_assets(
+/// Load the new assets from disk (once), validate them on the canary worker, and
+/// — only on success — commit them to the shared state and roll out to the
+/// remaining workers.
+fn perform_reload(
     shared: &Arc<SharedState>,
-    script_runtime: &Rc<ScriptRuntime>,
+    worker_txs: &mut [mpsc::UnboundedSender<ReloadRequest>],
 ) -> Result<()> {
     eprintln!("reloading plugin, site, and TLS assets");
-    let (tx, rx) = oneshot::channel();
-    CPU_TP.with(|tp| {
-        let shared = shared.clone();
-        tp.spawn(move || {
-            let loaded = load_script_sites(&shared).and_then(|plugin_sites| {
-                Site::load(
-                    &shared.config.tar_path,
-                    shared.config.max_rate_limit_buckets,
-                )
-                .map(Arc::new)
-                .map(|site| (plugin_sites, site))
-            });
-            let _ = tx.send(loaded);
-        });
-    });
-    let (plugin_sites, site) = rx.await.unwrap()?;
-    let script_sources = plugin_sites
+
+    // Filesystem work happens exactly once, here on the coordinator thread.
+    let mut plugin_sites = Vec::with_capacity(shared.config.plugin_paths.len());
+    for plugin_path in &shared.config.plugin_paths {
+        plugin_sites.push(Arc::new(
+            Site::load(plugin_path, shared.config.max_rate_limit_buckets)
+                .with_context(|| format!("failed to reload plugin {}", plugin_path.display()))?,
+        ));
+    }
+    let site = Arc::new(
+        Site::load(
+            &shared.config.tar_path,
+            shared.config.max_rate_limit_buckets,
+        )
+        .with_context(|| "failed to reload site tarball")?,
+    );
+    let tls_result = load_tls_if_configured(&shared.config);
+
+    // The ordered sites every worker compiles: plugins first, then the main site.
+    let sites: Vec<Arc<Site>> = plugin_sites
         .iter()
         .cloned()
         .chain(std::iter::once(site.clone()))
-        .collect::<Vec<_>>();
+        .collect();
 
-    let scripts = script_runtime
-        .load_scripts_from_sites(&script_sources)
-        .await
-        .with_context(|| "failed to reload scripts")?;
+    let Some((canary_tx, rest)) = worker_txs.split_first_mut() else {
+        // No workers to notify (shouldn't happen: thread count is >= 1).
+        return Ok(());
+    };
 
-    shared.site.store(site.clone());
-    script_runtime.install_scripts(scripts);
-    // Spawn background task to clean up expired rate limit buckets for the new site
-    spawn_cleanup_task(site.rate_limit_manager.clone());
-    eprintln!("reloaded tarball {}", shared.config.tar_path.display());
-    for plugin_path in &shared.config.plugin_paths {
-        eprintln!("reloaded plugin {}", plugin_path.display());
+    // Stage 1: validate the new assets on the canary worker and wait for it.
+    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+    let canary_req = ReloadRequest {
+        sites: sites.clone(),
+        reply: Some(reply_tx),
+    };
+    if canary_tx.unbounded_send(canary_req).is_err() {
+        eprintln!("canary worker is gone; aborting reload");
+        return Ok(());
     }
-    eprintln!("reloaded scripts");
+    match reply_rx.recv_timeout(CANARY_RELOAD_TIMEOUT) {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            eprintln!("canary reload failed, aborting (previous config kept): {err}");
+            return Ok(());
+        }
+        Err(err) => {
+            eprintln!("canary reload did not complete in time, aborting: {err}");
+            return Ok(());
+        }
+    }
 
-    match load_tls_if_configured(&shared.config) {
+    // Stage 2: canary succeeded — commit the shared assets, then notify the rest.
+    shared.plugin_sites.store(Arc::new(plugin_sites));
+    shared.site.store(site);
+    match tls_result {
         Ok(runtime_opt) => {
             let tls_present = runtime_opt.is_some();
-            shared
-                .tls
-                .store(runtime_opt.map(|runtime| Arc::new(runtime)));
+            shared.tls.store(runtime_opt.map(Arc::new));
             if tls_present {
                 eprintln!("reloaded TLS configuration");
             }
         }
-        Err(err) => eprintln!("TLS reload failed: {err:?}"),
+        Err(err) => eprintln!("TLS reload failed (keeping previous TLS): {err:?}"),
     }
+
+    for tx in rest.iter_mut() {
+        let _ = tx.unbounded_send(ReloadRequest {
+            sites: sites.clone(),
+            reply: None,
+        });
+    }
+
+    eprintln!("reloaded tarball {}", shared.config.tar_path.display());
+    for plugin_path in &shared.config.plugin_paths {
+        eprintln!("reloaded plugin {}", plugin_path.display());
+    }
+    eprintln!("canary validated; rolled out to all workers");
     Ok(())
 }
 
-fn load_script_sites(shared: &Arc<SharedState>) -> Result<Vec<Arc<Site>>> {
-    let mut sites = Vec::with_capacity(shared.config.plugin_paths.len());
-    for plugin_path in &shared.config.plugin_paths {
-        sites.push(Arc::new(Site::load(
-            plugin_path,
-            shared.config.max_rate_limit_buckets,
-        )?));
-    }
-    Ok(sites)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn identifies_io_uring_cancellation() {
-        let err = io::Error::from_raw_os_error(libc::ECANCELED);
-
-        assert!(is_io_canceled(&err));
-    }
-
-    #[test]
-    fn does_not_treat_other_io_errors_as_canceled() {
-        let err = io::Error::from_raw_os_error(libc::EIO);
-
-        assert!(!is_io_canceled(&err));
+/// Per-worker reload loop. Awaits reload requests from the coordinator and
+/// recompiles this thread's eBPF programs from the sites carried in the request,
+/// installing them into this worker's `ScriptRuntime`. Programs are pinned to
+/// the current thread, so each worker compiles independently. If the request is
+/// the canary's, the outcome is reported back so the coordinator can decide
+/// whether to roll the reload out to the rest of the fleet.
+pub async fn worker_reload_loop(
+    script_runtime: Rc<ScriptRuntime>,
+    mut reload_rx: mpsc::UnboundedReceiver<ReloadRequest>,
+) {
+    while let Some(req) = reload_rx.next().await {
+        let result = match script_runtime.load_scripts_from_sites(&req.sites).await {
+            Ok(scripts) => {
+                script_runtime.install_scripts(scripts);
+                Ok(())
+            }
+            Err(err) => {
+                eprintln!("worker reload: script recompilation failed: {err:?}");
+                Err(format!("{err:?}"))
+            }
+        };
+        if let Some(reply) = req.reply {
+            let _ = reply.send(result);
+        }
     }
 }

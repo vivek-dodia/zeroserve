@@ -2,11 +2,10 @@ use std::{
     cell::RefCell,
     io,
     rc::Rc,
-    sync::{Arc, Mutex, Weak},
+    sync::{Arc, Weak},
 };
 
 use arc_swap::{ArcSwap, ArcSwapOption};
-use std::net::TcpListener;
 
 use monoio::{
     fs::File,
@@ -15,36 +14,49 @@ use monoio::{
 
 use crate::{
     config::StaticConfig,
-    hupwatch::HupWatcher,
     site::{Site, TarEntry},
     tls::TlsRuntime,
 };
 
+/// State shared across all worker event loops. Everything here is `Send + Sync`
+/// and accessed concurrently from every worker thread. Per-thread state (the
+/// monoio runtime, the eBPF `ScriptRuntime`, the TCP listeners, and the hangup
+/// watcher) lives in the workers themselves, not here.
 pub struct SharedState {
     pub config: Arc<StaticConfig>,
     pub site: ArcSwap<Site>,
+    /// Plugin sites whose scripts run before the main site's scripts. Stored so
+    /// each worker can recompile them on reload without re-reading the CLI.
+    pub plugin_sites: ArcSwap<Vec<Arc<Site>>>,
     pub tls: ArcSwapOption<TlsRuntime>,
-    pub http_listener: Mutex<Option<TcpListener>>,
-    pub tls_listener: Mutex<Option<TcpListener>>,
-    pub hup: Arc<HupWatcher>,
 }
 
 impl SharedState {
     pub fn new(
         config: Arc<StaticConfig>,
         site: Arc<Site>,
+        plugin_sites: Vec<Arc<Site>>,
         tls: Option<TlsRuntime>,
-        http_listener: TcpListener,
-        tls_listener: Option<TcpListener>,
     ) -> Self {
         Self {
             config,
             site: ArcSwap::new(site),
+            plugin_sites: ArcSwap::new(Arc::new(plugin_sites)),
             tls: ArcSwapOption::from(tls.map(Arc::new)),
-            http_listener: Mutex::new(Some(http_listener)),
-            tls_listener: Mutex::new(tls_listener),
-            hup: HupWatcher::new(),
         }
+    }
+
+    /// The ordered list of sites whose scripts a worker should compile and run:
+    /// plugin sites first, then the main site. Matches the original startup
+    /// ordering and is recomputed from the latest hot-reloaded assets.
+    pub fn collect_sites(&self) -> Vec<Arc<Site>> {
+        let plugins = self.plugin_sites.load_full();
+        let site = self.site.load_full();
+        plugins
+            .iter()
+            .cloned()
+            .chain(std::iter::once(site))
+            .collect()
     }
 }
 

@@ -24,23 +24,25 @@ use std::io::Write;
 use std::net::TcpListener;
 use std::os::fd::FromRawFd;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc as std_mpsc};
 
 use crate::cli::ListenAddr;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use futures::channel::mpsc;
 use landlock::{Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr};
 use monoio::{IoUringDriver, RuntimeBuilder};
 use nix::mount::MsFlags;
+use socket2::{Domain, Protocol, Socket, Type};
 
 use crate::reload::SighupBlocked;
 use crate::{
     cli::Cli,
     config::StaticConfig,
+    hupwatch::HupWatcher,
     pack::ZEROSERVE_H,
-    ratelimit::spawn_cleanup_task,
-    reload::start_reload_thread,
+    reload::{ReloadRequest, spawn_coordinator, worker_reload_loop},
     script::{ScriptRuntime, ScriptRuntimeConfig},
     server::amain,
     shared::SharedState,
@@ -77,15 +79,20 @@ fn main() -> Result<()> {
         rlimit::increase_nofile_limit(1048576).with_context(|| "failed to raise fd limit")?;
     eprintln!("fd limit {}", fdlimit);
 
-    let http_listener = create_listener(&config.http_addr)
-        .with_context(|| format!("failed to create HTTP listener for {}", config.http_addr))?;
-    let tls_listener = if let Some(x) = &config.tls_addr {
-        Some(
-            create_listener(x)
-                .with_context(|| format!("failed to create TLS listener for {}", x))?,
-        )
-    } else {
-        None
+    let threads = config.threads;
+
+    // One listener per worker. This must happen before namespace isolation and
+    // capability dropping so sockets bind in the caller's network namespace and
+    // privileged ports remain possible.
+    let http_listeners = create_worker_listeners(&config.http_addr, threads)
+        .with_context(|| format!("failed to create HTTP listeners for {}", config.http_addr))?;
+    let tls_listeners: Vec<Option<TcpListener>> = match &config.tls_addr {
+        Some(addr) => create_worker_listeners(addr, threads)
+            .with_context(|| format!("failed to create TLS listeners for {}", addr))?
+            .into_iter()
+            .map(Some)
+            .collect(),
+        None => (0..threads).map(|_| None).collect(),
     };
 
     // Build the reverse-proxy TLS client now, before namespace isolation turns
@@ -154,11 +161,101 @@ fn main() -> Result<()> {
         eprintln!("TLS enabled");
     }
 
+    eprintln!(
+        "async preemption timer interval: {:?}",
+        config.preempt_timer_interval
+    );
+
+    let shared = Arc::new(SharedState::new(
+        config.clone(),
+        site,
+        plugin_sites,
+        tls_runtime,
+    ));
+
+    // One reload channel per worker. The coordinator stages reloads on these:
+    // the first worker acts as the canary, the rest are notified only after it
+    // succeeds.
+    #[allow(clippy::type_complexity)]
+    let (reload_txs, reload_rxs): (
+        Vec<mpsc::UnboundedSender<ReloadRequest>>,
+        Vec<mpsc::UnboundedReceiver<ReloadRequest>>,
+    ) = (0..threads).map(|_| mpsc::unbounded()).unzip();
+
+    // The coordinator owns reload + rate-limit cleanup on its own thread.
+    spawn_coordinator(shared.clone(), reload_txs, sighup_blocked)?;
+
+    eprintln!(
+        "listening on http://{} ({} worker thread(s))",
+        config.http_addr, threads
+    );
+    if let Some(addr) = &config.tls_addr {
+        eprintln!("listening on https://{}", addr);
+    }
+
+    let mut handles = Vec::with_capacity(threads);
+    let (startup_tx, startup_rx) = std_mpsc::channel();
+    for (i, ((http_listener, tls_listener), reload_rx)) in http_listeners
+        .into_iter()
+        .zip(tls_listeners)
+        .zip(reload_rxs)
+        .enumerate()
+    {
+        let shared = shared.clone();
+        let config = config.clone();
+        let startup_tx = startup_tx.clone();
+        let handle = std::thread::Builder::new()
+            .name(format!("worker-{i}"))
+            .spawn(move || {
+                if let Err(err) = run_worker(
+                    i,
+                    config,
+                    shared,
+                    http_listener,
+                    tls_listener,
+                    reload_rx,
+                    startup_tx,
+                ) {
+                    eprintln!("worker {i} exited with error: {err:?}");
+                }
+            })
+            .with_context(|| format!("failed to spawn worker thread {i}"))?;
+        handles.push(handle);
+    }
+    drop(startup_tx);
+
+    for _ in 0..threads {
+        let (i, result) = startup_rx
+            .recv()
+            .with_context(|| "worker startup channel closed before all workers initialized")?;
+        if let Err(err) = result {
+            return Err(anyhow::anyhow!("worker {i} failed to start: {err}"));
+        }
+    }
+
+    for handle in handles {
+        let _ = handle.join();
+    }
+    Ok(())
+}
+
+/// Run a single worker: build a dedicated monoio runtime, create this thread's
+/// own eBPF `ScriptRuntime`, compile its scripts, and serve its listeners. Each
+/// worker is fully isolated — programs are pinned to this thread and never
+/// shared.
+fn run_worker(
+    worker_id: usize,
+    config: Arc<StaticConfig>,
+    shared: Arc<SharedState>,
+    http_listener: TcpListener,
+    tls_listener: Option<TcpListener>,
+    reload_rx: mpsc::UnboundedReceiver<ReloadRequest>,
+    startup_tx: std_mpsc::Sender<(usize, Result<(), String>)>,
+) -> Result<()> {
     let mut urb = io_uring::IoUring::builder();
     urb.setup_single_issuer();
     if let Some(ms) = config.sqpoll_idle_ms {
         urb.setup_sqpoll(ms);
-        eprintln!("io_uring sqpoll enabled with idle timeout {}ms", ms);
     }
 
     RuntimeBuilder::<IoUringDriver>::new()
@@ -167,9 +264,9 @@ fn main() -> Result<()> {
         .build()
         .expect("zeroserve: failed to build io_uring runtime")
         .block_on(async move {
-            // Spawn background task to clean up expired rate limit buckets
-            spawn_cleanup_task(site.rate_limit_manager.clone());
-
+            // SAFETY: GlobalEnv::new() is idempotent (Once-guarded) and
+            // init_thread() sets up this thread's preemption watcher; both are
+            // safe to call once per worker thread.
             let script_runtime = unsafe {
                 ScriptRuntime::new(ScriptRuntimeConfig {
                     preempt_timer_interval: config.preempt_timer_interval,
@@ -177,32 +274,25 @@ fn main() -> Result<()> {
                 })
             };
             let script_runtime = Rc::new(script_runtime);
-            eprintln!(
-                "async preemption timer interval: {:?}",
-                config.preempt_timer_interval
-            );
 
-            let script_sources = plugin_sites
-                .iter()
-                .cloned()
-                .chain(std::iter::once(site.clone()))
-                .collect::<Vec<_>>();
-            let scripts = script_runtime
-                .load_scripts_from_sites(&script_sources)
-                .await
-                .with_context(|| "failed to load scripts")?;
+            // Per-worker hangup watcher (spawns its task on this runtime).
+            let hup = HupWatcher::new();
+
+            let sites = shared.collect_sites();
+            let scripts = match script_runtime.load_scripts_from_sites(&sites).await {
+                Ok(scripts) => scripts,
+                Err(err) => {
+                    let err = err.context("failed to load scripts");
+                    let _ = startup_tx.send((worker_id, Err(format!("{err:?}"))));
+                    return Err(err);
+                }
+            };
             script_runtime.install_scripts(scripts);
+            let _ = startup_tx.send((worker_id, Ok(())));
 
-            let shared = Arc::new(SharedState::new(
-                config.clone(),
-                site,
-                tls_runtime,
-                http_listener,
-                tls_listener,
-            ));
-            start_reload_thread(shared.clone(), script_runtime.clone(), sighup_blocked)?;
+            monoio::spawn(worker_reload_loop(script_runtime.clone(), reload_rx));
 
-            amain(shared, script_runtime).await
+            amain(shared, script_runtime, hup, http_listener, tls_listener).await
         })
 }
 
@@ -274,17 +364,48 @@ fn setup_ns_isolation(config: &StaticConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn create_listener(addr: &ListenAddr) -> std::io::Result<TcpListener> {
+/// Create one listener per worker thread for the given address.
+///
+/// For a bound socket address, each worker gets its own `SO_REUSEPORT` socket so
+/// the kernel hash-balances incoming connections across the workers. For an
+/// inherited file descriptor (e.g. systemd socket activation) the single socket
+/// cannot be re-bound, so each worker receives its own `dup`'d descriptor and
+/// the kernel hands each accepted connection to exactly one worker.
+fn create_worker_listeners(addr: &ListenAddr, count: usize) -> Result<Vec<TcpListener>> {
     match addr {
-        ListenAddr::Socket(socket_addr) => TcpListener::bind(socket_addr),
+        ListenAddr::Socket(socket_addr) => {
+            let mut listeners = Vec::with_capacity(count);
+            for _ in 0..count {
+                let socket = Socket::new(
+                    Domain::for_address(*socket_addr),
+                    Type::STREAM,
+                    Some(Protocol::TCP),
+                )?;
+                socket.set_reuse_address(true)?;
+                socket.set_reuse_port(true)?;
+                socket.set_nonblocking(true)?;
+                socket.bind(&(*socket_addr).into())?;
+                socket.listen(1024)?;
+                listeners.push(socket.into());
+            }
+            Ok(listeners)
+        }
         ListenAddr::Fd(fd) => {
-            // SAFETY: The caller is responsible for ensuring the fd is a valid TCP listener socket.
-            // This is typically used for socket activation (e.g., systemd) where the parent process
-            // passes a pre-bound socket to the child.
-            let listener = unsafe { TcpListener::from_raw_fd(*fd) };
-            // Set non-blocking mode since we're using async I/O
-            listener.set_nonblocking(true)?;
-            Ok(listener)
+            let mut listeners = Vec::with_capacity(count);
+            for _ in 0..count {
+                // SAFETY: the caller guarantees `fd` is a valid listening socket
+                // (socket activation). dup gives each worker an independent
+                // descriptor referencing the same underlying socket.
+                let duped = unsafe { libc::dup(*fd) };
+                if duped < 0 {
+                    return Err(std::io::Error::last_os_error())
+                        .with_context(|| format!("failed to dup inherited fd {fd}"));
+                }
+                let listener = unsafe { TcpListener::from_raw_fd(duped) };
+                listener.set_nonblocking(true)?;
+                listeners.push(listener);
+            }
+            Ok(listeners)
         }
     }
 }

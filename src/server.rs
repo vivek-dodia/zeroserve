@@ -35,6 +35,7 @@ use crate::{
     boringtls::{AcceptOutcome, BoringStream},
     config::StaticConfig,
     http::h1::{self, HttpError, Request, RequestHead, StreamHint},
+    hupwatch::HupWatcher,
     logging::async_log,
     pool::{self, PoolKey, PooledConnection},
     script::{
@@ -142,38 +143,40 @@ struct StaticResponse {
     site: Arc<crate::site::Site>,
 }
 
-pub async fn amain(shared: Arc<SharedState>, script_runtime: Rc<ScriptRuntime>) -> Result<()> {
-    if shared.config.tls_addr.is_some() {
+pub async fn amain(
+    shared: Arc<SharedState>,
+    script_runtime: Rc<ScriptRuntime>,
+    hup: Arc<HupWatcher>,
+    http_listener: std::net::TcpListener,
+    tls_listener: Option<std::net::TcpListener>,
+) -> Result<()> {
+    if let Some(tls_listener) = tls_listener {
         let tls_state = shared.clone();
         let script_runtime = script_runtime.clone();
+        let hup = hup.clone();
         monoio::spawn(async move {
-            if let Err(err) = run_tls_listener(tls_state, script_runtime).await {
+            if let Err(err) = run_tls_listener(tls_state, script_runtime, hup, tls_listener).await {
                 eprintln!("TLS listener stopped: {err:?}");
             }
         });
     }
 
-    run_http_listener(shared, script_runtime).await
+    run_http_listener(shared, script_runtime, hup, http_listener).await
 }
 
 async fn run_http_listener(
     shared: Arc<SharedState>,
     script_runtime: Rc<ScriptRuntime>,
+    hup: Arc<HupWatcher>,
+    http_listener: std::net::TcpListener,
 ) -> Result<()> {
-    let listener = shared
-        .http_listener
-        .lock()
-        .unwrap()
-        .take()
-        .expect("http_listener");
-    let listener = TcpListener::from_std(listener)?;
-    eprintln!("listening on http://{}", shared.config.http_addr);
+    let listener = TcpListener::from_std(http_listener)?;
     loop {
         let (stream, addr) = listener.accept().await?;
         if stream.set_nodelay(true).is_err() {
             continue;
         }
-        let hup = shared.hup.wait(stream.as_raw_fd())?;
+        let conn_hup = hup.wait(stream.as_raw_fd())?;
         let state = shared.clone();
         let script_runtime = script_runtime.clone();
         monoio::spawn(async move {
@@ -191,7 +194,8 @@ async fn run_http_listener(
             } else {
                 addr
             };
-            if let Err(err) = handle_http_connection(hup, stream, peer, state, script_runtime).await
+            if let Err(err) =
+                handle_http_connection(conn_hup, stream, peer, state, script_runtime).await
             {
                 async_log(
                     format!(
@@ -233,26 +237,16 @@ async fn handle_http_connection(
 async fn run_tls_listener(
     shared: Arc<SharedState>,
     script_runtime: Rc<ScriptRuntime>,
+    hup: Arc<HupWatcher>,
+    tls_listener: std::net::TcpListener,
 ) -> Result<()> {
-    let addr = shared
-        .config
-        .tls_addr
-        .as_ref()
-        .ok_or_else(|| anyhow!("TLS listener requested without address"))?;
-    let listener = shared
-        .tls_listener
-        .lock()
-        .unwrap()
-        .take()
-        .expect("tls_listener");
-    let listener = TcpListener::from_std(listener)?;
-    eprintln!("listening on https://{}", addr);
+    let listener = TcpListener::from_std(tls_listener)?;
     loop {
         let (stream, peer) = listener.accept().await?;
         if stream.set_nodelay(true).is_err() {
             continue;
         }
-        let mut hup = shared.hup.wait(stream.as_raw_fd())?;
+        let mut conn_hup = hup.wait(stream.as_raw_fd())?;
         let state = shared.clone();
         let script_runtime = script_runtime.clone();
         monoio::spawn(async move {
@@ -332,7 +326,7 @@ async fn run_tls_listener(
                     if is_h2 {
                         let io = StreamWrapper::new(tls_stream);
                         if let Err(err) = handle_h2_connection(
-                            hup,
+                            conn_hup,
                             io,
                             reported_peer,
                             state,
@@ -352,7 +346,7 @@ async fn run_tls_listener(
                             .await;
                         }
                     } else if let Err(err) = handle_h1_connection(
-                        &mut hup,
+                        &mut conn_hup,
                         tls_stream,
                         reported_peer,
                         state,
@@ -404,13 +398,11 @@ async fn relay_tls_connection(client: TcpStream, target: &str, prelude: Vec<u8>)
     // Resolve the public name off the runtime thread (blocking getaddrinfo).
     let host = target.to_string();
     let (tx, rx) = oneshot::channel();
-    DNS_TP.with(|tp| {
-        tp.spawn(move || {
-            let resolved = (host.as_str(), RELAY_PORT)
-                .to_socket_addrs()
-                .map(|it| it.collect::<Vec<_>>());
-            let _ = tx.send(resolved);
-        });
+    DNS_TP.spawn(move || {
+        let resolved = (host.as_str(), RELAY_PORT)
+            .to_socket_addrs()
+            .map(|it| it.collect::<Vec<_>>());
+        let _ = tx.send(resolved);
     });
     let addrs = rx
         .await
@@ -1802,11 +1794,9 @@ pub(crate) async fn connect_backend(target: &BackendTarget) -> Result<PooledConn
         Some(x) => x,
         None => {
             let (tx, rx) = oneshot::channel();
-            DNS_TP.with(|tp| {
-                tp.spawn(move || {
-                    let resolved = addr.to_socket_addrs();
-                    let _ = tx.send((addr, resolved));
-                });
+            DNS_TP.spawn(move || {
+                let resolved = addr.to_socket_addrs();
+                let _ = tx.send((addr, resolved));
             });
             let (k, v) = rx.await?;
             let v = v

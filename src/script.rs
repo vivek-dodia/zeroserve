@@ -502,10 +502,8 @@ impl ScriptRuntime {
                     res.with_context(|| format!("failed to read script '{}'", name))?;
                     let prog_len = buf.len();
                     let (tx, rx) = oneshot::channel();
-                    CPU_TP.with(|tp| {
-                        tp.spawn(move || {
-                            let _ = tx.send(pl.load(&mut rand::thread_rng(), &buf));
-                        });
+                    CPU_TP.spawn(move || {
+                        let _ = tx.send(pl.load(&mut rand::thread_rng(), &buf));
                     });
                     let prog = rx.await.with_context(|| {
                         format!("script loader exited before loading '{}'", name)
