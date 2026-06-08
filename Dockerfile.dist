@@ -1,0 +1,20 @@
+# Runtime-only image built in CI from the prebuilt release binaries produced by
+# the `build` job (cargo-zigbuild, glibc 2.31). buildx selects the per-arch
+# binary via TARGETARCH; see the `docker` job in .github/workflows/ci.yml.
+#
+# For a from-source build (no prebuilt binaries), use ./Dockerfile instead.
+FROM debian:trixie-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
+# Staged by CI as dist/<arch>/zeroserve, where <arch> is amd64 or arm64.
+ARG TARGETARCH
+COPY dist/${TARGETARCH}/zeroserve /usr/local/bin/zeroserve
+
+WORKDIR /srv
+
+EXPOSE 8080 8443
+
+ENTRYPOINT ["/usr/local/bin/zeroserve"]
