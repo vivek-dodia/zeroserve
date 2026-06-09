@@ -439,7 +439,14 @@ fn setup_landlock(config: &StaticConfig) -> anyhow::Result<()> {
             ruleset = add_landlock_read_path(ruleset, path)?;
         }
         if let Some(path) = &config.ech_key_path {
-            ruleset = add_landlock_read_parent(ruleset, path)?;
+            // --ech-key may point at a directory of key files, which needs
+            // ReadDir on the directory itself, not just ReadFile beneath the
+            // parent.
+            if path.is_dir() {
+                ruleset = add_landlock_read_path(ruleset, path)?;
+            } else {
+                ruleset = add_landlock_read_parent(ruleset, path)?;
+            }
         }
         if let Some(path) = &config.reload_signal_file {
             ruleset = add_landlock_read_parent(ruleset, path)?;
