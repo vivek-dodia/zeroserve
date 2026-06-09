@@ -2666,10 +2666,16 @@ impl Generator {
                 }
             } else if let Some(routes) = obj.get("routes") {
                 let routes = route_vec_from_value(routes, "invalid handle_response routes")?;
-                let should_continue = continue_skip_key.is_some()
-                    && (routes.is_empty()
-                        || self.response_routes_mutate_request(&routes, &mut HashSet::new())?);
-                if continue_skip_key.is_some() && !should_continue {
+                // The upstream body streams through untouched, so a handle_response
+                // route is supported as long as it only adjusts the response
+                // (headers, copied response headers, status) or mutates the
+                // request (forward_auth style) — i.e. it does not try to replace
+                // the body. Routes that replace the body are rejected here; the
+                // rest continue the proxied response.
+                let replaces_body =
+                    !routes.is_empty() && self.response_routes_replace_body(&routes)?;
+                let should_continue = continue_skip_key.is_some() && !replaces_body;
+                if continue_skip_key.is_some() && replaces_body {
                     bail!(
                         "{label}.handle_response routes replace response bodies and are not supported by generated Caddy middleware"
                     );
@@ -2705,69 +2711,63 @@ impl Generator {
         self.emit_response_routes(&routes, label, None)
     }
 
-    fn response_routes_mutate_request(
+    /// Whether any handler in these handle_response routes would replace the
+    /// proxied response body (rather than just adjust headers/status or the
+    /// request). These are the handlers `emit_response_routes` itself rejects;
+    /// detecting them up front lets supported header-only/status hooks through
+    /// while still rejecting body-replacing routes.
+    fn response_routes_replace_body(&self, routes: &[Route]) -> Result<bool> {
+        self.response_routes_replace_body_inner(routes, &mut HashSet::new())
+    }
+
+    fn response_routes_replace_body_inner(
         &self,
         routes: &[Route],
         visited_invokes: &mut HashSet<String>,
     ) -> Result<bool> {
         for route in routes {
             for handler in &route.handlers {
-                if self.response_handler_mutates_request(handler, visited_invokes)? {
-                    return Ok(true);
+                match handler.handler.as_str() {
+                    "copy_response" | "static_response" | "error" | "file_server" => {
+                        return Ok(true);
+                    }
+                    "subroute" => {
+                        if let Some(routes) = handler.config.get("routes") {
+                            if !routes.is_null() {
+                                let routes: Vec<Route> = serde_json::from_value(routes.clone())
+                                    .context("invalid handle_response subroute")?;
+                                if self
+                                    .response_routes_replace_body_inner(&routes, visited_invokes)?
+                                {
+                                    return Ok(true);
+                                }
+                            }
+                        }
+                    }
+                    "invoke" => {
+                        let name = handler
+                            .config
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        if visited_invokes.insert(name.to_string()) {
+                            if let Some(route) = self.named_routes.get(name) {
+                                let replaces = self.response_routes_replace_body_inner(
+                                    std::slice::from_ref(route),
+                                    visited_invokes,
+                                )?;
+                                visited_invokes.remove(name);
+                                if replaces {
+                                    return Ok(true);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
         Ok(false)
-    }
-
-    fn response_handler_mutates_request(
-        &self,
-        handler: &Handler,
-        visited_invokes: &mut HashSet<String>,
-    ) -> Result<bool> {
-        match handler.handler.as_str() {
-            "headers" => {
-                validate_headers_handler(handler)?;
-                let Some(request) = handler.config.get("request") else {
-                    return Ok(false);
-                };
-                if request.is_null() {
-                    return Ok(false);
-                }
-                let normalized = normalize_header_ops(request, HeaderTarget::Request)?;
-                Ok(header_ops_are_nonempty(&normalized))
-            }
-            "subroute" => {
-                let Some(routes) = handler.config.get("routes") else {
-                    return Ok(false);
-                };
-                if routes.is_null() {
-                    return Ok(false);
-                }
-                let routes: Vec<Route> = serde_json::from_value(routes.clone())
-                    .context("invalid handle_response subroute")?;
-                self.response_routes_mutate_request(&routes, visited_invokes)
-            }
-            "invoke" => {
-                let name = handler
-                    .config
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                if !visited_invokes.insert(name.to_string()) {
-                    return Ok(false);
-                }
-                let route = self
-                    .named_routes
-                    .get(name)
-                    .ok_or_else(|| missing_named_route_error(name))?;
-                let mutates = self
-                    .response_routes_mutate_request(std::slice::from_ref(route), visited_invokes)?;
-                visited_invokes.remove(name);
-                Ok(mutates)
-            }
-            _ => Ok(false),
-        }
     }
 
     fn emit_response_routes(
@@ -5946,20 +5946,6 @@ fn normalize_header_ops(value: &Value, target: HeaderTarget) -> Result<Value> {
     Ok(Value::Object(normalized))
 }
 
-fn header_ops_are_nonempty(value: &Value) -> bool {
-    let Some(obj) = value.as_object() else {
-        return false;
-    };
-    for key in ["add", "set", "delete", "replace"] {
-        match obj.get(key) {
-            Some(Value::Object(map)) if !map.is_empty() => return true,
-            Some(Value::Array(values)) if !values.is_empty() => return true,
-            _ => {}
-        }
-    }
-    false
-}
-
 fn normalize_header_value_map(value: &Value, label: &str) -> Result<Value> {
     let headers = value
         .as_object()
@@ -7136,7 +7122,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_nonterminal_reverse_proxy_handle_response_routes() {
+    fn compiles_nonterminal_reverse_proxy_handle_response_routes() {
         let source = r#"{
           "apps": {"http": {"servers": {"srv0": {"routes": [{
             "handle": [{
@@ -7152,15 +7138,12 @@ mod tests {
           }]}}}}
         }"#;
 
-        let err = compile_caddy_json(source).unwrap_err().to_string();
-        assert!(
-            err.contains("reverse_proxy.handle_response routes replace response bodies"),
-            "{err}"
-        );
+        let c = compile_caddy_json(source).unwrap();
+        assert!(c.contains("zs_res_continue_request();"), "{c}");
     }
 
     #[test]
-    fn rejects_grouped_reverse_proxy_handle_response_routes() {
+    fn compiles_grouped_reverse_proxy_handle_response_routes() {
         let source = r#"{
           "apps": {"http": {"servers": {"srv0": {"routes": [{
             "handle": [{
@@ -7177,11 +7160,8 @@ mod tests {
           }]}}}}
         }"#;
 
-        let err = compile_caddy_json(source).unwrap_err().to_string();
-        assert!(
-            err.contains("reverse_proxy.handle_response routes replace response bodies"),
-            "{err}"
-        );
+        let c = compile_caddy_json(source).unwrap();
+        assert!(c.contains("zs_res_continue_request();"), "{c}");
     }
 
     #[test]
@@ -9071,7 +9051,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_reverse_proxy_handle_response_header_routes() {
+    fn compiles_reverse_proxy_handle_response_header_routes() {
+        // Header-only handle_response routes leave the upstream body untouched,
+        // so they are supported: emit the response hook and continue the proxied
+        // response.
         let source = r#"{
           "apps": {"http": {"servers": {"srv0": {"routes": [{
             "handle": [{
@@ -9086,11 +9069,9 @@ mod tests {
           }]}}}}
         }"#;
 
-        let err = compile_caddy_json(source).unwrap_err().to_string();
-        assert!(
-            err.contains("reverse_proxy.handle_response routes replace response bodies"),
-            "{err}"
-        );
+        let c = compile_caddy_json(source).unwrap();
+        assert!(c.contains("zs_caddy_copy_response_headers("), "{c}");
+        assert!(c.contains("zs_res_continue_request();"), "{c}");
     }
 
     #[test]
@@ -9142,7 +9123,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_copy_response_headers_null_lists_like_caddy_json() {
+    fn compiles_copy_response_headers_null_lists_like_caddy_json() {
+        // include/exclude both null means "copy all upstream headers"; the body
+        // is untouched, so this is supported.
         let source = r#"{
           "apps": {"http": {"servers": {"srv0": {"routes": [{
             "handle": [{
@@ -9155,11 +9138,9 @@ mod tests {
           }]}}}}
         }"#;
 
-        let err = compile_caddy_json(source).unwrap_err().to_string();
-        assert!(
-            err.contains("reverse_proxy.handle_response routes replace response bodies"),
-            "{err}"
-        );
+        let c = compile_caddy_json(source).unwrap();
+        assert!(c.contains("zs_caddy_copy_response_headers("), "{c}");
+        assert!(c.contains("zs_res_continue_request();"), "{c}");
     }
 
     #[test]
@@ -9180,11 +9161,8 @@ mod tests {
           }]}}}}
         }"#;
 
-        let err = compile_caddy_json(source).unwrap_err().to_string();
-        assert!(
-            err.contains("reverse_proxy.handle_response routes replace response bodies"),
-            "{err}"
-        );
+        let c = compile_caddy_json(source).unwrap();
+        assert!(c.contains("zs_res_continue_request();"), "{c}");
     }
 
     #[test]
@@ -9233,11 +9211,8 @@ mod tests {
           }}}}
         }"#;
 
-        let err = compile_caddy_json(source).unwrap_err().to_string();
-        assert!(
-            err.contains("reverse_proxy.handle_response routes replace response bodies"),
-            "{err}"
-        );
+        let c = compile_caddy_json(source).unwrap();
+        assert!(c.contains("zs_res_continue_request();"), "{c}");
     }
 
     #[test]
@@ -9307,7 +9282,7 @@ mod tests {
 
             let err = compile_caddy_json(&source).unwrap_err().to_string();
             assert!(
-                err.contains("reverse_proxy.handle_response routes replace response bodies"),
+                err.contains("must be an array of strings"),
                 "{field}: {err}"
             );
         }
@@ -9329,7 +9304,7 @@ mod tests {
 
         let err = compile_caddy_json(source).unwrap_err().to_string();
         assert!(
-            err.contains("reverse_proxy.handle_response routes replace response bodies"),
+            err.contains("copy_response_headers cannot define both include and exclude"),
             "{err}"
         );
     }
@@ -9591,7 +9566,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_static_reverse_proxy_handle_response_with_upstream_placeholders() {
+    fn compiles_reverse_proxy_handle_response_with_upstream_placeholders() {
         let source = r#"{
           "apps": {"http": {"servers": {"srv0": {"routes": [{
             "handle": [{
@@ -9608,11 +9583,9 @@ mod tests {
           }]}}}}
         }"#;
 
-        let err = compile_caddy_json(source).unwrap_err().to_string();
-        assert!(
-            err.contains("reverse_proxy.handle_response routes replace response bodies"),
-            "{err}"
-        );
+        let c = compile_caddy_json(source).unwrap();
+        assert!(c.contains("zs_caddy_response_headers("), "{c}");
+        assert!(c.contains("zs_res_continue_request();"), "{c}");
     }
 
     #[test]

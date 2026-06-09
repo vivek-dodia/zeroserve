@@ -19,8 +19,16 @@ jobs:
   # Unit tests (cargo) + end-to-end tests (Deno against the release binary).
   # ---------------------------------------------------------------------------
   test:
-    name: Unit + e2e tests
-    runs-on: ubuntu-latest
+    name: Unit + e2e tests (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
 
@@ -39,6 +47,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.arch }}
 
       - name: Check formatting
         run: cargo fmt --all --check

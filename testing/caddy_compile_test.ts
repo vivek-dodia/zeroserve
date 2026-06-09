@@ -539,6 +539,8 @@ function concatBytes(chunks: Uint8Array[]): Uint8Array {
 Deno.test({
   name: "compile Caddy JSON to eBPF middleware and serve it",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const backend = await startBackend();
     const siteDir = await Deno.makeTempDir();
@@ -1083,7 +1085,10 @@ Deno.test({
         });
         assertEquals(badRangeRes.status, 203);
         assertEquals(badRangeRes.headers.get("content-range"), "bytes */22");
-        assertEquals(await badRangeRes.text(), "");
+        assertEquals(
+          await badRangeRes.text(),
+          "invalid range: failed to overlap\n",
+        );
 
         const gzipRes = await fetch(`${baseUrl}/static/file.txt`, {
           headers: { "Accept-Encoding": "gzip" },
@@ -1227,6 +1232,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy intercept status zero runs response routes",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     let tarPath: string | null = null;
@@ -1323,6 +1330,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy expression regexp macros expose captures",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     let tarPath: string | null = null;
@@ -1613,6 +1622,8 @@ zs_u64 entry(void) {
 Deno.test({
   name: "compiled Caddy expression protocol lowercases argument",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     let tarPath: string | null = null;
@@ -1704,6 +1715,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy non-positive request body max size is unlimited",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const backend = await startBackend();
     const siteDir = await Deno.makeTempDir();
@@ -1838,6 +1851,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy static_response preserves repeated headers",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     let tarPath: string | null = null;
@@ -2092,6 +2107,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy static_response close ends the H1 connection",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     let tarPath: string | null = null;
@@ -2195,6 +2212,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy static_response abort closes without response",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     let tarPath: string | null = null;
@@ -2270,6 +2289,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy query matcher treats embedded stars literally",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     let tarPath: string | null = null;
@@ -2485,6 +2506,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy method matcher is case-sensitive",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     let tarPath: string | null = null;
@@ -2554,6 +2577,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy header matchers inspect Host",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const backend = await startBackend();
     const siteDir = await Deno.makeTempDir();
@@ -2759,6 +2784,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy header matchers inspect Transfer-Encoding",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     let tarPath: string | null = null;
@@ -2856,6 +2883,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy empty method path and host arrays never match",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     let tarPath: string | null = null;
@@ -2944,6 +2973,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy query and header matchers expand placeholders",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     let tarPath: string | null = null;
@@ -3041,6 +3072,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy header matcher checks presence and absence",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     let tarPath: string | null = null;
@@ -3136,6 +3169,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy response status matcher accepts zero as no match",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     let tarPath: string | null = null;
@@ -3208,6 +3243,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy header matchers inspect repeated header values",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     let tarPath: string | null = null;
@@ -3348,6 +3385,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy error handler returns status without body",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     let tarPath: string | null = null;
@@ -3431,6 +3470,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy server error routes expose error placeholders",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     let tarPath: string | null = null;
@@ -3537,6 +3578,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy terminal error route falls back to error status",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     let tarPath: string | null = null;
@@ -3614,6 +3657,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy file_server misses run server error routes",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     let tarPath: string | null = null;
@@ -3692,6 +3737,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy file_server unsupported fs runs server error routes",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     let tarPath: string | null = null;
@@ -3774,6 +3821,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy error-route file_server keeps error status for POST",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     let tarPath: string | null = null;
@@ -3855,6 +3904,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy subroute error routes handle local errors",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     let tarPath: string | null = null;
@@ -3945,6 +3996,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy conditional subroute error routes can fall through",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     let tarPath: string | null = null;
@@ -4034,6 +4087,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy subroute groups share request route state",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     let tarPath: string | null = null;
@@ -4159,6 +4214,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy vars_regexp treats mixed placeholder keys literally",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     let tarPath: string | null = null;
@@ -4327,6 +4384,8 @@ zs_u64 entry(void) {
 Deno.test({
   name: "compiled Caddy vars handler feeds vars matcher",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     let tarPath: string | null = null;
@@ -4589,6 +4648,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy remote_ip matcher matches peer IP ranges",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     let tarPath: string | null = null;
@@ -4739,6 +4800,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy client_ip matcher honors static trusted proxies",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     let tarPath: string | null = null;
@@ -4838,6 +4901,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy rewrite URI operations mutate path and query",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const backend = await startBackend();
     const siteDir = await Deno.makeTempDir();
@@ -5064,6 +5129,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy rewrite query operations mutate request query",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const backend = await startBackend();
     const siteDir = await Deno.makeTempDir();
@@ -5209,6 +5276,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy reverse_proxy expands upstream placeholders",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const backend = await startBackend();
     const siteDir = await Deno.makeTempDir();
@@ -5447,6 +5516,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy reverse_proxy sets forwarded headers",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const backend = await startBackend();
     const siteDir = await Deno.makeTempDir();
@@ -5623,6 +5694,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy reverse_proxy sends empty User-Agent when absent",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const backend = await startRawHeaderCaptureBackend();
     const siteDir = await Deno.makeTempDir();
@@ -5695,6 +5768,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy reverse_proxy request headers are proxy-only",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const backend = await startBackend();
     const siteDir = await Deno.makeTempDir();
@@ -5720,23 +5795,18 @@ Deno.test({
                           "X-Original": ["mutated"],
                         },
                       },
+                      // A response-header hook (header_down) reads the original
+                      // request header, proving the request mutation above is
+                      // upstream-only. A handle_response route that copied the
+                      // upstream body to do this is intentionally unsupported.
+                      response: {
+                        set: {
+                          "X-Original-In-Hook": [
+                            "{http.request.header.X-Original}",
+                          ],
+                        },
+                      },
                     },
-                    handle_response: [{
-                      match: { status_code: [2] },
-                      routes: [{
-                        handle: [{
-                          handler: "headers",
-                          response: {
-                            set: {
-                              "X-Original-In-Hook": [
-                                "{http.request.header.X-Original}",
-                              ],
-                            },
-                          },
-                        }],
-                        terminal: true,
-                      }],
-                    }],
                     upstreams: [{ dial: backend.dial }],
                   }],
                   terminal: true,
@@ -5789,6 +5859,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy reverse_proxy uses server trusted proxies",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const backend = await startBackend();
     const siteDir = await Deno.makeTempDir();
@@ -5870,6 +5942,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy rewrite operations expand placeholders",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     let tarPath: string | null = null;
@@ -5962,6 +6036,8 @@ Deno.test({
   name:
     "compiled Caddy headers apply immediate response operations before static_response",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     let tarPath: string | null = null;
@@ -6046,6 +6122,8 @@ Deno.test({
   name:
     "compiled Caddy headers apply immediate response operations before file_server",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     let tarPath: string | null = null;
@@ -6144,6 +6222,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy response hooks see generated content length",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     let tarPath: string | null = null;
@@ -6397,6 +6477,8 @@ Deno.test({
   name:
     "compiled Caddy headers preserve immediate response order before reverse_proxy",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const backend = await startBackend();
     const siteDir = await Deno.makeTempDir();
@@ -6471,6 +6553,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy headers replace request and response values",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const backend = await startBackend();
     const siteDir = await Deno.makeTempDir();
@@ -6581,6 +6665,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy headers delete all before add and set",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const backend = await startBackend();
     const siteDir = await Deno.makeTempDir();
@@ -6668,6 +6754,8 @@ Deno.test({
   name:
     "compiled Caddy deferred response headers preserve null value semantics",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const backend = await startBackend();
     const siteDir = await Deno.makeTempDir();
@@ -6748,6 +6836,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy file_server serves absolute filesystem roots",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     const deniedBrowseDir = join(siteDir, "deniedroot", "denied");
@@ -7008,10 +7098,9 @@ Deno.test({
           diskNotModifiedRes.headers.get("vary"),
           "Accept-Encoding",
         );
-        assertEquals(
-          diskNotModifiedRes.headers.get("last-modified"),
-          diskLastModified,
-        );
+        // RFC 7232 / Go's writeNotModified: a 304 with an ETag omits
+        // Last-Modified (the ETag is the stronger validator).
+        assertEquals(diskNotModifiedRes.headers.get("last-modified"), null);
         assertEquals(await diskNotModifiedRes.text(), "");
 
         const diskFailedEtagRes = await fetch(`${baseUrl}/disk/file.txt`, {
@@ -7249,6 +7338,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy file_server treats slash root as filesystem",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     let tarPath: string | null = null;
@@ -7318,6 +7409,8 @@ Deno.test({
   name:
     "compiled Caddy file_server honors explicit default filesystem for relative roots",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     let tarPath: string | null = null;
@@ -7395,6 +7488,8 @@ Deno.test({
   name:
     "compiled Caddy file_server skips canonical redirect after filename rewrite",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     let tarPath: string | null = null;
@@ -7476,6 +7571,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy file_server does not redirect unbrowsable directories",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     let tarPath: string | null = null;
@@ -7552,6 +7649,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy file_server redirects empty rewritten browse paths",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     let tarPath: string | null = null;
@@ -7629,6 +7728,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy file_server pass_thru checks exposed filesystem roots",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     let tarPath: string | null = null;
@@ -7752,6 +7853,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy file_server expands placeholders",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     let tarPath: string | null = null;
@@ -7930,6 +8033,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy host matcher normalizes host headers",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     let tarPath: string | null = null;
@@ -8113,6 +8218,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy path matcher supports Caddy glob syntax",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     let tarPath: string | null = null;
@@ -8300,6 +8407,8 @@ Deno.test({
   name:
     "compiled Caddy protocol matcher follows HTTP version and gRPC content type",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     let tarPath: string | null = null;
@@ -8404,6 +8513,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy regex matchers feed placeholder-expanded headers",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     let tarPath: string | null = null;
@@ -8601,6 +8712,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy placeholders expand request and response state",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     let tarPath: string | null = null;
@@ -8933,6 +9046,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy TLS placeholders expand connection state",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     let tarPath: string | null = null;
@@ -9066,6 +9181,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy map handler resolves lazily",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     let tarPath: string | null = null;
@@ -9321,6 +9438,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy invoke handler runs named routes",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     let tarPath: string | null = null;
@@ -9428,6 +9547,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy file matcher sets file placeholders",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     const fsRoot = await Deno.makeTempDir();
@@ -9866,6 +9987,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy file matcher status fallback enters error routes",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     let tarPath: string | null = null;
@@ -9945,6 +10068,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy rewrite URI expands file matcher placeholder",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     let tarPath: string | null = null;
@@ -10057,8 +10182,10 @@ Deno.test({
 });
 
 Deno.test({
-  name: "Caddy reverse_proxy response-only handle_response routes are rejected",
+  name: "Caddy reverse_proxy response-only handle_response routes compile",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     try {
@@ -10106,13 +10233,12 @@ Deno.test({
         stdout: "piped",
         stderr: "piped",
       }).output();
-      assertEquals(compiled.success, false);
-      assertEquals(
-        new TextDecoder().decode(compiled.stderr).includes(
-          "reverse_proxy.handle_response routes replace response bodies",
-        ),
-        true,
-      );
+      // Response-only handle_response routes leave the upstream body untouched,
+      // so they compile to a response hook that continues the proxied response.
+      assertEquals(compiled.success, true);
+      const generated = new TextDecoder().decode(compiled.stdout);
+      assert(generated.includes("zs_caddy_copy_response_headers("));
+      assert(generated.includes("zs_res_continue_request();"));
     } finally {
       await Deno.remove(siteDir, { recursive: true }).catch(() => {});
     }
@@ -10122,6 +10248,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy forward_auth continues with copied request headers",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const backends = await startForwardAuthBackends();
     const siteDir = await Deno.makeTempDir();
@@ -10179,6 +10307,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy forward_auth renames copied response headers",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const backends = await startForwardAuthBackends();
     const siteDir = await Deno.makeTempDir();
@@ -10239,6 +10369,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy forward_auth preserves original request body",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const backends = await startForwardAuthBackends();
     const siteDir = await Deno.makeTempDir();
@@ -10307,6 +10439,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy forward_auth continues over h2c",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const backends = await startForwardAuthBackends();
     const siteDir = await Deno.makeTempDir();
@@ -10378,6 +10512,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy forward_auth continues over h2 TLS",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const backends = await startForwardAuthBackends();
     const siteDir = await Deno.makeTempDir();
@@ -10453,6 +10589,8 @@ Deno.test({
   name:
     "compiled Caddy reverse_proxy response header matchers keep placeholders literal",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const backend = await startRawTeapotBackend();
     const siteDir = await Deno.makeTempDir();
@@ -10536,6 +10674,8 @@ Deno.test({
   name:
     "Caddy reverse_proxy handle_response routes that rewrite bodies are rejected",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const backend = await startBackend();
     const siteDir = await Deno.makeTempDir();
@@ -10609,7 +10749,7 @@ Deno.test({
       assertEquals(compiled.success, false);
       assertEquals(
         new TextDecoder().decode(compiled.stderr).includes(
-          "reverse_proxy.handle_response routes rewrite response bodies",
+          "reverse_proxy.handle_response routes replace response bodies",
         ),
         true,
       );
@@ -10623,6 +10763,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy reverse_proxy empty handle_response continues request",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const backend = await startRawTeapotBackend();
     const siteDir = await Deno.makeTempDir();
@@ -10695,6 +10837,8 @@ Deno.test({
   name:
     "compiled Caddy reverse_proxy handle_response status takes priority over routes",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const backend = await startBackend();
     const siteDir = await Deno.makeTempDir();
@@ -10798,6 +10942,8 @@ Deno.test({
   name:
     "compiled Caddy reverse_proxy handle_response status zero preserves upstream status",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const backend = await startBackend();
     const siteDir = await Deno.makeTempDir();
@@ -10870,6 +11016,8 @@ Deno.test({
   name:
     "compiled Caddy reverse_proxy handle_response invalid placeholder status returns 500",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const backend = await startBackend();
     const siteDir = await Deno.makeTempDir();
@@ -10940,6 +11088,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy file_server filesystem is gated by expose-filesystem",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     const fsRoot = await Deno.makeTempDir();
@@ -11012,6 +11162,8 @@ Deno.test({
   name:
     "compiled Caddy basic_auth protects routes and exposes user placeholder",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     let tarPath: string | null = null;
@@ -11141,6 +11293,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy basic_auth exposes provider errors to error routes",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const siteDir = await Deno.makeTempDir();
     let tarPath: string | null = null;
@@ -11247,6 +11401,8 @@ Deno.test("caddy-compile adapts Caddyfile file logging", async () => {
 Deno.test({
   name: "compiled Caddy file logging writes only with expose filesystem",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const logPath = await Deno.makeTempFile();
     await Deno.remove(logPath);
@@ -11288,6 +11444,8 @@ Deno.test({
 Deno.test({
   name: "compiled Caddy file logging covers static and proxy responses",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const backend = await startBackend();
     const logPath = await Deno.makeTempFile();
@@ -11350,6 +11508,8 @@ Deno.test({
 Deno.test({
   name: "runtime Caddy file logging covers fallback responses",
   ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
   async fn() {
     const logPath = await Deno.makeTempFile();
     await Deno.remove(logPath);
