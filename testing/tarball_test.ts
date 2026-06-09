@@ -3,14 +3,13 @@ import { join } from "@std/path";
 import {
   checkExited,
   delay,
-  getFreePort,
   getZeroservePath,
   hasBpfToolchain,
   packSite,
   raceWithTimeout,
-  stopProcess,
-  waitForServer,
+  spawnZeroserve,
   withZeroserve,
+  type ZeroserveProc,
 } from "./test_utils.ts";
 
 const canRunScripts = await hasBpfToolchain();
@@ -56,8 +55,7 @@ Deno.test({
     let pluginTarPath: string | null = null;
     let replacementPluginTarPath: string | null = null;
     let siteTarPath: string | null = null;
-    let child: Deno.ChildProcess | null = null;
-    let statusPromise: Promise<Deno.CommandStatus> | null = null;
+    let proc: ZeroserveProc | null = null;
     try {
       await writePluginSite(pluginDir, "v1");
       await writePluginSite(replacementPluginDir, "v2");
@@ -93,31 +91,21 @@ zs_u64 entry(void) {
       replacementPluginTarPath = await packSite(replacementPluginDir);
       siteTarPath = await packSite(siteDir);
 
-      const zeroservePath = await getZeroservePath();
-      const port = await getFreePort();
-      child = new Deno.Command(zeroservePath, {
-        args: [
-          "--addr",
-          `127.0.0.1:${port}`,
-          "--disable-request-logging",
-          "--plugin",
-          pluginTarPath,
-          siteTarPath,
-        ],
-        stdout: "null",
-        stderr: "inherit",
-      }).spawn();
-      statusPromise = child.status;
+      proc = await spawnZeroserve([
+        "--plugin",
+        pluginTarPath,
+        siteTarPath,
+      ]);
+      const port = proc.httpPort;
 
-      await waitForServer("127.0.0.1", port, statusPromise);
       await assertPluginVersion(port, "v1");
 
       await Deno.rename(replacementPluginTarPath, pluginTarPath);
       replacementPluginTarPath = null;
-      child.kill("SIGHUP");
+      proc.child.kill("SIGHUP");
 
       for (let i = 0; i < 30; i++) {
-        const exited = await checkExited(statusPromise);
+        const exited = await checkExited(proc.statusPromise);
         assert(
           exited === null,
           `zeroserve exited during plugin reload with code ${exited?.code}`,
@@ -130,8 +118,8 @@ zs_u64 entry(void) {
       }
       await assertPluginVersion(port, "v2");
     } finally {
-      if (child && statusPromise) {
-        await stopProcess(child, statusPromise);
+      if (proc) {
+        await proc.stop();
       }
       if (pluginTarPath) {
         await Deno.remove(pluginTarPath).catch(() => {});
@@ -192,37 +180,24 @@ Deno.test("e2e: failed script reload keeps serving the previous tarball", async 
   const replacementSiteDir = await Deno.makeTempDir();
   let tarPath: string | null = null;
   let replacementTarPath: string | null = null;
-  let child: Deno.ChildProcess | null = null;
-  let statusPromise: Promise<Deno.CommandStatus> | null = null;
+  let proc: ZeroserveProc | null = null;
   try {
     await writeSite(initialSiteDir, "before reload\n", false);
     await writeSite(replacementSiteDir, "after reload\n", true);
     tarPath = await packSite(initialSiteDir);
     replacementTarPath = await packSite(replacementSiteDir);
 
-    const zeroservePath = await getZeroservePath();
-    const port = await getFreePort();
-    child = new Deno.Command(zeroservePath, {
-      args: [
-        "--addr",
-        `127.0.0.1:${port}`,
-        "--disable-request-logging",
-        tarPath,
-      ],
-      stdout: "null",
-      stderr: "null",
-    }).spawn();
-    statusPromise = child.status;
+    proc = await spawnZeroserve([tarPath], { quiet: true });
+    const port = proc.httpPort;
 
-    await waitForServer("127.0.0.1", port, statusPromise);
     assertEquals(await fetchText(port), "before reload\n");
 
     await Deno.rename(replacementTarPath, tarPath);
     replacementTarPath = null;
-    child.kill("SIGHUP");
+    proc.child.kill("SIGHUP");
 
     for (let i = 0; i < 20; i++) {
-      const exited = await checkExited(statusPromise);
+      const exited = await checkExited(proc.statusPromise);
       assert(
         exited === null,
         `zeroserve exited during reload with code ${exited?.code}`,
@@ -231,8 +206,8 @@ Deno.test("e2e: failed script reload keeps serving the previous tarball", async 
       await delay(100);
     }
   } finally {
-    if (child && statusPromise) {
-      await stopProcess(child, statusPromise);
+    if (proc) {
+      await proc.stop();
     }
     if (tarPath) {
       await Deno.remove(tarPath).catch(() => {});

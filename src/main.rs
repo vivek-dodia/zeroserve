@@ -280,12 +280,22 @@ fn main() -> Result<()> {
     // The coordinator owns reload + rate-limit cleanup on its own thread.
     spawn_coordinator(shared.clone(), reload_txs, sighup_blocked)?;
 
+    // Report the kernel-resolved addresses so `--addr 127.0.0.1:0` callers
+    // (e.g. the e2e suite) can learn the actual port from this line.
+    let http_local = http_listeners[0]
+        .local_addr()
+        .with_context(|| "failed to resolve bound HTTP listener address")?;
     eprintln!(
         "listening on http://{} ({} worker thread(s))",
-        config.http_addr, threads
+        http_local, threads
     );
-    if let Some(addr) = &config.tls_addr {
-        eprintln!("listening on https://{}", addr);
+    if config.tls_addr.is_some() {
+        let tls_local = tls_listeners[0]
+            .as_ref()
+            .expect("tls_addr implies TLS listeners")
+            .local_addr()
+            .with_context(|| "failed to resolve bound TLS listener address")?;
+        eprintln!("listening on https://{}", tls_local);
     }
 
     let mut handles = Vec::with_capacity(threads);

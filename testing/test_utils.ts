@@ -21,32 +21,133 @@ export async function packSite(siteRoot: string): Promise<string> {
   return tarPath;
 }
 
+export interface ZeroserveProc {
+  child: Deno.ChildProcess;
+  statusPromise: Promise<Deno.CommandStatus>;
+  httpPort: number;
+  tlsPort: number | null;
+  stop: () => Promise<void>;
+}
+
+/**
+ * Spawn zeroserve bound to port 0 and learn the actual ports from its
+ * "listening on ..." stderr lines. Pre-picking a free port and probing it with
+ * a bare TCP connect is racy under `deno test --parallel`: another test's
+ * server can take the port in the spawn window (zeroserve then exits with
+ * EADDRINUSE, or silently shares the port via SO_REUSEPORT) and the probe
+ * cannot tell whose socket answered.
+ */
+export async function spawnZeroserve(
+  args: string[],
+  opts: { tls?: boolean; quiet?: boolean } = {},
+): Promise<ZeroserveProc> {
+  const zeroservePath = await getZeroservePath();
+  const child = new Deno.Command(zeroservePath, {
+    args: [
+      "--addr",
+      "127.0.0.1:0",
+      ...(opts.tls ? ["--tls-addr", "127.0.0.1:0"] : []),
+      "--disable-request-logging",
+      ...args,
+    ],
+    cwd: repoRoot,
+    stdin: "null",
+    stdout: "null",
+    stderr: "piped",
+  }).spawn();
+  const statusPromise = child.status;
+  try {
+    const { httpPort, tlsPort, pump } = await waitForListenPorts(child, opts);
+    return {
+      child,
+      statusPromise,
+      httpPort,
+      tlsPort,
+      stop: async () => {
+        await stopProcess(child, statusPromise);
+        await pump;
+      },
+    };
+  } catch (err) {
+    await stopProcess(child, statusPromise);
+    throw err;
+  }
+}
+
+async function waitForListenPorts(
+  child: Deno.ChildProcess,
+  opts: { tls?: boolean; quiet?: boolean },
+  timeoutMs = 10_000,
+): Promise<{ httpPort: number; tlsPort: number | null; pump: Promise<void> }> {
+  const reader = child.stderr.getReader();
+  const echo = async (chunk: Uint8Array) => {
+    if (opts.quiet) {
+      return;
+    }
+    let written = 0;
+    while (written < chunk.length) {
+      written += await Deno.stderr.write(chunk.subarray(written));
+    }
+  };
+  const stderrDecoder = new TextDecoder();
+  const deadline = Date.now() + timeoutMs;
+  let text = "";
+  try {
+    while (true) {
+      const httpMatch = text.match(/listening on http:\/\/[^\s]+:(\d+)/);
+      const tlsMatch = text.match(/listening on https:\/\/[^\s]+:(\d+)/);
+      if (httpMatch && (!opts.tls || tlsMatch)) {
+        // Keep draining stderr for the life of the process so the child never
+        // blocks on a full pipe; `stop` awaits this to avoid leaking ops.
+        const pump = (async () => {
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) {
+              break;
+            }
+            await echo(value);
+          }
+        })()
+          .catch(() => {})
+          .finally(() => reader.releaseLock());
+        return {
+          httpPort: Number(httpMatch[1]),
+          tlsPort: tlsMatch ? Number(tlsMatch[1]) : null,
+          pump,
+        };
+      }
+      const result = await raceWithTimeout(
+        reader.read(),
+        deadline - Date.now(),
+      );
+      if (result === null) {
+        throw new Error(
+          "timed out waiting for zeroserve to report its listen address",
+        );
+      }
+      if (result.done) {
+        const status = await child.status;
+        throw new Error(`zeroserve exited early with code ${status.code}`);
+      }
+      await echo(result.value);
+      text += stderrDecoder.decode(result.value, { stream: true });
+    }
+  } catch (err) {
+    await reader.cancel().catch(() => {});
+    throw err;
+  }
+}
+
 export async function withZeroserve(
   tarPath: string,
   fn: (baseUrl: string) => Promise<void>,
   extraArgs: string[] = [],
 ): Promise<void> {
-  const zeroservePath = await getZeroservePath();
-  const port = await getFreePort();
-  const child = new Deno.Command(zeroservePath, {
-    args: [
-      "--addr",
-      `127.0.0.1:${port}`,
-      "--disable-request-logging",
-      ...extraArgs,
-      tarPath,
-    ],
-    cwd: repoRoot,
-    stdin: "null",
-    stdout: "null",
-    stderr: "inherit",
-  }).spawn();
-  const statusPromise = child.status;
+  const proc = await spawnZeroserve([...extraArgs, tarPath]);
   try {
-    await waitForServer("127.0.0.1", port, statusPromise);
-    await fn(`http://127.0.0.1:${port}`);
+    await fn(`http://127.0.0.1:${proc.httpPort}`);
   } finally {
-    await stopProcess(child, statusPromise);
+    await proc.stop();
   }
 }
 
@@ -56,34 +157,17 @@ export async function withZeroserveTls(
   keyPath: string,
   fn: (httpUrl: string, httpsUrl: string) => Promise<void>,
 ): Promise<void> {
-  const zeroservePath = await getZeroservePath();
-  const httpPort = await getFreePort();
-  const httpsPort = await getFreePort();
-  const child = new Deno.Command(zeroservePath, {
-    args: [
-      "--addr",
-      `127.0.0.1:${httpPort}`,
-      "--tls-addr",
-      `127.0.0.1:${httpsPort}`,
-      "--cert",
-      certPath,
-      "--key",
-      keyPath,
-      "--disable-request-logging",
-      tarPath,
-    ],
-    cwd: repoRoot,
-    stdin: "null",
-    stdout: "null",
-    stderr: "inherit",
-  }).spawn();
-  const statusPromise = child.status;
+  const proc = await spawnZeroserve(
+    ["--cert", certPath, "--key", keyPath, tarPath],
+    { tls: true },
+  );
   try {
-    await waitForServer("127.0.0.1", httpPort, statusPromise);
-    await waitForServer("127.0.0.1", httpsPort, statusPromise);
-    await fn(`http://127.0.0.1:${httpPort}`, `https://127.0.0.1:${httpsPort}`);
+    await fn(
+      `http://127.0.0.1:${proc.httpPort}`,
+      `https://127.0.0.1:${proc.tlsPort}`,
+    );
   } finally {
-    await stopProcess(child, statusPromise);
+    await proc.stop();
   }
 }
 

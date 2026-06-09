@@ -1,6 +1,11 @@
 import { assertEquals } from "@std/assert";
 import { join } from "@std/path";
-import { packSite, withZeroserve, withZeroserveTls, getZeroservePath } from "./test_utils.ts";
+import {
+    packSite,
+    spawnZeroserve,
+    withZeroserve,
+    withZeroserveTls,
+} from "./test_utils.ts";
 import * as http2 from "node:http2";
 import { Buffer } from "node:buffer";
 
@@ -297,125 +302,17 @@ async function withZeroserveHostnames(
     hostnames: string[],
     fn: (baseUrl: string) => Promise<void>,
 ): Promise<void> {
-    const zeroservePath = await getZeroservePath();
-    const port = await getFreePort();
-    const child = new Deno.Command(zeroservePath, {
-        args: [
-            "--addr",
-            `127.0.0.1:${port}`,
-            "--disable-request-logging",
-            "--validate-hostnames",
-            hostnames.join(","),
-            tarPath,
-        ],
-        cwd: repoRoot,
-        stdin: "null",
-        stdout: "null",
-        stderr: "inherit",
-    }).spawn();
-    const statusPromise = child.status;
-    try {
-        await waitForServer("127.0.0.1", port, statusPromise);
-        await fn(`http://127.0.0.1:${port}`);
-    } finally {
-        await stopProcess(child, statusPromise);
-    }
-}
-
-async function getFreePort(): Promise<number> {
-    const listener = Deno.listen({ hostname: "127.0.0.1", port: 0 });
-    const port = (listener.addr as Deno.NetAddr).port;
-    listener.close();
-    return port;
-}
-
-async function waitForServer(
-    hostname: string,
-    port: number,
-    statusPromise: Promise<Deno.CommandStatus>,
-    timeoutMs = 10_000,
-): Promise<void> {
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-        const exited = await checkExited(statusPromise);
-        if (exited) {
-            throw new Error(
-                `zeroserve exited early with code ${exited.code}`,
-            );
-        }
-        try {
-            const conn = await Deno.connect({ hostname, port });
-            conn.close();
-            return;
-        } catch {
-            await delay(100);
-        }
-    }
-    throw new Error(`timed out waiting for zeroserve at ${hostname}:${port}`);
-}
-
-async function stopProcess(
-    child: Deno.ChildProcess,
-    statusPromise: Promise<Deno.CommandStatus>,
-): Promise<void> {
-    try {
-        child.kill("SIGTERM");
-    } catch {
-        return;
-    }
-
-    const status = await raceWithTimeout(statusPromise, 1000);
-    if (status) {
-        return;
-    }
-
-    try {
-        child.kill("SIGKILL");
-    } catch {
-        return;
-    }
-    await statusPromise;
-}
-
-async function checkExited(
-    statusPromise: Promise<Deno.CommandStatus>,
-): Promise<Deno.CommandStatus | null> {
-    const exited = await Promise.race([
-        statusPromise,
-        immediate(),
+    const proc = await spawnZeroserve([
+        "--validate-hostnames",
+        hostnames.join(","),
+        tarPath,
     ]);
-    return exited ?? null;
-}
-
-function delay(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function immediate(): Promise<null> {
-    return new Promise((resolve) => queueMicrotask(() => resolve(null)));
-}
-
-async function raceWithTimeout<T>(
-    promise: Promise<T>,
-    timeoutMs: number,
-): Promise<T | null> {
-    let timer: ReturnType<typeof setTimeout> | null = null;
     try {
-        return await Promise.race([
-            promise,
-            new Promise<null>((resolve) => {
-                timer = setTimeout(() => resolve(null), timeoutMs);
-            }),
-        ]);
+        await fn(`http://127.0.0.1:${proc.httpPort}`);
     } finally {
-        if (timer !== null) {
-            clearTimeout(timer);
-        }
+        await proc.stop();
     }
 }
-
-import { fromFileUrl } from "@std/path";
-const repoRoot = fromFileUrl(new URL("..", import.meta.url));
 
 Deno.test("e2e: HTTP/1 hostname validation allows matching hostname", async () => {
     const siteDir = await Deno.makeTempDir();
