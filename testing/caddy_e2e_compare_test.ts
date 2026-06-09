@@ -27,6 +27,11 @@ type Probe = {
   compareHeaders?: string[];
   compareBody?: boolean;
   normalizeBrowseJson?: boolean;
+  // Compare only the number of browse entries, not which ones. `file_limit`
+  // truncates "in directory order" (per Caddy), and Caddy reads from disk while
+  // zeroserve reads from the packed tarball, so the two backends legitimately
+  // pick different subsets; only the count is deterministic across them.
+  normalizeBrowseCount?: boolean;
 };
 
 type ObservedResponse = {
@@ -1436,7 +1441,7 @@ http://abcde:${caddyPort} {
           path: "/",
           headers: { Accept: "application/json" },
           compareHeaders: ["content-type"],
-          normalizeBrowseJson: true,
+          normalizeBrowseCount: true,
         },
       ],
     });
@@ -2814,6 +2819,10 @@ async function fetchObserved(
 }
 
 function normalizeBody(body: string, probe: Probe): string {
+  if (probe.normalizeBrowseCount) {
+    const listing = JSON.parse(body) as unknown[];
+    return `entries:${listing.length}`;
+  }
   if (!probe.normalizeBrowseJson) {
     return body;
   }
