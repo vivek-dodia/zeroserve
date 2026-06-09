@@ -51,8 +51,9 @@ pub fn build_caddy_tarball(config_path: &Path) -> Result<Vec<u8>> {
         json
     };
 
-    let (generated, warnings) = crate::caddy_compile::compile_caddy_json_collecting(&json_source)
-        .with_context(|| format!("failed to compile {}", config_path.display()))?;
+    let (generated, warnings) =
+        crate::caddy_compile::compile_caddy_json_collecting(&json_source)
+            .with_context(|| format!("failed to compile {}", config_path.display()))?;
     for warning in &warnings {
         eprintln!("warning: {warning}");
     }
@@ -186,7 +187,9 @@ fn build_tarball(object: &[u8]) -> Result<Vec<u8>> {
     builder
         .append(&header, object)
         .context("failed to append middleware object to tar")?;
-    builder.into_inner().context("failed to finalize tar stream")
+    builder
+        .into_inner()
+        .context("failed to finalize tar stream")
 }
 
 /// Load the site for this run: from the in-memory `--caddy` tarball when one is

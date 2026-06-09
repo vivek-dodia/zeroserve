@@ -19,7 +19,7 @@ type Probe = {
   path: string;
   method?: string;
   headers?: Record<string, string>;
-  body?: string | Uint8Array;
+  body?: BodyInit;
   redirect?: RequestRedirect;
   compareHeaders?: string[];
   compareBody?: boolean;
