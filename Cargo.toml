@@ -13,7 +13,8 @@ lalrpop = "0.23"
 lalrpop-util = "0.23"
 arc-swap = "1"
 chrono = "0.4"
-async-ebpf = "0.2.3"
+async-ebpf = "0.3.1"
+#async-ebpf = { path = "../async-ebpf" }
 base64ct = { version = "1", features = ["alloc"] }
 dashmap = "6"
 blake3 = "1"
