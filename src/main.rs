@@ -35,9 +35,6 @@ use crate::cli::ListenAddr;
 use anyhow::{Context, Result};
 use clap::Parser;
 use futures::channel::mpsc;
-use landlock::{
-    Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreated, RulesetCreatedAttr,
-};
 use monoio::{IoUringDriver, RuntimeBuilder};
 use nix::mount::MsFlags;
 use socket2::{Domain, Protocol, Socket, Type};
@@ -142,8 +139,8 @@ fn main() -> Result<()> {
         return Ok(());
     }
     // The `--caddy` flow builds the entire site in memory up front, while clang
-    // and a writable filesystem are still available (before namespace isolation
-    // and landlock). The generated middleware C and the tarball stay in memfds.
+    // and a writable filesystem are still available (before namespace isolation).
+    // The generated middleware C and the tarball stay in memfds.
     let caddy_tarball = match args.caddy.as_ref() {
         Some(path) => {
             eprintln!(
@@ -230,9 +227,6 @@ fn main() -> Result<()> {
             }
         );
     }
-
-    setup_landlock(&config).with_context(|| "failed to setup landlock")?;
-    eprintln!("enabled landlock");
 
     // Block SIGHUP early before spawning any threads
     let sighup_blocked = SighupBlocked::new();
@@ -415,74 +409,6 @@ fn load_plugin_sites(config: &StaticConfig) -> Result<Vec<Arc<Site>>> {
         sites.push(site);
     }
     Ok(sites)
-}
-
-fn setup_landlock(config: &StaticConfig) -> anyhow::Result<()> {
-    let abi = landlock::ABI::V2;
-    let access_all = AccessFs::from_all(abi);
-
-    let mut ruleset = Ruleset::default().handle_access(access_all)?.create()?;
-    if config.expose_filesystem {
-        ruleset = ruleset.add_rule(PathBeneath::new(PathFd::new("/")?, access_all))?;
-    } else {
-        ruleset = add_landlock_read_parent(ruleset, &config.tar_path)?;
-        for plugin_path in &config.plugin_paths {
-            ruleset = add_landlock_read_parent(ruleset, plugin_path)?;
-        }
-        if let Some(path) = &config.cert_path {
-            ruleset = add_landlock_read_parent(ruleset, path)?;
-        }
-        if let Some(path) = &config.key_path {
-            ruleset = add_landlock_read_parent(ruleset, path)?;
-        }
-        if let Some(path) = &config.cert_dir_path {
-            ruleset = add_landlock_read_path(ruleset, path)?;
-        }
-        if let Some(path) = &config.ech_key_path {
-            // --ech-key may point at a directory of key files, which needs
-            // ReadDir on the directory itself, not just ReadFile beneath the
-            // parent.
-            if path.is_dir() {
-                ruleset = add_landlock_read_path(ruleset, path)?;
-            } else {
-                ruleset = add_landlock_read_parent(ruleset, path)?;
-            }
-        }
-        if let Some(path) = &config.reload_signal_file {
-            ruleset = add_landlock_read_parent(ruleset, path)?;
-        }
-    }
-
-    ruleset.restrict_self()?;
-    Ok(())
-}
-
-fn add_landlock_read_path(
-    ruleset: RulesetCreated,
-    path: &std::path::Path,
-) -> anyhow::Result<RulesetCreated> {
-    let meta = std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
-    let access = if meta.is_dir() {
-        AccessFs::ReadFile | AccessFs::ReadDir
-    } else {
-        AccessFs::ReadFile.into()
-    };
-    ruleset
-        .add_rule(PathBeneath::new(PathFd::new(path)?, access))
-        .with_context(|| format!("allow landlock read access to {}", path.display()))
-}
-
-fn add_landlock_read_parent(
-    ruleset: RulesetCreated,
-    path: &std::path::Path,
-) -> anyhow::Result<RulesetCreated> {
-    let parent = path
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| std::path::Path::new("."));
-    ruleset
-        .add_rule(PathBeneath::new(PathFd::new(parent)?, AccessFs::ReadFile))
-        .with_context(|| format!("allow landlock read access to parent of {}", path.display()))
 }
 
 fn setup_ns_isolation(config: &StaticConfig) -> anyhow::Result<()> {

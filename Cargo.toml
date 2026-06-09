@@ -34,7 +34,6 @@ hmac = "0.12"
 http = "1"
 idna = "1"
 io-uring = "0.6"
-landlock = "0.4"
 libc = "0.2"
 mini-moka = { version = "0.10", default-features = false }
 nix = { version = "0.30", features = ["mount", "event", "fs"] }

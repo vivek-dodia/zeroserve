@@ -10,7 +10,7 @@ pub struct StaticConfig {
     pub tar_path: PathBuf,
     /// When set (the `--caddy` flow), the site is served from this in-memory
     /// tarball rather than read from `tar_path`. `tar_path` then points at the
-    /// source Caddyfile, only for diagnostics and landlock parent rules.
+    /// source Caddyfile for diagnostics.
     pub caddy_tarball: Option<Arc<Vec<u8>>>,
     pub plugin_paths: Vec<PathBuf>,
     pub cert_path: Option<PathBuf>,
@@ -86,8 +86,8 @@ impl TryFrom<Cli> for StaticConfig {
         };
 
         // In the `--caddy` flow there is no SITE_TAR; the source Caddyfile path
-        // stands in for `tar_path` (diagnostics + landlock parent rule). The
-        // in-memory tarball itself is attached by the caller via `caddy_tarball`.
+        // stands in for `tar_path` diagnostics. The in-memory tarball itself is
+        // attached by the caller via `caddy_tarball`.
         let tar_path = cli
             .tarball
             .or_else(|| cli.caddy.clone())
