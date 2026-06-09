@@ -6,8 +6,8 @@ use crate::{
     helpers::estimate_json_memory_usage,
     json::JsonRef,
     script::{
-        MAX_CALL_DEPTH, MonoioTimeslicer, SCRIPT_CALL_SECTION_PREFIX, ScriptExecutionContext,
-        default_timeslice, read_utf8, with_ectx,
+        MAX_CALL_DEPTH, MonoioTimeslicer, ResponseHook, SCRIPT_CALL_SECTION_PREFIX,
+        ScriptExecutionContext, default_timeslice, read_utf8, with_ectx,
     },
 };
 
@@ -70,14 +70,35 @@ pub fn h_call(
             ctx.request.clone(),
             ctx.body_source.clone(),
             ctx.metadata.clone(),
+            ctx.caddy_maps.clone(),
+            ctx.early_response_headers.clone(),
+            ctx.response_hooks.clone(),
+            ctx.response_context.clone(),
+            ctx.request_body_limit.clone(),
             ctx.site.clone(),
             ctx.call_depth,
             ctx.max_memory_footprint,
+            ctx.expose_filesystem,
         )))
     })?;
 
-    let Some((input, scripts, t, request, body_source, metadata, site, call_depth, max_mem)) =
-        prepared
+    let Some((
+        input,
+        scripts,
+        t,
+        request,
+        body_source,
+        metadata,
+        caddy_maps,
+        early_response_headers,
+        response_hooks,
+        response_context,
+        request_body_limit,
+        site,
+        call_depth,
+        max_mem,
+        expose_filesystem,
+    )) = prepared
     else {
         return Ok(-1i64 as u64);
     };
@@ -102,11 +123,17 @@ pub fn h_call(
                 request,
                 body_source,
                 metadata,
+                caddy_maps,
+                early_response_headers,
+                response_hooks,
+                response_context,
+                request_body_limit,
                 script_name.clone(),
                 site,
                 scripts.clone(),
                 t,
                 max_mem,
+                expose_filesystem,
                 call_depth + 1,
             );
             let timeslice = default_timeslice();
@@ -150,4 +177,55 @@ pub fn h_call(
     });
 
     Ok(0)
+}
+
+/// Register a response hook for the current request. The hook is implemented as
+/// another script's `zeroserve.call.<func>` entrypoint and receives a deep copy
+/// of the JSON input when response headers are being finalized.
+pub fn h_res_hook(
+    scope: &HelperScope,
+    script_ptr: u64,
+    script_len: u64,
+    func_ptr: u64,
+    func_len: u64,
+    json_handle: u64,
+) -> Result<u64, ()> {
+    let script = read_utf8(scope, script_ptr, script_len)?.to_string();
+    let func = read_utf8(scope, func_ptr, func_len)?.to_string();
+    if func.trim().is_empty() {
+        return Err(());
+    }
+
+    with_ectx(scope, |ctx| {
+        let script = if script.trim().is_empty() {
+            ctx.script_name.clone()
+        } else {
+            script.clone()
+        };
+        let input = ctx
+            .extobj::<JsonRef>(json_handle)?
+            .view(|v| v.clone())
+            .map_err(|_| ())?;
+        ctx.response_hooks.borrow_mut().push(ResponseHook {
+            script,
+            func,
+            input,
+        });
+        Ok(0)
+    })
+}
+
+/// Clear all response hooks registered for the current request.
+pub fn h_res_hooks_clear(
+    scope: &HelperScope,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    with_ectx(scope, |ctx| {
+        ctx.response_hooks.borrow_mut().clear();
+        Ok(0)
+    })
 }

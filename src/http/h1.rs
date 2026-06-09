@@ -63,11 +63,13 @@ pub struct RequestHead {
     pub uri: Uri,
     pub version: Version,
     pub headers: HeaderMap,
+    pub tls: bool,
 }
 
 #[derive(Clone, Debug)]
 pub struct ResponseHead {
     pub status: StatusCode,
+    pub status_text: String,
     pub version: Version,
     pub headers: HeaderMap,
 }
@@ -611,6 +613,7 @@ fn parse_request_head(raw: &[u8]) -> Result<RequestHead, HttpError> {
         uri,
         version,
         headers,
+        tls: false,
     })
 }
 
@@ -620,13 +623,13 @@ fn parse_response_head(raw: &[u8]) -> Result<ResponseHead, HttpError> {
     let status_line = lines
         .next()
         .ok_or(HttpError::InvalidResponse("missing status line"))?;
-    let mut parts = status_line.split_whitespace();
-    let version = parts
-        .next()
-        .ok_or(HttpError::InvalidResponse("missing version"))?;
-    let code = parts
-        .next()
+    let (version, status_text) = status_line
+        .split_once(' ')
         .ok_or(HttpError::InvalidResponse("missing status code"))?;
+    let status_text = status_text.trim_start();
+    let code = status_text
+        .split_once(' ')
+        .map_or(status_text, |(code, _)| code);
     let version = parse_version(version).ok_or(HttpError::InvalidResponse("invalid version"))?;
     let code: u16 = code
         .parse()
@@ -636,6 +639,7 @@ fn parse_response_head(raw: &[u8]) -> Result<ResponseHead, HttpError> {
     let headers = parse_headers(lines)?;
     Ok(ResponseHead {
         status,
+        status_text: status_text.to_string(),
         version,
         headers,
     })
@@ -727,6 +731,7 @@ mod tests {
             uri: "/proxy".parse().unwrap(),
             version: Version::HTTP_11,
             headers,
+            tls: false,
         };
 
         let encoded = String::from_utf8(encode_request_head(&head)).unwrap();

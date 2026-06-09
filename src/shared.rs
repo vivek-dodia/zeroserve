@@ -1,6 +1,7 @@
 use std::{
     cell::RefCell,
     io,
+    path::Path,
     rc::Rc,
     sync::{Arc, Weak},
 };
@@ -14,6 +15,7 @@ use monoio::{
 
 use crate::{
     config::StaticConfig,
+    logging::FileLogSender,
     site::{Site, TarEntry},
     tls::TlsRuntime,
 };
@@ -29,6 +31,7 @@ pub struct SharedState {
     /// each worker can recompile them on reload without re-reading the CLI.
     pub plugin_sites: ArcSwap<Vec<Arc<Site>>>,
     pub tls: ArcSwapOption<TlsRuntime>,
+    pub file_logger: FileLogSender,
 }
 
 impl SharedState {
@@ -37,12 +40,14 @@ impl SharedState {
         site: Arc<Site>,
         plugin_sites: Vec<Arc<Site>>,
         tls: Option<TlsRuntime>,
+        file_logger: FileLogSender,
     ) -> Self {
         Self {
             config,
             site: ArcSwap::new(site),
             plugin_sites: ArcSwap::new(Arc::new(plugin_sites)),
             tls: ArcSwapOption::from(tls.map(Arc::new)),
+            file_logger,
         }
     }
 
@@ -102,6 +107,77 @@ pub async fn stream_tar_entry(
     let file = get_tar_file(site)?;
     let mut remaining = entry.size;
     let mut offset = entry.offset;
+    let mut buffer = vec![0u8; chunk_size];
+    while remaining > 0 {
+        let read_len = remaining.min(chunk_size as u64) as usize;
+        let view = monoio::buf::SliceMut::new(buffer, 0, read_len);
+        let (res, view) = file.read_at(view, offset).await;
+        buffer = view.into_inner();
+        let n = res?;
+        if n == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+        }
+        let view = monoio::buf::Slice::new(buffer, 0, n);
+        let (res, view) = w.write_all(view).await;
+        buffer = view.into_inner();
+        res?;
+        remaining -= n as u64;
+        offset += n as u64;
+    }
+    Ok(())
+}
+
+pub async fn stream_tar_entry_range(
+    entry: Arc<TarEntry>,
+    site: &Arc<Site>,
+    start: u64,
+    len: u64,
+    chunk_size: usize,
+    w: &mut impl AsyncWriteRent,
+) -> std::io::Result<()> {
+    let file = get_tar_file(site)?;
+    let mut remaining = len;
+    let mut offset = entry.offset + start;
+    let mut buffer = vec![0u8; chunk_size];
+    while remaining > 0 {
+        let read_len = remaining.min(chunk_size as u64) as usize;
+        let view = monoio::buf::SliceMut::new(buffer, 0, read_len);
+        let (res, view) = file.read_at(view, offset).await;
+        buffer = view.into_inner();
+        let n = res?;
+        if n == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+        }
+        let view = monoio::buf::Slice::new(buffer, 0, n);
+        let (res, view) = w.write_all(view).await;
+        buffer = view.into_inner();
+        res?;
+        remaining -= n as u64;
+        offset += n as u64;
+    }
+    Ok(())
+}
+
+pub async fn read_fs_file(path: &Path) -> io::Result<Vec<u8>> {
+    let file = File::open(path).await?;
+    let metadata = file.metadata().await?;
+    let size =
+        usize::try_from(metadata.len()).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
+    let (res, buf) = file.read_exact_at(vec![0u8; size], 0).await;
+    res?;
+    Ok(buf)
+}
+
+pub async fn stream_fs_file(
+    path: &Path,
+    start: u64,
+    len: u64,
+    chunk_size: usize,
+    w: &mut impl AsyncWriteRent,
+) -> std::io::Result<()> {
+    let file = File::open(path).await?;
+    let mut remaining = len;
+    let mut offset = start;
     let mut buffer = vec![0u8; chunk_size];
     while remaining > 0 {
         let read_len = remaining.min(chunk_size as u64) as usize;

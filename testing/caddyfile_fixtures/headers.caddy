@@ -1,0 +1,9 @@
+example.com {
+	header {
+		X-Frame-Options DENY
+		+X-Custom one
+		-Server
+		?X-Default fallback
+	}
+	request_header X-Real-IP {remote_host}
+}

@@ -1,9 +1,15 @@
 use std::{
-    any::Any, cell::RefCell, collections::HashMap, pin::Pin, rc::Rc, sync::Arc, time::Duration,
+    any::Any,
+    cell::{Cell, RefCell},
+    collections::HashMap,
+    pin::Pin,
+    rc::Rc,
+    sync::Arc,
+    time::{Duration, Instant},
 };
 
 use ::http::{
-    Uri,
+    Method, Uri,
     header::{HeaderName, HeaderValue},
 };
 use anyhow::{Context, bail};
@@ -16,11 +22,17 @@ use async_ebpf::{
 };
 use futures::{FutureExt, channel::oneshot};
 use monoio::fs::File;
+use serde::Deserialize;
 use ulid::Ulid;
 use url::form_urlencoded;
 
 use crate::helpers;
-use crate::{json::JsonRef, logging::async_log, site::Site, thread_pool::CPU_TP};
+use crate::{
+    json::JsonRef,
+    logging::async_log,
+    site::{Site, normalize_request_path},
+    thread_pool::CPU_TP,
+};
 
 const SCRIPT_ENTRYPOINT: &str = "zeroserve.request";
 /// Prefix for the per-function code sections that expose a script to inter-script
@@ -50,12 +62,28 @@ enum BodySourceState {
 #[derive(Clone)]
 pub struct BodySource {
     inner: Rc<RefCell<BodySourceState>>,
+    max_size: Rc<Cell<usize>>,
 }
 
 impl BodySource {
-    pub fn new(reader: BodyReaderFuture) -> Self {
+    pub fn new(reader: BodyReaderFuture, max_size: Rc<Cell<usize>>) -> Self {
         Self {
             inner: Rc::new(RefCell::new(BodySourceState::Pending(reader))),
+            max_size,
+        }
+    }
+
+    pub(crate) fn empty() -> Self {
+        Self {
+            inner: Rc::new(RefCell::new(BodySourceState::Empty)),
+            max_size: Rc::new(Cell::new(0)),
+        }
+    }
+
+    pub fn set_max_size(&self, max_size: usize) {
+        let current = self.max_size.get();
+        if current == 0 || max_size < current {
+            self.max_size.set(max_size);
         }
     }
 
@@ -142,22 +170,151 @@ static SCRIPT_HELPERS: &[(&str, Helper)] = &[
     ("zs_json_respond", helpers::h_json_respond),
     ("zs_object_free", helpers::h_object_free),
     ("zs_call", helpers::h_call),
+    ("zs_res_hook", helpers::h_res_hook),
+    ("zs_res_hooks_clear", helpers::h_res_hooks_clear),
     ("zs_req_method", helpers::h_req_method),
+    ("zs_req_set_method", helpers::h_req_set_method),
+    ("zs_caddy_rewrite_method", helpers::h_caddy_rewrite_method),
     ("zs_req_path", helpers::h_req_path),
+    ("zs_req_normalized_path", helpers::h_req_normalized_path),
+    (
+        "zs_caddy_path_regexp_subject",
+        helpers::h_caddy_path_regexp_subject,
+    ),
     ("zs_req_uri", helpers::h_req_uri),
     ("zs_req_set_uri", helpers::h_req_set_uri),
     ("zs_req_query", helpers::h_req_query),
+    ("zs_caddy_rewrite_uri", helpers::h_caddy_rewrite_uri),
+    ("zs_req_rewrite_uri", helpers::h_req_rewrite_uri),
+    ("zs_req_rewrite_query", helpers::h_req_rewrite_query),
     ("zs_req_scheme", helpers::h_req_scheme),
+    ("zs_req_proto_major", helpers::h_req_proto_major),
+    ("zs_req_proto_minor", helpers::h_req_proto_minor),
     ("zs_req_peer", helpers::h_req_peer),
+    ("zs_req_is_tls", helpers::h_req_is_tls),
+    (
+        "zs_req_tls_handshake_complete",
+        helpers::h_req_tls_handshake_complete,
+    ),
+    ("zs_req_remote_ip_matches", helpers::h_req_remote_ip_matches),
+    (
+        "zs_caddy_remote_ip_matches",
+        helpers::h_caddy_remote_ip_matches,
+    ),
+    (
+        "zs_caddy_client_ip_matches",
+        helpers::h_caddy_client_ip_matches,
+    ),
+    (
+        "zs_caddy_reverse_proxy_forwarded",
+        helpers::h_caddy_reverse_proxy_forwarded,
+    ),
+    (
+        "zs_caddy_reverse_proxy_request_headers",
+        helpers::h_caddy_reverse_proxy_request_headers,
+    ),
+    ("zs_caddy_vars_set", helpers::h_caddy_vars_set),
+    ("zs_caddy_vars_match", helpers::h_caddy_vars_match),
+    (
+        "zs_caddy_vars_match_expanded_keys",
+        helpers::h_caddy_vars_match_expanded_keys,
+    ),
+    (
+        "zs_caddy_vars_regexp_match",
+        helpers::h_caddy_vars_regexp_match,
+    ),
+    (
+        "zs_caddy_vars_regexp_match_expanded_keys",
+        helpers::h_caddy_vars_regexp_match_expanded_keys,
+    ),
+    ("zs_caddy_map", helpers::h_caddy_map),
+    (
+        "zs_caddy_response_headers",
+        helpers::h_caddy_response_headers,
+    ),
+    ("zs_caddy_encode", helpers::h_caddy_encode),
+    ("zs_caddy_path_match", helpers::h_caddy_path_match),
+    ("zs_caddy_query_match", helpers::h_caddy_query_match),
+    ("zs_caddy_query_present", helpers::h_caddy_query_present),
+    ("zs_caddy_query_empty", helpers::h_caddy_query_empty),
+    ("zs_caddy_header_match", helpers::h_caddy_header_match),
+    (
+        "zs_caddy_header_match_expanded",
+        helpers::h_caddy_header_match_expanded,
+    ),
+    ("zs_caddy_header_present", helpers::h_caddy_header_present),
+    (
+        "zs_caddy_header_present_expanded",
+        helpers::h_caddy_header_present_expanded,
+    ),
+    (
+        "zs_caddy_header_regexp_match",
+        helpers::h_caddy_header_regexp_match,
+    ),
+    (
+        "zs_caddy_header_regexp_match_expanded",
+        helpers::h_caddy_header_regexp_match_expanded,
+    ),
+    (
+        "zs_caddy_req_header_first_prefix",
+        helpers::h_caddy_req_header_first_prefix,
+    ),
+    ("zs_caddy_regex_match", helpers::h_caddy_regex_match),
+    ("zs_caddy_expr_in", helpers::h_caddy_expr_in),
+    ("zs_caddy_expr_eq", helpers::h_caddy_expr_eq),
+    ("zs_caddy_file_match", helpers::h_caddy_file_match),
+    ("zs_caddy_expand", helpers::h_caddy_expand),
+    ("zs_caddy_expand_known", helpers::h_caddy_expand_known),
     ("zs_connection_info", helpers::h_connection_info),
     ("zs_req_header", helpers::h_req_header),
     ("zs_req_set_header", helpers::h_req_set_header),
+    ("zs_req_append_header", helpers::h_req_append_header),
+    ("zs_req_delete_header", helpers::h_req_delete_header),
+    ("zs_req_replace_header", helpers::h_req_replace_header),
     ("zs_req_query_param", helpers::h_req_query_param),
+    (
+        "zs_req_query_param_matches",
+        helpers::h_req_query_param_matches,
+    ),
+    ("zs_req_body_limit", helpers::h_req_body_limit),
     ("zs_req_body_json", helpers::h_req_body_json),
     ("zs_meta_get", helpers::h_meta_get),
     ("zs_meta_set", helpers::h_meta_set),
+    ("zs_res_replace_header", helpers::h_res_replace_header),
+    ("zs_res_status", helpers::h_res_status),
+    ("zs_res_set_status", helpers::h_res_set_status),
+    ("zs_res_header", helpers::h_res_header),
+    ("zs_res_continue_request", helpers::h_res_continue_request),
+    (
+        "zs_caddy_res_header_match",
+        helpers::h_caddy_res_header_match,
+    ),
+    (
+        "zs_caddy_res_header_present",
+        helpers::h_caddy_res_header_present,
+    ),
+    (
+        "zs_caddy_copy_response_headers",
+        helpers::h_caddy_copy_response_headers,
+    ),
+    ("zs_response_pending", helpers::h_response_pending),
+    ("zs_response_clear", helpers::h_response_clear),
+    ("zs_abort", helpers::h_abort),
     ("zs_respond", helpers::h_respond),
+    ("zs_caddy_respond", helpers::h_caddy_respond),
+    ("zs_caddy_respond_static", helpers::h_caddy_respond_static),
+    ("zs_caddy_set_error", helpers::h_caddy_set_error),
+    ("zs_caddy_basic_auth", helpers::h_caddy_basic_auth),
+    (
+        "zs_caddy_reverse_proxy_url",
+        helpers::h_caddy_reverse_proxy_url,
+    ),
+    (
+        "zs_caddy_reverse_proxy_rewrite",
+        helpers::h_caddy_reverse_proxy_rewrite,
+    ),
     ("zs_reverse_proxy", helpers::h_reverse_proxy),
+    ("zs_file_server", helpers::h_file_server),
     (
         "zs_aws_v4_authorization_header",
         helpers::h_aws_v4_authorization_header,
@@ -183,6 +340,8 @@ static HELPER_TABLES: &[&[(&str, Helper)]] = &[SCRIPT_HELPERS];
 pub struct ConnectionInfo {
     /// True when the request was received over TLS.
     pub tls: bool,
+    /// True when TLS is complete for this request. Plaintext requests are false.
+    pub tls_handshake_complete: bool,
     /// Negotiated ALPN protocol (e.g. "h2", "http/1.1"). `None` when ALPN
     /// was not used or the connection is plaintext.
     pub alpn: Option<String>,
@@ -199,6 +358,15 @@ pub struct ConnectionInfo {
     /// ClientHello). `Some(false)` covers both "client offered a stale/no
     /// config" and "client did not offer ECH".
     pub ech_accepted: Option<bool>,
+    /// TLS protocol version name in Caddy placeholder form (e.g. "tls1.3").
+    /// `None` for plaintext connections.
+    pub tls_version: Option<String>,
+    /// RFC-standard TLS cipher suite name selected for the connection.
+    /// `None` for plaintext connections or if BoringSSL has no active cipher.
+    pub tls_cipher_suite: Option<String>,
+    /// Whether this TLS connection resumed a previous session. `None` for
+    /// plaintext connections.
+    pub tls_resumed: Option<bool>,
     /// JA4 TLS client fingerprint computed from the ClientHello. `None` for
     /// plaintext connections or if the ClientHello could not be parsed.
     pub tls_client_ja4: Option<String>,
@@ -207,17 +375,81 @@ pub struct ConnectionInfo {
 #[derive(Clone, Debug)]
 pub struct ScriptRequest {
     pub request_id: Ulid,
+    pub start_time: Instant,
     pub method: String,
+    pub original_method: String,
     pub path: String,
+    pub original_path: String,
+    pub(crate) normalized_path: String,
     pub uri: String,
+    pub original_uri: String,
     pub query: String,
+    pub original_query: String,
     pub scheme: String,
+    pub proto_major: u8,
+    pub proto_minor: u8,
     pub peer: String,
+    pub local: String,
     pub headers: HashMap<String, String>,
+    pub(crate) header_values: HashMap<String, Vec<String>>,
+    pub(crate) transfer_encodings: Vec<String>,
     pub query_params: HashMap<String, String>,
+    pub(crate) query_param_values: HashMap<String, Vec<String>>,
+    pub(crate) caddy_query_params: HashMap<String, Vec<String>>,
+    pub(crate) caddy_query_valid: bool,
     pub connection: ConnectionInfo,
+    pub(crate) proxy_method: Option<String>,
+    pub(crate) proxy_uri: Option<String>,
+    pub(crate) proxy_headers: Option<::http::HeaderMap>,
     pub(crate) uri_changed: bool,
-    pub(crate) header_changes: HashMap<String, Option<String>>,
+    pub(crate) method_changed: bool,
+    pub(crate) header_changes: Vec<HeaderChange>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum HeaderChange {
+    Set(String, String),
+    Append(String, String),
+    Remove(String),
+    RemovePattern(String),
+    Clear,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ResponseHook {
+    pub script: String,
+    pub func: String,
+    pub input: serde_json::Value,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ResponseContext {
+    pub status: u16,
+    pub headers: ::http::HeaderMap,
+    pub original_headers: ::http::HeaderMap,
+    pub continue_request: bool,
+}
+
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+pub(crate) struct CaddyMapConfig {
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub destinations: Vec<String>,
+    #[serde(default)]
+    pub mappings: Vec<CaddyMapEntry>,
+    #[serde(default)]
+    pub defaults: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+pub(crate) struct CaddyMapEntry {
+    #[serde(default)]
+    pub input: String,
+    #[serde(default)]
+    pub input_regexp: String,
+    #[serde(default)]
+    pub outputs: Vec<serde_json::Value>,
 }
 
 impl ScriptRequest {
@@ -227,7 +459,57 @@ impl ScriptRequest {
     }
 
     pub fn query_param(&self, name: &str) -> Option<&str> {
-        self.query_params.get(name).map(String::as_str)
+        self.query_param_values
+            .get(name)
+            .and_then(|values| values.first())
+            .map(String::as_str)
+    }
+
+    pub fn query_param_matches(&self, name: &str, value: &str) -> bool {
+        self.query_param_values
+            .get(name)
+            .is_some_and(|values| value == "*" || values.iter().any(|candidate| candidate == value))
+    }
+
+    pub fn set_method(&mut self, method: &str) -> Result<(), ()> {
+        let method = method.trim();
+        if method.is_empty() {
+            return Err(());
+        }
+        let parsed = Method::from_bytes(method.as_bytes()).map_err(|_| ())?;
+        self.method = parsed.as_str().to_string();
+        self.method_changed = true;
+        Ok(())
+    }
+
+    pub fn set_proxy_method(&mut self, method: &str) -> Result<(), ()> {
+        let method = method.trim();
+        if method.is_empty() {
+            return Err(());
+        }
+        let parsed = Method::from_bytes(method.as_bytes()).map_err(|_| ())?;
+        self.proxy_method = Some(parsed.as_str().to_string());
+        Ok(())
+    }
+
+    pub fn set_proxy_uri(&mut self, uri: &str) -> Result<(), ()> {
+        let uri = uri.trim();
+        if uri.is_empty() {
+            return Err(());
+        }
+        let _: Uri = uri.parse().map_err(|_| ())?;
+        self.proxy_uri = Some(uri.to_string());
+        Ok(())
+    }
+
+    pub fn set_proxy_headers(&mut self, headers: ::http::HeaderMap) {
+        self.proxy_headers = Some(headers);
+    }
+
+    pub(crate) fn clear_proxy_overrides(&mut self) {
+        self.proxy_method = None;
+        self.proxy_uri = None;
+        self.proxy_headers = None;
     }
 
     pub fn set_uri(&mut self, uri: &str) -> Result<(), ()> {
@@ -235,13 +517,67 @@ impl ScriptRequest {
         if uri.is_empty() {
             return Err(());
         }
-        let parsed: Uri = uri.parse().map_err(|_| ())?;
-        let path = parsed.path().to_string();
-        let query = parsed.query().unwrap_or("").to_string();
-        self.uri = uri.to_string();
+        let (path, query) = if let Some(parts) = split_relative_request_target(uri) {
+            parts
+        } else {
+            match uri.parse::<Uri>() {
+                Ok(parsed) => {
+                    let mut path = parsed.path().to_string();
+                    if path.is_empty() && !uri.starts_with('?') {
+                        let end = uri.find(['?', '#']).unwrap_or(uri.len());
+                        path = uri[..end].to_string();
+                    }
+                    (path, parsed.query().unwrap_or("").to_string())
+                }
+                Err(_) => return Err(()),
+            }
+        };
+        self.uri = if query.is_empty() {
+            path.clone()
+        } else {
+            format!("{path}?{query}")
+        };
         self.path = path;
+        self.normalized_path = normalize_request_path(&self.path)
+            .map(|path| path.relative().to_string())
+            .unwrap_or_else(|| self.path.trim_start_matches('/').to_string());
         self.query = query.clone();
         self.query_params = parse_query_params(&query);
+        self.query_param_values = parse_query_param_values(&query);
+        let (caddy_query_params, caddy_query_valid) = parse_caddy_query_params(&query);
+        self.caddy_query_params = caddy_query_params;
+        self.caddy_query_valid = caddy_query_valid;
+        self.uri_changed = true;
+        Ok(())
+    }
+
+    pub fn set_query(&mut self, query: &str) -> Result<(), ()> {
+        self.uri = if query.is_empty() {
+            self.path.clone()
+        } else {
+            format!("{}?{}", self.path, query)
+        };
+        self.query = query.to_string();
+        self.query_params = parse_query_params(query);
+        self.query_param_values = parse_query_param_values(query);
+        let (caddy_query_params, caddy_query_valid) = parse_caddy_query_params(query);
+        self.caddy_query_params = caddy_query_params;
+        self.caddy_query_valid = caddy_query_valid;
+        self.uri_changed = true;
+        Ok(())
+    }
+
+    pub fn set_path(&mut self, path: &str) -> Result<(), ()> {
+        let uri = if self.query.is_empty() {
+            path.to_string()
+        } else {
+            format!("{}?{}", path, self.query)
+        };
+        self.uri = uri;
+        self.path = path.to_string();
+        self.normalized_path = normalize_request_path(&self.path)
+            .map(|path| path.relative().to_string())
+            .unwrap_or_else(|| self.path.trim_start_matches('/').to_string());
         self.uri_changed = true;
         Ok(())
     }
@@ -262,11 +598,186 @@ impl ScriptRequest {
                 }
                 let value = value.to_string();
                 self.headers.insert(name.clone(), value.clone());
-                self.header_changes.insert(name, Some(value));
+                self.header_values.insert(name.clone(), vec![value.clone()]);
+                self.header_changes.push(HeaderChange::Set(name, value));
             }
             None => {
                 self.headers.remove(&name);
-                self.header_changes.insert(name, None);
+                self.header_values.remove(&name);
+                self.header_changes.push(HeaderChange::Remove(name));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn append_header(&mut self, name: &str, value: &str) -> Result<(), ()> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(());
+        }
+        let name = name.to_ascii_lowercase();
+        if HeaderName::from_bytes(name.as_bytes()).is_err() || HeaderValue::from_str(value).is_err()
+        {
+            return Err(());
+        }
+        let value = value.to_string();
+        if name == "host" {
+            self.headers.insert(name.clone(), value.clone());
+            self.header_values
+                .entry(name.clone())
+                .or_default()
+                .push(value.clone());
+            self.header_changes.push(HeaderChange::Set(name, value));
+            return Ok(());
+        }
+        self.headers
+            .entry(name.clone())
+            .and_modify(|existing| {
+                existing.push(',');
+                existing.push_str(&value);
+            })
+            .or_insert_with(|| value.clone());
+        self.header_values
+            .entry(name.clone())
+            .or_default()
+            .push(value.clone());
+        self.header_changes.push(HeaderChange::Append(name, value));
+        Ok(())
+    }
+
+    pub fn delete_header_pattern(&mut self, pattern: &str) -> Result<(), ()> {
+        let pattern = pattern.trim().to_ascii_lowercase();
+        if pattern.is_empty() {
+            return Err(());
+        }
+        if pattern == "*" {
+            self.headers.clear();
+            self.header_values.clear();
+            self.header_changes.push(HeaderChange::Clear);
+            return Ok(());
+        }
+        self.headers
+            .retain(|name, _| !header_pattern_matches(name, &pattern));
+        self.header_values
+            .retain(|name, _| !header_pattern_matches(name, &pattern));
+        self.header_changes
+            .push(HeaderChange::RemovePattern(pattern));
+        Ok(())
+    }
+
+    pub fn replace_header(
+        &mut self,
+        name: &str,
+        search: &str,
+        replacement: &str,
+    ) -> Result<(), ()> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(());
+        }
+        let targets = if name == "*" {
+            self.headers.keys().cloned().collect::<Vec<_>>()
+        } else {
+            let name = name.to_ascii_lowercase();
+            if HeaderName::from_bytes(name.as_bytes()).is_err() {
+                return Err(());
+            }
+            self.headers
+                .keys()
+                .filter(|existing| existing.eq_ignore_ascii_case(&name))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for target in targets {
+            let values = self
+                .header_values
+                .get(&target)
+                .cloned()
+                .or_else(|| self.headers.get(&target).cloned().map(|value| vec![value]));
+            let Some(values) = values else {
+                continue;
+            };
+            let values = values
+                .into_iter()
+                .map(|value| value.replace(search, replacement))
+                .filter(|value| HeaderValue::from_str(value).is_ok())
+                .collect::<Vec<_>>();
+            if values.is_empty() {
+                continue;
+            }
+            if target == "host" {
+                let value = values.last().cloned().ok_or(())?;
+                self.headers.insert(target.clone(), value.clone());
+                self.header_values.insert(target.clone(), values);
+                self.header_changes.push(HeaderChange::Set(target, value));
+                continue;
+            }
+            self.headers.insert(target.clone(), values.join(","));
+            self.header_values.insert(target.clone(), values.clone());
+            self.header_changes
+                .push(HeaderChange::Remove(target.clone()));
+            for value in values {
+                self.header_changes
+                    .push(HeaderChange::Append(target.clone(), value));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn replace_header_regex(
+        &mut self,
+        name: &str,
+        search: &regex::Regex,
+        replacement: &str,
+    ) -> Result<(), ()> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(());
+        }
+        let targets = if name == "*" {
+            self.headers.keys().cloned().collect::<Vec<_>>()
+        } else {
+            let name = name.to_ascii_lowercase();
+            if HeaderName::from_bytes(name.as_bytes()).is_err() {
+                return Err(());
+            }
+            self.headers
+                .keys()
+                .filter(|existing| existing.eq_ignore_ascii_case(&name))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for target in targets {
+            let values = self
+                .header_values
+                .get(&target)
+                .cloned()
+                .or_else(|| self.headers.get(&target).cloned().map(|value| vec![value]));
+            let Some(values) = values else {
+                continue;
+            };
+            let values = values
+                .into_iter()
+                .map(|value| search.replace_all(&value, replacement).into_owned())
+                .filter(|value| HeaderValue::from_str(value).is_ok())
+                .collect::<Vec<_>>();
+            if values.is_empty() {
+                continue;
+            }
+            if target == "host" {
+                let value = values.last().cloned().ok_or(())?;
+                self.headers.insert(target.clone(), value.clone());
+                self.header_values.insert(target.clone(), values);
+                self.header_changes.push(HeaderChange::Set(target, value));
+                continue;
+            }
+            self.headers.insert(target.clone(), values.join(","));
+            self.header_values.insert(target.clone(), values.clone());
+            self.header_changes
+                .push(HeaderChange::Remove(target.clone()));
+            for value in values {
+                self.header_changes
+                    .push(HeaderChange::Append(target.clone(), value));
             }
         }
         Ok(())
@@ -276,48 +787,260 @@ impl ScriptRequest {
         self.uri_changed
     }
 
-    pub(crate) fn header_changes(&self) -> &HashMap<String, Option<String>> {
+    pub(crate) fn method_changed(&self) -> bool {
+        self.method_changed
+    }
+
+    pub(crate) fn proxy_method(&self) -> Option<&str> {
+        self.proxy_method.as_deref()
+    }
+
+    pub(crate) fn proxy_uri(&self) -> Option<&str> {
+        self.proxy_uri.as_deref()
+    }
+
+    pub(crate) fn proxy_headers(&self) -> Option<&::http::HeaderMap> {
+        self.proxy_headers.as_ref()
+    }
+
+    pub(crate) fn header_changes(&self) -> &[HeaderChange] {
         &self.header_changes
     }
 }
 
+pub(crate) fn split_relative_request_target(uri: &str) -> Option<(String, String)> {
+    if uri.starts_with('/') || uri.starts_with('?') || uri.contains("://") {
+        return None;
+    }
+    let without_fragment = uri.split_once('#').map_or(uri, |(before, _)| before);
+    let (path, query) = without_fragment
+        .split_once('?')
+        .map_or((without_fragment, ""), |(path, query)| (path, query));
+    if path.is_empty() {
+        return None;
+    }
+    Some((path.to_string(), query.to_string()))
+}
+
 fn parse_query_params(query: &str) -> HashMap<String, String> {
+    parse_query_param_values(query)
+        .into_iter()
+        .filter_map(|(key, mut values)| values.drain(..).next().map(|value| (key, value)))
+        .collect()
+}
+
+fn parse_query_param_values(query: &str) -> HashMap<String, Vec<String>> {
     let mut query_params = HashMap::new();
     if !query.is_empty() {
         for (key, value) in form_urlencoded::parse(query.as_bytes()) {
             query_params
                 .entry(key.into_owned())
-                .or_insert(value.into_owned());
+                .or_insert_with(Vec::new)
+                .push(value.into_owned());
         }
     }
     query_params
+}
+
+pub(crate) fn parse_caddy_query_params(query: &str) -> (HashMap<String, Vec<String>>, bool) {
+    let mut query_params = HashMap::new();
+    let mut valid = true;
+    if query.is_empty() {
+        return (query_params, valid);
+    }
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        if pair.contains(';') {
+            valid = false;
+            continue;
+        }
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let Some(key) = caddy_query_unescape(key) else {
+            valid = false;
+            continue;
+        };
+        let Some(value) = caddy_query_unescape(value) else {
+            valid = false;
+            continue;
+        };
+        query_params.entry(key).or_insert_with(Vec::new).push(value);
+    }
+    (query_params, valid)
+}
+
+fn caddy_query_unescape(value: &str) -> Option<String> {
+    let mut out = Vec::with_capacity(value.len());
+    let bytes = value.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' => {
+                if i + 2 >= bytes.len() {
+                    return None;
+                }
+                let high = hex_value(bytes[i + 1])?;
+                let low = hex_value(bytes[i + 2])?;
+                out.push((high << 4) | low);
+                i += 3;
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    Some(String::from_utf8_lossy(&out).into_owned())
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+pub(crate) fn header_pattern_matches(name: &str, pattern: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    let pattern = pattern.to_ascii_lowercase();
+    if pattern.starts_with('*') && pattern.ends_with('*') && pattern.len() >= 2 {
+        name.contains(&pattern[1..pattern.len() - 1])
+    } else if let Some(suffix) = pattern.strip_prefix('*') {
+        name.ends_with(suffix)
+    } else if let Some(prefix) = pattern.strip_suffix('*') {
+        name.starts_with(prefix)
+    } else {
+        name == pattern
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct ScriptResponse {
     pub status: u16,
     pub body: Vec<u8>,
+    pub content_type: Option<String>,
+    pub force_close: bool,
     /// Extra response headers set by a helper (e.g. `Location`, `Set-Cookie`).
     /// Emitted in order with `HeaderMap::append`, so repeated names (multiple
     /// `Set-Cookie`) are preserved.
     pub headers: Vec<(String, String)>,
 }
 
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+pub(crate) struct CaddyFileBrowse {
+    #[serde(default)]
+    pub template_file: String,
+    #[serde(default)]
+    pub reveal_symlinks: bool,
+    #[serde(default, rename = "sort")]
+    pub sort_options: Vec<String>,
+    #[serde(default)]
+    pub file_limit: i64,
+}
+
+fn deserialize_caddy_file_browse<'de, D>(
+    deserializer: D,
+) -> Result<Option<CaddyFileBrowse>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match value {
+        None | Some(serde_json::Value::Null) | Some(serde_json::Value::Bool(false)) => Ok(None),
+        Some(serde_json::Value::Bool(true)) => Ok(Some(CaddyFileBrowse::default())),
+        Some(value @ serde_json::Value::Object(_)) => serde_json::from_value(value)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+        Some(other) => Err(serde::de::Error::custom(format!(
+            "invalid file_server browse value: {other}"
+        ))),
+    }
+}
+
+fn deserialize_weak_string_option<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(value)) => Ok(Some(value)),
+        Some(serde_json::Value::Number(value)) => Ok(Some(value.to_string())),
+        Some(other) => serde_json::to_string(&other)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+    }
+}
+
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+pub(crate) struct CaddyFileServer {
+    #[serde(default)]
+    pub fs: String,
+    #[serde(default)]
+    pub root: String,
+    #[serde(default)]
+    pub hide: Vec<String>,
+    #[serde(default)]
+    pub index_names: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_caddy_file_browse")]
+    pub browse: Option<CaddyFileBrowse>,
+    #[serde(default)]
+    pub canonical_uris: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_weak_string_option")]
+    pub status_code: Option<String>,
+    #[serde(default)]
+    pub pass_thru: bool,
+    #[serde(default)]
+    pub etag_file_extensions: Vec<String>,
+    #[serde(default)]
+    pub precompressed: HashMap<String, serde_json::Value>,
+    #[serde(default)]
+    pub precompressed_order: Vec<String>,
+}
+
 #[derive(Debug)]
 pub struct ScriptOutcome {
     pub request: ScriptRequest,
+    pub request_shared: Rc<RefCell<ScriptRequest>>,
     pub metadata: HashMap<String, String>,
+    pub metadata_shared: Rc<RefCell<HashMap<String, String>>>,
+    pub caddy_maps_shared: Rc<RefCell<Vec<CaddyMapConfig>>>,
+    pub early_response_headers: ::http::HeaderMap,
+    pub response_hooks: Vec<ResponseHook>,
+    pub abort: bool,
     pub response: Option<ScriptResponse>,
+    pub request_body_limit: Option<usize>,
     pub reverse_proxy: Option<String>,
+    pub file_server: Option<CaddyFileServer>,
+    /// Streaming response compression requested by an `encode` handler, applied
+    /// by the response-writing path against the request's `Accept-Encoding`.
+    pub encode: Option<crate::helpers::compress::EncodeConfig>,
 }
 
 impl ScriptOutcome {
     pub(crate) fn from_request(request: ScriptRequest) -> Self {
+        let request_shared = Rc::new(RefCell::new(request.clone()));
         ScriptOutcome {
             request,
+            request_shared,
             metadata: HashMap::new(),
+            metadata_shared: Rc::new(RefCell::new(HashMap::new())),
+            caddy_maps_shared: Rc::new(RefCell::new(Vec::new())),
+            early_response_headers: ::http::HeaderMap::new(),
+            response_hooks: Vec::new(),
+            abort: false,
             response: None,
+            request_body_limit: None,
             reverse_proxy: None,
+            file_server: None,
+            encode: None,
         }
     }
 }
@@ -331,14 +1054,24 @@ pub struct ScriptExecutionContext {
     /// The per-request metadata map, shared by reference across a call chain so a
     /// callee's `zs_meta_set` is visible to the caller.
     pub metadata: Rc<RefCell<HashMap<String, String>>>,
+    pub caddy_maps: Rc<RefCell<Vec<CaddyMapConfig>>>,
+    pub early_response_headers: Rc<RefCell<::http::HeaderMap>>,
+    pub response_hooks: Rc<RefCell<Vec<ResponseHook>>>,
+    pub response_context: Option<Rc<RefCell<ResponseContext>>>,
+    pub abort: bool,
     pub response: Option<ScriptResponse>,
+    pub request_body_limit: Rc<Cell<Option<usize>>>,
     pub reverse_proxy: Option<String>,
+    pub file_server: Option<CaddyFileServer>,
+    /// Streaming response compression config recorded by `zs_caddy_encode`.
+    pub encode: Option<crate::helpers::compress::EncodeConfig>,
     pub script_name: String,
     pub log_buffer: Vec<u8>,
     pub external_objects: ObjectRegistry,
     pub error: String,
     pub memory_footprint_bytes: u64,
     pub max_memory_footprint: u64,
+    pub expose_filesystem: bool,
     pub site: Arc<Site>,
     /// All loaded scripts on this thread, shared so helpers (notably `zs_call`)
     /// can resolve and invoke another script by name.
@@ -360,11 +1093,17 @@ impl ScriptExecutionContext {
         request: Rc<RefCell<ScriptRequest>>,
         body_source: BodySource,
         metadata: Rc<RefCell<HashMap<String, String>>>,
+        caddy_maps: Rc<RefCell<Vec<CaddyMapConfig>>>,
+        early_response_headers: Rc<RefCell<::http::HeaderMap>>,
+        response_hooks: Rc<RefCell<Vec<ResponseHook>>>,
+        response_context: Option<Rc<RefCell<ResponseContext>>>,
+        request_body_limit: Rc<Cell<Option<usize>>>,
         script_name: String,
         site: Arc<Site>,
         scripts: Rc<Vec<(String, Program)>>,
         t: ThreadEnv,
         max_memory_footprint: u64,
+        expose_filesystem: bool,
         call_depth: usize,
     ) -> Self {
         let input_mem = helpers::estimate_json_memory_usage(&input) as u64;
@@ -379,14 +1118,23 @@ impl ScriptExecutionContext {
             request,
             body_source,
             metadata,
+            caddy_maps,
+            early_response_headers,
+            response_hooks,
+            response_context,
+            abort: false,
             response: None,
+            request_body_limit,
             reverse_proxy: None,
+            file_server: None,
+            encode: None,
             script_name,
             log_buffer: vec![],
             external_objects,
             error: String::new(),
             memory_footprint_bytes: input_mem,
             max_memory_footprint,
+            expose_filesystem,
             site,
             scripts,
             t,
@@ -426,6 +1174,14 @@ impl ScriptExecutionContext {
         self.memory_footprint_bytes += n;
         Ok(())
     }
+
+    pub(crate) fn abort_and_clear_outputs(&mut self) {
+        self.abort = true;
+        self.response = None;
+        self.reverse_proxy = None;
+        self.file_server = None;
+        self.encode = None;
+    }
 }
 
 pub struct ObjectRegistry {
@@ -447,12 +1203,14 @@ pub struct ScriptRuntime {
     t: ThreadEnv,
     scripts: RefCell<Rc<Vec<(String, Program)>>>,
     max_memory_footprint: u64,
+    expose_filesystem: bool,
 }
 
 #[derive(Clone, Debug)]
 pub struct ScriptRuntimeConfig {
     pub preempt_timer_interval: Duration,
     pub max_memory_footprint: u64,
+    pub expose_filesystem: bool,
 }
 
 impl ScriptRuntime {
@@ -464,6 +1222,7 @@ impl ScriptRuntime {
             t,
             scripts,
             max_memory_footprint: config.max_memory_footprint,
+            expose_filesystem: config.expose_filesystem,
         }
     }
 
@@ -567,10 +1326,195 @@ impl ScriptRuntime {
             &timeslice,
             &MonoioTimeslicer,
             self.max_memory_footprint,
+            self.expose_filesystem,
         )
         .await;
         Ok(outcome)
     }
+
+    pub(crate) async fn run_request_with_state(
+        &self,
+        site: Arc<Site>,
+        request: Rc<RefCell<ScriptRequest>>,
+        metadata: Rc<RefCell<HashMap<String, String>>>,
+        caddy_maps: Rc<RefCell<Vec<CaddyMapConfig>>>,
+        body_source: BodySource,
+    ) -> anyhow::Result<ScriptOutcome> {
+        let timeslice = default_timeslice();
+        let scripts = (*self.scripts.borrow()).clone();
+        let outcome = run_request_scripts_with_state(
+            self.t,
+            scripts,
+            site,
+            request,
+            metadata,
+            caddy_maps,
+            body_source,
+            &timeslice,
+            &MonoioTimeslicer,
+            self.max_memory_footprint,
+            self.expose_filesystem,
+        )
+        .await;
+        Ok(outcome)
+    }
+
+    pub(crate) async fn run_response_hooks(
+        &self,
+        site: Arc<Site>,
+        request: Rc<RefCell<ScriptRequest>>,
+        metadata: Rc<RefCell<HashMap<String, String>>>,
+        caddy_maps: Rc<RefCell<Vec<CaddyMapConfig>>>,
+        hooks: &[ResponseHook],
+        status: ::http::StatusCode,
+        headers: &mut ::http::HeaderMap,
+    ) -> ResponseHookOutcome {
+        let raw = self
+            .run_response_hooks_raw(
+                site,
+                request,
+                metadata,
+                caddy_maps,
+                hooks,
+                status.as_u16(),
+                headers,
+            )
+            .await;
+        ResponseHookOutcome {
+            status: ::http::StatusCode::from_u16(raw.status).unwrap_or(status),
+            continue_request: raw.continue_request,
+        }
+    }
+
+    pub(crate) async fn run_response_hooks_raw(
+        &self,
+        site: Arc<Site>,
+        request: Rc<RefCell<ScriptRequest>>,
+        metadata: Rc<RefCell<HashMap<String, String>>>,
+        caddy_maps: Rc<RefCell<Vec<CaddyMapConfig>>>,
+        hooks: &[ResponseHook],
+        status: u16,
+        headers: &mut ::http::HeaderMap,
+    ) -> RawResponseHookOutcome {
+        if hooks.is_empty() {
+            return RawResponseHookOutcome {
+                status,
+                continue_request: false,
+            };
+        }
+
+        let timeslice = default_timeslice();
+        let scripts = (*self.scripts.borrow()).clone();
+        let response_hooks: Rc<RefCell<Vec<ResponseHook>>> = Rc::new(RefCell::new(Vec::new()));
+        let response_context = Rc::new(RefCell::new(ResponseContext {
+            status,
+            headers: headers.clone(),
+            original_headers: headers.clone(),
+            continue_request: false,
+        }));
+        let preemption = PreemptionEnabled::new(self.t);
+
+        for hook in hooks {
+            let section = format!("{}{}", SCRIPT_CALL_SECTION_PREFIX, hook.func);
+            let Some((_, program)) = scripts.iter().find(|(name, _)| {
+                name == &hook.script || name.strip_suffix(".o") == Some(hook.script.as_str())
+            }) else {
+                async_log(
+                    format!(
+                        "[script_runtime] response hook '{}.{}' skipped: script not found\n",
+                        hook.script, hook.func
+                    )
+                    .into_bytes(),
+                )
+                .await;
+                continue;
+            };
+            if !program.has_section(&section) {
+                async_log(
+                    format!(
+                        "[script_runtime] response hook '{}.{}' skipped: function not found\n",
+                        hook.script, hook.func
+                    )
+                    .into_bytes(),
+                )
+                .await;
+                continue;
+            }
+
+            let mut ctx = ScriptExecutionContext::for_call(
+                hook.input.clone(),
+                request.clone(),
+                BodySource::empty(),
+                metadata.clone(),
+                caddy_maps.clone(),
+                Rc::new(RefCell::new(::http::HeaderMap::new())),
+                response_hooks.clone(),
+                Some(response_context.clone()),
+                Rc::new(Cell::new(None)),
+                hook.script.clone(),
+                site.clone(),
+                scripts.clone(),
+                self.t,
+                self.max_memory_footprint,
+                self.expose_filesystem,
+                0,
+            );
+            let mut resources: [&mut dyn Any; 1] = [&mut ctx];
+            let before_hook = response_context.borrow().clone();
+            if let Err(err) = program
+                .run(
+                    &timeslice,
+                    &MonoioTimeslicer,
+                    &section,
+                    &mut resources,
+                    &1u64.to_le_bytes(),
+                    &preemption,
+                )
+                .await
+            {
+                *response_context.borrow_mut() = before_hook;
+                async_log(
+                    format!(
+                        "[script_runtime] response hook '{}.{}' failed: {:?} ({})\n",
+                        hook.script,
+                        hook.func,
+                        err,
+                        if ctx.error.is_empty() {
+                            "no details"
+                        } else {
+                            ctx.error.as_str()
+                        }
+                    )
+                    .into_bytes(),
+                )
+                .await;
+            }
+        }
+
+        let response_context = response_context.borrow();
+        *headers = response_context.headers.clone();
+        let status = if (100..=999).contains(&response_context.status) {
+            response_context.status
+        } else {
+            status
+        };
+        RawResponseHookOutcome {
+            status,
+            continue_request: response_context.continue_request,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ResponseHookOutcome {
+    pub status: ::http::StatusCode,
+    pub continue_request: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RawResponseHookOutcome {
+    pub status: u16,
+    pub continue_request: bool,
 }
 
 /// The default timeslice budget shared by the top-level request entrypoint and
@@ -592,18 +1536,71 @@ async fn run_request_scripts(
     timeslice: &TimesliceConfig,
     timeslicer: &impl Timeslicer,
     max_memory_footprint: u64,
+    expose_filesystem: bool,
+) -> ScriptOutcome {
+    let request = Rc::new(RefCell::new(request));
+    let metadata: Rc<RefCell<HashMap<String, String>>> = Rc::new(RefCell::new(HashMap::new()));
+    let caddy_maps: Rc<RefCell<Vec<CaddyMapConfig>>> = Rc::new(RefCell::new(Vec::new()));
+    run_request_scripts_with_state(
+        t,
+        scripts,
+        site,
+        request,
+        metadata,
+        caddy_maps,
+        body_source,
+        timeslice,
+        timeslicer,
+        max_memory_footprint,
+        expose_filesystem,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_request_scripts_with_state(
+    t: ThreadEnv,
+    scripts: Rc<Vec<(String, Program)>>,
+    site: Arc<Site>,
+    request: Rc<RefCell<ScriptRequest>>,
+    metadata: Rc<RefCell<HashMap<String, String>>>,
+    caddy_maps: Rc<RefCell<Vec<CaddyMapConfig>>>,
+    body_source: BodySource,
+    timeslice: &TimesliceConfig,
+    timeslicer: &impl Timeslicer,
+    max_memory_footprint: u64,
+    expose_filesystem: bool,
 ) -> ScriptOutcome {
     if scripts.is_empty() {
-        return ScriptOutcome::from_request(request);
+        let request_value = request.borrow().clone();
+        let metadata_value = metadata.borrow().clone();
+        return ScriptOutcome {
+            request: request_value,
+            request_shared: request.clone(),
+            metadata: metadata_value,
+            metadata_shared: metadata.clone(),
+            caddy_maps_shared: caddy_maps.clone(),
+            early_response_headers: ::http::HeaderMap::new(),
+            response_hooks: Vec::new(),
+            abort: false,
+            response: None,
+            request_body_limit: None,
+            reverse_proxy: None,
+            file_server: None,
+            encode: None,
+        };
     }
 
     // The request and metadata are shared by reference for the whole request:
     // each script (and any `zs_call` callee it spawns) holds a clone of these
     // `Rc`s, so mutations are seen by every later script and propagate out.
-    let request = Rc::new(RefCell::new(request));
-    let metadata: Rc<RefCell<HashMap<String, String>>> = Rc::new(RefCell::new(HashMap::new()));
+    let early_response_headers: Rc<RefCell<::http::HeaderMap>> =
+        Rc::new(RefCell::new(::http::HeaderMap::new()));
+    let response_hooks: Rc<RefCell<Vec<ResponseHook>>> = Rc::new(RefCell::new(Vec::new()));
+    let request_body_limit: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
     let mut response: Option<ScriptResponse> = None;
     let mut reverse_proxy: Option<String> = None;
+    let mut encode: Option<crate::helpers::compress::EncodeConfig> = None;
     let preemption = PreemptionEnabled::new(t);
 
     for (name, program) in scripts.iter() {
@@ -615,8 +1612,16 @@ async fn run_request_scripts(
             request: request.clone(),
             body_source: body_source.clone(),
             metadata: metadata.clone(),
+            caddy_maps: caddy_maps.clone(),
+            early_response_headers: early_response_headers.clone(),
+            response_hooks: response_hooks.clone(),
+            response_context: None,
+            abort: false,
             response: None,
+            request_body_limit: request_body_limit.clone(),
             reverse_proxy: None,
+            file_server: None,
+            encode: None,
             script_name: name.clone(),
             log_buffer: vec![],
             external_objects: ObjectRegistry {
@@ -626,6 +1631,7 @@ async fn run_request_scripts(
             error: String::new(),
             memory_footprint_bytes: 0,
             max_memory_footprint,
+            expose_filesystem,
             site: site.clone(),
             scripts: scripts.clone(),
             t,
@@ -660,14 +1666,47 @@ async fn run_request_scripts(
             .await;
             return ScriptOutcome {
                 request: request.borrow().clone(),
+                request_shared: request.clone(),
                 metadata: metadata.borrow().clone(),
+                metadata_shared: metadata.clone(),
+                caddy_maps_shared: caddy_maps.clone(),
+                early_response_headers: early_response_headers.borrow().clone(),
+                response_hooks: response_hooks.borrow().clone(),
+                abort: false,
                 response: Some(ScriptResponse {
                     status: 500,
                     body: vec![],
+                    content_type: Some("text/plain; charset=utf-8".to_string()),
+                    force_close: false,
                     headers: Vec::new(),
                 }),
+                request_body_limit: request_body_limit.get(),
                 reverse_proxy: None,
+                file_server: None,
+                encode: None,
             };
+        }
+        if ctx.abort {
+            return ScriptOutcome {
+                request: request.borrow().clone(),
+                request_shared: request.clone(),
+                metadata: metadata.borrow().clone(),
+                metadata_shared: metadata.clone(),
+                caddy_maps_shared: caddy_maps.clone(),
+                early_response_headers: early_response_headers.borrow().clone(),
+                response_hooks: response_hooks.borrow().clone(),
+                abort: true,
+                response,
+                request_body_limit: request_body_limit.get(),
+                reverse_proxy,
+                file_server: None,
+                encode: None,
+            };
+        }
+        // An `encode` handler runs before the response producer in the same
+        // route entry; carry its config forward to whichever producer wins.
+        if let Some(ctx_encode) = ctx.encode.take() {
+            encode = Some(ctx_encode);
         }
         if let Some(script_response) = ctx.response {
             response = Some(script_response);
@@ -677,13 +1716,39 @@ async fn run_request_scripts(
             reverse_proxy = Some(proxy_url);
             break;
         }
+        if let Some(file_server) = ctx.file_server {
+            return ScriptOutcome {
+                request: request.borrow().clone(),
+                request_shared: request.clone(),
+                metadata: metadata.borrow().clone(),
+                metadata_shared: metadata.clone(),
+                caddy_maps_shared: caddy_maps.clone(),
+                early_response_headers: early_response_headers.borrow().clone(),
+                response_hooks: response_hooks.borrow().clone(),
+                abort: false,
+                response,
+                request_body_limit: request_body_limit.get(),
+                reverse_proxy,
+                file_server: Some(file_server),
+                encode,
+            };
+        }
     }
 
     ScriptOutcome {
         request: request.borrow().clone(),
+        request_shared: request.clone(),
         metadata: metadata.borrow().clone(),
+        metadata_shared: metadata.clone(),
+        caddy_maps_shared: caddy_maps.clone(),
+        early_response_headers: early_response_headers.borrow().clone(),
+        response_hooks: response_hooks.borrow().clone(),
+        abort: false,
         response,
+        request_body_limit: request_body_limit.get(),
         reverse_proxy,
+        file_server: None,
+        encode,
     }
 }
 
@@ -702,6 +1767,9 @@ pub fn read_utf8<'a>(
     ptr: u64,
     len: u64,
 ) -> Result<&'a str, ()> {
+    if len == 0 {
+        return Ok("");
+    }
     let data = scope.user_memory(ptr, len)?;
     std::str::from_utf8(&data).map_err(|_| ())
 }
@@ -741,5 +1809,131 @@ impl ProgramEventListener for EventListener {
             Ok(Some(async_log(msg.into_bytes()).boxed_local()))
         })
         .unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request_with_repeated_header(values: &[&str]) -> ScriptRequest {
+        let mut headers = HashMap::new();
+        headers.insert("x-test".to_string(), values.join(","));
+        let mut header_values = HashMap::new();
+        header_values.insert(
+            "x-test".to_string(),
+            values.iter().map(|value| value.to_string()).collect(),
+        );
+        ScriptRequest {
+            request_id: Ulid::new(),
+            start_time: Instant::now(),
+            method: "GET".to_string(),
+            original_method: "GET".to_string(),
+            path: "/".to_string(),
+            original_path: "/".to_string(),
+            normalized_path: String::new(),
+            uri: "/".to_string(),
+            original_uri: "/".to_string(),
+            query: String::new(),
+            original_query: String::new(),
+            scheme: "http".to_string(),
+            proto_major: 1,
+            proto_minor: 1,
+            peer: "127.0.0.1:12345".to_string(),
+            local: "127.0.0.1:80".to_string(),
+            headers,
+            header_values,
+            transfer_encodings: Vec::new(),
+            query_params: HashMap::new(),
+            query_param_values: HashMap::new(),
+            caddy_query_params: HashMap::new(),
+            caddy_query_valid: true,
+            connection: ConnectionInfo::default(),
+            proxy_method: None,
+            proxy_uri: None,
+            proxy_headers: None,
+            uri_changed: false,
+            method_changed: false,
+            header_changes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn replace_header_preserves_repeated_values() {
+        let mut request = request_with_repeated_header(&["raw-one", "raw-two"]);
+        request
+            .replace_header("X-Test", "raw", "cooked")
+            .expect("replace succeeds");
+
+        assert_eq!(
+            request.header_values.get("x-test").unwrap(),
+            &vec!["cooked-one".to_string(), "cooked-two".to_string()]
+        );
+        assert_eq!(
+            request.headers.get("x-test").map(String::as_str),
+            Some("cooked-one,cooked-two")
+        );
+        assert!(matches!(
+            &request.header_changes[0],
+            HeaderChange::Remove(name) if name == "x-test"
+        ));
+        assert!(matches!(
+            &request.header_changes[1],
+            HeaderChange::Append(name, value) if name == "x-test" && value == "cooked-one"
+        ));
+        assert!(matches!(
+            &request.header_changes[2],
+            HeaderChange::Append(name, value) if name == "x-test" && value == "cooked-two"
+        ));
+    }
+
+    #[test]
+    fn replace_header_regex_preserves_repeated_values() {
+        let mut request = request_with_repeated_header(&["raw-one", "raw-two"]);
+        let regex = regex::Regex::new("raw-(.*)").unwrap();
+        request
+            .replace_header_regex("X-Test", &regex, "cooked-$1")
+            .expect("replace succeeds");
+
+        assert_eq!(
+            request.header_values.get("x-test").unwrap(),
+            &vec!["cooked-one".to_string(), "cooked-two".to_string()]
+        );
+        assert!(matches!(
+            &request.header_changes[0],
+            HeaderChange::Remove(name) if name == "x-test"
+        ));
+        assert!(matches!(
+            &request.header_changes[1],
+            HeaderChange::Append(name, value) if name == "x-test" && value == "cooked-one"
+        ));
+        assert!(matches!(
+            &request.header_changes[2],
+            HeaderChange::Append(name, value) if name == "x-test" && value == "cooked-two"
+        ));
+    }
+
+    #[test]
+    fn set_uri_preserves_relative_path_request_targets() {
+        let mut request = request_with_repeated_header(&[]);
+
+        request.set_uri("leaf.txt").expect("relative URI works");
+        assert_eq!(request.uri, "leaf.txt");
+        assert_eq!(request.path, "leaf.txt");
+        assert_eq!(request.query, "");
+
+        request
+            .set_uri("nested/leaf.txt?x=1")
+            .expect("relative URI with query works");
+        assert_eq!(request.uri, "nested/leaf.txt?x=1");
+        assert_eq!(request.path, "nested/leaf.txt");
+        assert_eq!(request.query, "x=1");
+
+        request
+            .set_uri("nested/leaf.txt?x=1#frag")
+            .expect("relative URI with fragment works");
+        assert_eq!(request.uri, "nested/leaf.txt?x=1");
+        assert_eq!(request.path, "nested/leaf.txt");
+        assert_eq!(request.query, "x=1");
     }
 }

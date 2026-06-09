@@ -1,12 +1,13 @@
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::HashMap,
     io::ErrorKind,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs},
     os::fd::AsRawFd,
+    path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use ::http::{
@@ -39,10 +40,10 @@ use crate::{
     logging::async_log,
     pool::{self, PoolKey, PooledConnection},
     script::{
-        BodyReadError, BodySource, ConnectionInfo, ScriptOutcome, ScriptRequest, ScriptResponse,
-        ScriptRuntime,
+        BodyReadError, BodySource, ConnectionInfo, HeaderChange, ScriptOutcome, ScriptRequest,
+        ScriptResponse, ScriptRuntime, header_pattern_matches,
     },
-    shared::{SharedState, read_tar_entry, stream_tar_entry},
+    shared::{SharedState, read_tar_entry, stream_fs_file, stream_tar_entry},
     site::{NormalizedPath, guess_mime, normalize_request_path},
     thread_pool::DNS_TP,
 };
@@ -51,9 +52,19 @@ type HttpBody = h1::Body;
 
 const H2_PREFACE: &[u8; 24] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
+mod caddy;
+
+use caddy::ResponseHookState;
+
 use std::cell::RefCell as StdRefCell;
 
 type H1BodyState<R> = Rc<StdRefCell<Option<(h1::H1Connection<R>, h1::Body)>>>;
+
+#[derive(Clone, Copy)]
+struct H1SendOutcome {
+    keep_client: bool,
+    status: u16,
+}
 
 fn create_h1_body_source<R: AsyncReadRent + 'static>(
     reader: h1::H1Connection<R>,
@@ -63,33 +74,38 @@ fn create_h1_body_source<R: AsyncReadRent + 'static>(
     let state: H1BodyState<R> = Rc::new(StdRefCell::new(Some((reader, body))));
     let state_clone = state.clone();
 
-    let body_source = BodySource::new(Box::pin(async move {
-        let (mut reader, mut body) = state_clone
-            .borrow_mut()
-            .take()
-            .ok_or(BodyReadError::ReadError)?;
+    let max_size = Rc::new(Cell::new(max_buffered_body_size));
+    let max_size_for_reader = max_size.clone();
+    let body_source = BodySource::new(
+        Box::pin(async move {
+            let (mut reader, mut body) = state_clone
+                .borrow_mut()
+                .take()
+                .ok_or(BodyReadError::ReadError)?;
 
-        let mut buf = Vec::new();
-        loop {
-            match body.next_data(&mut reader).await {
-                Some(Ok(chunk)) => {
-                    if buf.len() + chunk.len() > max_buffered_body_size {
-                        *state_clone.borrow_mut() = Some((reader, body));
-                        return Err(BodyReadError::TooLarge);
+            let mut buf = Vec::new();
+            loop {
+                match body.next_data(&mut reader).await {
+                    Some(Ok(chunk)) => {
+                        if buf.len() + chunk.len() > max_size_for_reader.get() {
+                            *state_clone.borrow_mut() = Some((reader, body));
+                            return Err(BodyReadError::TooLarge);
+                        }
+                        buf.extend_from_slice(&chunk);
                     }
-                    buf.extend_from_slice(&chunk);
+                    Some(Err(_)) => {
+                        *state_clone.borrow_mut() = Some((reader, body));
+                        return Err(BodyReadError::ReadError);
+                    }
+                    None => break,
                 }
-                Some(Err(_)) => {
-                    *state_clone.borrow_mut() = Some((reader, body));
-                    return Err(BodyReadError::ReadError);
-                }
-                None => break,
             }
-        }
 
-        *state_clone.borrow_mut() = Some((reader, body));
-        Ok(buf)
-    }));
+            *state_clone.borrow_mut() = Some((reader, body));
+            Ok(buf)
+        }),
+        max_size,
+    );
 
     (body_source, state)
 }
@@ -103,28 +119,33 @@ fn create_h2_body_source(
     let state: H2BodyState = Rc::new(StdRefCell::new(Some(body)));
     let state_clone = state.clone();
 
-    let body_source = BodySource::new(Box::pin(async move {
-        let mut body = state_clone
-            .borrow_mut()
-            .take()
-            .ok_or(BodyReadError::ReadError)?;
+    let max_size = Rc::new(Cell::new(max_buffered_body_size));
+    let max_size_for_reader = max_size.clone();
+    let body_source = BodySource::new(
+        Box::pin(async move {
+            let mut body = state_clone
+                .borrow_mut()
+                .take()
+                .ok_or(BodyReadError::ReadError)?;
 
-        let mut buf = Vec::new();
-        while let Some(chunk) = body.data().await {
-            let chunk = chunk.map_err(|_| BodyReadError::ReadError)?;
-            if buf.len() + chunk.len() > max_buffered_body_size {
-                *state_clone.borrow_mut() = Some(body);
-                return Err(BodyReadError::TooLarge);
+            let mut buf = Vec::new();
+            while let Some(chunk) = body.data().await {
+                let chunk = chunk.map_err(|_| BodyReadError::ReadError)?;
+                if buf.len() + chunk.len() > max_size_for_reader.get() {
+                    *state_clone.borrow_mut() = Some(body);
+                    return Err(BodyReadError::TooLarge);
+                }
+                buf.extend_from_slice(&chunk);
+                body.flow_control()
+                    .release_capacity(chunk.len())
+                    .map_err(|_| BodyReadError::ReadError)?;
             }
-            buf.extend_from_slice(&chunk);
-            body.flow_control()
-                .release_capacity(chunk.len())
-                .map_err(|_| BodyReadError::ReadError)?;
-        }
 
-        // Body fully consumed, no need to restore
-        Ok(buf)
-    }));
+            // Body fully consumed, no need to restore
+            Ok(buf)
+        }),
+        max_size,
+    );
 
     (body_source, state)
 }
@@ -132,7 +153,21 @@ fn create_h2_body_source(
 enum StaticBody {
     Empty,
     Bytes(Vec<u8>),
-    File(Arc<crate::site::TarEntry>),
+    File {
+        entry: Arc<crate::site::TarEntry>,
+        range: Option<ByteRange>,
+    },
+    FsFile {
+        path: PathBuf,
+        size: u64,
+        range: Option<ByteRange>,
+    },
+}
+
+#[derive(Clone, Copy)]
+struct ByteRange {
+    start: u64,
+    len: u64,
 }
 
 struct StaticResponse {
@@ -171,6 +206,7 @@ async fn run_http_listener(
     http_listener: std::net::TcpListener,
 ) -> Result<()> {
     let listener = TcpListener::from_std(http_listener)?;
+    let local = listener.local_addr()?;
     loop {
         let (stream, addr) = listener.accept().await?;
         if stream.set_nodelay(true).is_err() {
@@ -195,7 +231,7 @@ async fn run_http_listener(
                 addr
             };
             if let Err(err) =
-                handle_http_connection(conn_hup, stream, peer, state, script_runtime).await
+                handle_http_connection(conn_hup, stream, peer, local, state, script_runtime).await
             {
                 async_log(
                     format!(
@@ -214,18 +250,20 @@ async fn handle_http_connection(
     mut hup: impl Future<Output = ()> + Unpin + 'static,
     stream: TcpStream,
     peer: std::net::SocketAddr,
+    local: std::net::SocketAddr,
     shared: Arc<SharedState>,
     script_runtime: Rc<ScriptRuntime>,
 ) -> Result<()> {
     let conn = ConnectionInfo::default();
     if is_h2c_preface(&stream).await? {
-        return handle_h2c_connection(hup, stream, peer, shared, script_runtime, conn).await;
+        return handle_h2c_connection(hup, stream, peer, local, shared, script_runtime, conn).await;
     }
 
     handle_h1_connection(
         &mut hup,
         stream,
         peer,
+        local,
         shared,
         Scheme::Http,
         script_runtime,
@@ -241,6 +279,7 @@ async fn run_tls_listener(
     tls_listener: std::net::TcpListener,
 ) -> Result<()> {
     let listener = TcpListener::from_std(tls_listener)?;
+    let local = listener.local_addr()?;
     loop {
         let (stream, peer) = listener.accept().await?;
         if stream.set_nodelay(true).is_err() {
@@ -315,20 +354,15 @@ async fn run_tls_listener(
                     } else {
                         None
                     };
-                    let conn = ConnectionInfo {
-                        tls: true,
-                        alpn,
-                        inner_sni: tls_stream.server_name(),
-                        outer_sni,
-                        ech_accepted,
-                        tls_client_ja4: tls_stream.ja4_fingerprint(),
-                    };
+                    let conn =
+                        caddy::tls_connection_info(&tls_stream, alpn, outer_sni, ech_accepted);
                     if is_h2 {
                         let io = StreamWrapper::new(tls_stream);
                         if let Err(err) = handle_h2_connection(
                             conn_hup,
                             io,
                             reported_peer,
+                            local,
                             state,
                             script_runtime,
                             Scheme::Https,
@@ -349,6 +383,7 @@ async fn run_tls_listener(
                         &mut conn_hup,
                         tls_stream,
                         reported_peer,
+                        local,
                         state,
                         Scheme::Https,
                         script_runtime,
@@ -498,6 +533,7 @@ async fn handle_h1_connection<IO, H>(
     hup: &mut H,
     io: IO,
     peer: std::net::SocketAddr,
+    local: std::net::SocketAddr,
     shared: Arc<SharedState>,
     scheme: Scheme,
     script_runtime: Rc<ScriptRuntime>,
@@ -536,6 +572,7 @@ where
             &shared,
             &script_runtime,
             peer,
+            local,
             scheme,
             &mut w,
             hup,
@@ -554,6 +591,7 @@ async fn handle_h2c_connection(
     hup: impl Future<Output = ()> + Unpin + 'static,
     stream: TcpStream,
     peer: std::net::SocketAddr,
+    local: std::net::SocketAddr,
     shared: Arc<SharedState>,
     script_runtime: Rc<ScriptRuntime>,
     connection: ConnectionInfo,
@@ -565,6 +603,7 @@ async fn handle_h2c_connection(
         hup,
         io,
         peer,
+        local,
         shared,
         script_runtime,
         Scheme::Http,
@@ -577,6 +616,7 @@ async fn handle_h2_connection<IO>(
     hup: impl Future<Output = ()> + Unpin + 'static,
     io: IO,
     peer: std::net::SocketAddr,
+    local: std::net::SocketAddr,
     shared: Arc<SharedState>,
     script_runtime: Rc<ScriptRuntime>,
     scheme: Scheme,
@@ -624,6 +664,7 @@ where
                 state,
                 script_runtime,
                 peer,
+                local,
                 scheme,
                 hup,
                 conn_for_request,
@@ -646,6 +687,7 @@ async fn handle_request<R: AsyncReadRent + 'static>(
     shared: &Arc<SharedState>,
     script_runtime: &Rc<ScriptRuntime>,
     peer: std::net::SocketAddr,
+    local: std::net::SocketAddr,
     scheme: Scheme,
     w: &mut impl AsyncWriteRent,
     interrupt: &mut (impl Future<Output = ()> + Unpin),
@@ -653,10 +695,16 @@ async fn handle_request<R: AsyncReadRent + 'static>(
 ) -> (bool, h1::H1Connection<R>) {
     let request_id = Ulid::new();
     let (mut head, body) = req.into_parts();
+    head.tls = matches!(scheme, Scheme::Https);
     if !shared.config.disable_request_logging {
         log_request(request_id, peer, scheme, &head.method, &head.uri).await;
     }
     let head_only = head.method == Method::HEAD;
+    let transfer_encodings = if body.is_chunked() {
+        vec!["chunked".to_string()]
+    } else {
+        Vec::new()
+    };
 
     let (body_source, body_state) =
         create_h1_body_source(reader, body, shared.config.max_buffered_body_size);
@@ -664,7 +712,7 @@ async fn handle_request<R: AsyncReadRent + 'static>(
     if request_authority_sni_mismatch(&head, connection) {
         let (mut reader, mut body) = body_state.borrow_mut().take().unwrap();
         drain_payload(&mut reader, &mut body).await;
-        send_fixed(w, misdirected_request(), &HashMap::new()).await;
+        send_fixed(w, misdirected_request(), None, &HashMap::new(), None).await;
         return (true, reader);
     }
 
@@ -678,7 +726,7 @@ async fn handle_request<R: AsyncReadRent + 'static>(
         if !is_valid_hostname(host, &shared.config.validate_hostnames) {
             let (mut reader, mut body) = body_state.borrow_mut().take().unwrap();
             drain_payload(&mut reader, &mut body).await;
-            send_fixed(w, misdirected_request(), &HashMap::new()).await;
+            send_fixed(w, misdirected_request(), None, &HashMap::new(), None).await;
             return (true, reader);
         }
     }
@@ -688,7 +736,7 @@ async fn handle_request<R: AsyncReadRent + 'static>(
         // Invalid path (e.g., path traversal escape attempt)
         let (mut reader, mut body) = body_state.borrow_mut().take().unwrap();
         drain_payload(&mut reader, &mut body).await;
-        send_fixed(w, bad_request(), &HashMap::new()).await;
+        send_fixed(w, bad_request(), None, &HashMap::new(), None).await;
         return (true, reader);
     };
 
@@ -696,13 +744,15 @@ async fn handle_request<R: AsyncReadRent + 'static>(
         request_id,
         &head,
         peer,
+        local,
         scheme,
         &normalized_path,
+        transfer_encodings,
         connection.clone(),
     );
     let script_request_fallback = script_request.clone();
     let script_outcome = monoio::select! {
-        x = script_runtime.run_request(shared.site.load_full(), script_request, body_source) => x,
+        x = script_runtime.run_request(shared.site.load_full(), script_request, body_source.clone()) => x,
         _ = &mut *interrupt => {
           async_log(format!("[handle] {}: interrupted\n", request_id).into_bytes()).await;
           let (reader, _) = body_state.borrow_mut().take().unwrap();
@@ -731,38 +781,288 @@ async fn handle_request<R: AsyncReadRent + 'static>(
 
     // Recalculate normalized path if the URI was changed by script
     let normalized_path = if script_outcome.request.uri_changed() {
-        match normalize_request_path(head.uri.path()) {
+        match normalized_script_request_path(&script_outcome.request) {
             Some(path) => path,
             None => {
                 // Invalid path after script modification
                 let (mut reader, mut body) = body_state.borrow_mut().take().unwrap();
                 drain_payload(&mut reader, &mut body).await;
-                send_fixed(w, bad_request(), &HashMap::new()).await;
+                send_fixed(w, bad_request(), None, &HashMap::new(), None).await;
                 return (true, reader);
             }
         }
     } else {
         normalized_path
     };
+    let hook_state = ResponseHookState::from_outcome(script_runtime, shared, &script_outcome);
+    let encode_state = script_outcome.encode.clone().map(|config| {
+        crate::helpers::compress::EncodeState::from_request_headers(config, &head.headers)
+    });
 
     // Take reader and body back from shared state
     let (mut reader, mut body) = body_state.borrow_mut().take().unwrap();
 
-    if let Some(proxy_url) = script_outcome.reverse_proxy {
+    if script_outcome.abort {
+        return (false, reader);
+    }
+
+    if let Some(proxy_url) = script_outcome.reverse_proxy.as_deref() {
         let res = monoio::select! {
             x = reverse_proxy_request(
-                &proxy_url,
-                head,
+                proxy_url,
+                head.clone(),
                 body,
                 &mut reader,
                 w,
                 head_only,
+                peer,
+                scheme,
+                Some(&script_outcome.early_response_headers),
                 &script_outcome.metadata,
+                Some(&hook_state),
+                script_outcome.request.proxy_method(),
+                script_outcome.request.proxy_uri(),
+                script_outcome.request.proxy_headers(),
+                script_outcome.request_body_limit,
+                encode_state.as_ref(),
             ) => x,
             _ = &mut *interrupt => Err(anyhow::anyhow!("interrupted")),
         };
         match res {
-            Ok(continue_conn) => return (continue_conn, reader),
+            Ok(proxy_outcome) => {
+                if proxy_outcome.continue_request {
+                    let (continued, mut reader, mut body) = caddy::continue_h1_request(
+                        request_id,
+                        script_runtime,
+                        shared,
+                        &hook_state,
+                        &script_outcome,
+                        &body_state,
+                        &body_source,
+                        reader,
+                        proxy_outcome.preserved_body,
+                    )
+                    .await;
+                    if let Err(err) = apply_script_request(&mut head, &continued.request) {
+                        async_log(
+                            format!(
+                                "[handle] {}: continued script request update: {:?}\n",
+                                request_id, err
+                            )
+                            .into_bytes(),
+                        )
+                        .await;
+                    }
+                    let normalized_path = match normalized_script_request_path(&continued.request) {
+                        Some(path) => path,
+                        None => {
+                            drain_payload(&mut reader, &mut body).await;
+                            let send_outcome =
+                                send_fixed(w, bad_request(), None, &continued.metadata, None).await;
+                            log_caddy_access(
+                                shared,
+                                &head,
+                                peer,
+                                scheme,
+                                send_outcome.status,
+                                &continued.metadata,
+                            )
+                            .await;
+                            return (send_outcome.keep_client, reader);
+                        }
+                    };
+                    let continued_hook_state =
+                        ResponseHookState::from_outcome(script_runtime, shared, &continued);
+                    if continued.abort {
+                        return (false, reader);
+                    }
+                    if let Some(proxy_url) = continued.reverse_proxy.as_deref() {
+                        let continued_encode_state = continued.encode.clone().map(|config| {
+                            crate::helpers::compress::EncodeState::from_request_headers(
+                                config,
+                                &head.headers,
+                            )
+                        });
+                        let res = reverse_proxy_request(
+                            proxy_url,
+                            head.clone(),
+                            body,
+                            &mut reader,
+                            w,
+                            head_only,
+                            peer,
+                            scheme,
+                            Some(&continued.early_response_headers),
+                            &continued.metadata,
+                            Some(&continued_hook_state),
+                            continued.request.proxy_method(),
+                            continued.request.proxy_uri(),
+                            continued.request.proxy_headers(),
+                            continued.request_body_limit,
+                            continued_encode_state.as_ref(),
+                        )
+                        .await;
+                        return match res {
+                            Ok(outcome) => {
+                                if !outcome.continue_request {
+                                    log_caddy_access(
+                                        shared,
+                                        &head,
+                                        peer,
+                                        scheme,
+                                        outcome.send.status,
+                                        &continued.metadata,
+                                    )
+                                    .await;
+                                }
+                                (outcome.send.keep_client, reader)
+                            }
+                            Err(err) => {
+                                async_log(
+                                    format!(
+                                        "[handle] {}: continued reverse proxy: {:?}\n",
+                                        request_id, err
+                                    )
+                                    .into_bytes(),
+                                )
+                                .await;
+                                (false, reader)
+                            }
+                        };
+                    }
+                    if let Some(send_outcome) = caddy::try_serve_file_server_response_h1(
+                        &head,
+                        shared,
+                        head_only,
+                        peer,
+                        &mut reader,
+                        &mut body,
+                        w,
+                        &continued,
+                        &continued_hook_state,
+                        &normalized_path,
+                    )
+                    .await
+                    {
+                        log_caddy_access(
+                            shared,
+                            &head,
+                            peer,
+                            scheme,
+                            send_outcome.status,
+                            &continued.metadata,
+                        )
+                        .await;
+                        return (send_outcome.keep_client, reader);
+                    }
+                    if let Some(response) = continued.response.clone() {
+                        drain_payload(&mut reader, &mut body).await;
+                        let continued_encode_state = continued.encode.clone().map(|config| {
+                            crate::helpers::compress::EncodeState::from_request_headers(
+                                config,
+                                &head.headers,
+                            )
+                        });
+                        let send_outcome = send_script_response(
+                            w,
+                            response,
+                            head_only,
+                            &continued.metadata,
+                            Some(&continued_hook_state),
+                            continued_encode_state.as_ref(),
+                        )
+                        .await;
+                        log_caddy_access(
+                            shared,
+                            &head,
+                            peer,
+                            scheme,
+                            send_outcome.status,
+                            &continued.metadata,
+                        )
+                        .await;
+                        return (send_outcome.keep_client, reader);
+                    }
+                    match head.method {
+                        Method::GET | Method::HEAD => {
+                            drain_payload(&mut reader, &mut body).await;
+                            if let Some(send_outcome) = serve_static(
+                                &head,
+                                shared,
+                                head_only,
+                                peer,
+                                w,
+                                Some(&continued.early_response_headers),
+                                &continued.metadata,
+                                Some(&continued_hook_state),
+                                &normalized_path,
+                            )
+                            .await
+                            {
+                                log_caddy_access(
+                                    shared,
+                                    &head,
+                                    peer,
+                                    scheme,
+                                    send_outcome.status,
+                                    &continued.metadata,
+                                )
+                                .await;
+                                return (send_outcome.keep_client, reader);
+                            }
+                            let send_outcome = send_fixed(
+                                w,
+                                not_found(),
+                                Some(&continued.early_response_headers),
+                                &continued.metadata,
+                                Some(&continued_hook_state),
+                            )
+                            .await;
+                            log_caddy_access(
+                                shared,
+                                &head,
+                                peer,
+                                scheme,
+                                send_outcome.status,
+                                &continued.metadata,
+                            )
+                            .await;
+                            return (send_outcome.keep_client, reader);
+                        }
+                        _ => {
+                            drain_payload(&mut reader, &mut body).await;
+                            let send_outcome = send_fixed(
+                                w,
+                                method_not_allowed(),
+                                Some(&continued.early_response_headers),
+                                &continued.metadata,
+                                Some(&continued_hook_state),
+                            )
+                            .await;
+                            log_caddy_access(
+                                shared,
+                                &head,
+                                peer,
+                                scheme,
+                                send_outcome.status,
+                                &continued.metadata,
+                            )
+                            .await;
+                            return (send_outcome.keep_client, reader);
+                        }
+                    }
+                }
+                log_caddy_access(
+                    shared,
+                    &head,
+                    peer,
+                    scheme,
+                    proxy_outcome.send.status,
+                    &script_outcome.metadata,
+                )
+                .await;
+                return (proxy_outcome.send.keep_client, reader);
+            }
             Err(err) => {
                 async_log(
                     format!("[handle] {}: reverse proxy: {:?}\n", request_id, err).into_bytes(),
@@ -773,35 +1073,123 @@ async fn handle_request<R: AsyncReadRent + 'static>(
         }
     }
 
-    if let Some(response) = script_outcome.response {
+    if let Some(send_outcome) = caddy::try_serve_file_server_response_h1(
+        &head,
+        shared,
+        head_only,
+        peer,
+        &mut reader,
+        &mut body,
+        w,
+        &script_outcome,
+        &hook_state,
+        &normalized_path,
+    )
+    .await
+    {
+        log_caddy_access(
+            shared,
+            &head,
+            peer,
+            scheme,
+            send_outcome.status,
+            &script_outcome.metadata,
+        )
+        .await;
+        return (send_outcome.keep_client, reader);
+    }
+
+    if let Some(response) = script_outcome.response.clone() {
         drain_payload(&mut reader, &mut body).await;
-        send_script_response(w, response, head_only, &script_outcome.metadata).await;
-        return (true, reader);
+        let send_outcome = send_script_response(
+            w,
+            response,
+            head_only,
+            &script_outcome.metadata,
+            Some(&hook_state),
+            encode_state.as_ref(),
+        )
+        .await;
+        log_caddy_access(
+            shared,
+            &head,
+            peer,
+            scheme,
+            send_outcome.status,
+            &script_outcome.metadata,
+        )
+        .await;
+        return (send_outcome.keep_client, reader);
     }
 
     drain_payload(&mut reader, &mut body).await;
 
     match head.method {
         Method::GET | Method::HEAD => {
-            if serve_static(
+            if let Some(send_outcome) = serve_static(
                 &head,
                 shared,
                 head_only,
                 peer,
                 w,
+                Some(&script_outcome.early_response_headers),
                 &script_outcome.metadata,
+                Some(&hook_state),
                 &normalized_path,
             )
             .await
-            .is_none()
             {
-                send_fixed(w, not_found(), &script_outcome.metadata).await
+                log_caddy_access(
+                    shared,
+                    &head,
+                    peer,
+                    scheme,
+                    send_outcome.status,
+                    &script_outcome.metadata,
+                )
+                .await;
+                return (send_outcome.keep_client, reader);
             }
+            let send_outcome = send_fixed(
+                w,
+                not_found(),
+                Some(&script_outcome.early_response_headers),
+                &script_outcome.metadata,
+                Some(&hook_state),
+            )
+            .await;
+            log_caddy_access(
+                shared,
+                &head,
+                peer,
+                scheme,
+                send_outcome.status,
+                &script_outcome.metadata,
+            )
+            .await;
+            return (send_outcome.keep_client, reader);
         }
-        _ => send_fixed(w, method_not_allowed(), &script_outcome.metadata).await,
+        _ => {
+            let send_outcome = send_fixed(
+                w,
+                method_not_allowed(),
+                Some(&script_outcome.early_response_headers),
+                &script_outcome.metadata,
+                Some(&hook_state),
+            )
+            .await;
+            log_caddy_access(
+                shared,
+                &head,
+                peer,
+                scheme,
+                send_outcome.status,
+                &script_outcome.metadata,
+            )
+            .await;
+            return (send_outcome.keep_client, reader);
+        }
     }
-
-    (true, reader)
 }
 
 async fn handle_h2_request<H>(
@@ -810,6 +1198,7 @@ async fn handle_h2_request<H>(
     shared: Arc<SharedState>,
     script_runtime: Rc<ScriptRuntime>,
     peer: std::net::SocketAddr,
+    local: std::net::SocketAddr,
     scheme: Scheme,
     hup: future::Shared<H>,
     connection: ConnectionInfo,
@@ -827,6 +1216,7 @@ where
         uri: parts.uri,
         version: ::http::Version::HTTP_2,
         headers,
+        tls: matches!(scheme, Scheme::Https),
     };
     ensure_host_header(&mut head);
     let head_only = head.method == Method::HEAD;
@@ -838,7 +1228,9 @@ where
             "text/plain; charset=utf-8",
             b"Misdirected Request".to_vec(),
             head_only,
+            None,
             &HashMap::new(),
+            None,
         )
         .await?;
         return Ok(());
@@ -858,7 +1250,9 @@ where
                 "text/plain; charset=utf-8",
                 b"Misdirected Request".to_vec(),
                 head_only,
+                None,
                 &HashMap::new(),
+                None,
             )
             .await?;
             return Ok(());
@@ -877,7 +1271,9 @@ where
             "text/plain; charset=utf-8",
             b"Bad Request".to_vec(),
             head_only,
+            None,
             &HashMap::new(),
+            None,
         )
         .await?;
         return Ok(());
@@ -887,14 +1283,16 @@ where
         request_id,
         &head,
         peer,
+        local,
         scheme,
         &normalized_path,
+        Vec::new(),
         connection,
     );
     let script_request_fallback = script_request.clone();
     let mut hup_wait = hup.clone();
     let script_outcome = monoio::select! {
-        x = script_runtime.run_request(shared.site.load_full(), script_request, body_source) => x,
+        x = script_runtime.run_request(shared.site.load_full(), script_request, body_source.clone()) => x,
         _ = &mut hup_wait => {
           async_log(format!("[handle] {}: interrupted\n", request_id).into_bytes()).await;
           return Ok(());
@@ -922,7 +1320,7 @@ where
 
     // Recalculate normalized path if the URI was changed by script
     let normalized_path = if script_outcome.request.uri_changed() {
-        match normalize_request_path(head.uri.path()) {
+        match normalized_script_request_path(&script_outcome.request) {
             Some(path) => path,
             None => {
                 // Invalid path after script modification
@@ -932,7 +1330,9 @@ where
                     "text/plain; charset=utf-8",
                     b"Bad Request".to_vec(),
                     head_only,
+                    None,
                     &HashMap::new(),
+                    None,
                 )
                 .await?;
                 return Ok(());
@@ -941,8 +1341,16 @@ where
     } else {
         normalized_path
     };
+    let hook_state = ResponseHookState::from_outcome(&script_runtime, &shared, &script_outcome);
+    let encode_state = script_outcome.encode.clone().map(|config| {
+        crate::helpers::compress::EncodeState::from_request_headers(config, &head.headers)
+    });
 
-    if let Some(proxy_url) = script_outcome.reverse_proxy {
+    if script_outcome.abort {
+        return Ok(());
+    }
+
+    if let Some(proxy_url) = script_outcome.reverse_proxy.as_deref() {
         // Take body from state - may be None if script consumed it
         let body = body_state.borrow_mut().take();
         if let Some(body) = body {
@@ -950,19 +1358,277 @@ where
             let res = monoio::select! {
                 x = reverse_proxy_request_h2(
                     &proxy_url,
-                    head,
+                    head.clone(),
                     body,
                     &mut respond,
                     head_only,
+                    peer,
+                    scheme,
+                    Some(&script_outcome.early_response_headers),
                     &script_outcome.metadata,
+                    Some(&hook_state),
+                    script_outcome.request.proxy_method(),
+                    script_outcome.request.proxy_uri(),
+                    script_outcome.request.proxy_headers(),
+                    script_outcome.request_body_limit,
+                    encode_state.as_ref(),
                 ) => x,
                 _ = &mut hup_wait => Err(anyhow::anyhow!("interrupted")),
             };
-            if let Err(err) = res {
-                async_log(
-                    format!("[handle] {}: reverse proxy: {:?}\n", request_id, err).into_bytes(),
-                )
-                .await;
+            match res {
+                Ok(proxy_outcome) => {
+                    if proxy_outcome.continue_request {
+                        let (continued, body) = caddy::continue_h2_request(
+                            request_id,
+                            &script_runtime,
+                            &shared,
+                            &hook_state,
+                            &script_outcome,
+                            &body_state,
+                            &body_source,
+                            proxy_outcome.preserved_body,
+                        )
+                        .await;
+                        if let Err(err) = apply_script_request(&mut head, &continued.request) {
+                            async_log(
+                                format!(
+                                    "[handle] {}: continued script request update: {:?}\n",
+                                    request_id, err
+                                )
+                                .into_bytes(),
+                            )
+                            .await;
+                        }
+                        let normalized_path =
+                            match normalized_script_request_path(&continued.request) {
+                                Some(path) => path,
+                                None => {
+                                    let status = send_h2_bytes_response(
+                                        &mut respond,
+                                        StatusCode::BAD_REQUEST,
+                                        "text/plain; charset=utf-8",
+                                        b"Bad Request".to_vec(),
+                                        head_only,
+                                        None,
+                                        &continued.metadata,
+                                        None,
+                                    )
+                                    .await?;
+                                    log_caddy_access(
+                                        &shared,
+                                        &head,
+                                        peer,
+                                        scheme,
+                                        status,
+                                        &continued.metadata,
+                                    )
+                                    .await;
+                                    return Ok(());
+                                }
+                            };
+                        let continued_hook_state =
+                            ResponseHookState::from_outcome(&script_runtime, &shared, &continued);
+                        if continued.abort {
+                            return Ok(());
+                        }
+                        if let Some(proxy_url) = continued.reverse_proxy.as_deref() {
+                            if let Some(body) = body {
+                                let continued_encode_state =
+                                    continued.encode.clone().map(|config| {
+                                        crate::helpers::compress::EncodeState::from_request_headers(
+                                            config,
+                                            &head.headers,
+                                        )
+                                    });
+                                let res = reverse_proxy_request_h2(
+                                    proxy_url,
+                                    head.clone(),
+                                    body,
+                                    &mut respond,
+                                    head_only,
+                                    peer,
+                                    scheme,
+                                    Some(&continued.early_response_headers),
+                                    &continued.metadata,
+                                    Some(&continued_hook_state),
+                                    continued.request.proxy_method(),
+                                    continued.request.proxy_uri(),
+                                    continued.request.proxy_headers(),
+                                    continued.request_body_limit,
+                                    continued_encode_state.as_ref(),
+                                )
+                                .await;
+                                match res {
+                                    Ok(outcome) => {
+                                        if !outcome.continue_request
+                                            && let Some(status) = outcome.status
+                                        {
+                                            log_caddy_access(
+                                                &shared,
+                                                &head,
+                                                peer,
+                                                scheme,
+                                                status,
+                                                &continued.metadata,
+                                            )
+                                            .await;
+                                        }
+                                    }
+                                    Err(err) => {
+                                        async_log(
+                                            format!(
+                                                "[handle] {}: continued reverse proxy: {:?}\n",
+                                                request_id, err
+                                            )
+                                            .into_bytes(),
+                                        )
+                                        .await;
+                                    }
+                                }
+                            } else {
+                                async_log(
+                                    format!(
+                                        "[handle] {}: continued reverse proxy skipped - body already consumed\n",
+                                        request_id
+                                    )
+                                    .into_bytes(),
+                                )
+                                .await;
+                            }
+                            return Ok(());
+                        }
+                        if let Some(status) = caddy::try_serve_file_server_response_h2(
+                            &head,
+                            &shared,
+                            head_only,
+                            &mut respond,
+                            &continued,
+                            &continued_hook_state,
+                            &normalized_path,
+                        )
+                        .await?
+                        {
+                            log_caddy_access(
+                                &shared,
+                                &head,
+                                peer,
+                                scheme,
+                                status,
+                                &continued.metadata,
+                            )
+                            .await;
+                            return Ok(());
+                        }
+                        if let Some(response) = continued.response.clone() {
+                            let continued_encode_state = continued.encode.clone().map(|config| {
+                                crate::helpers::compress::EncodeState::from_request_headers(
+                                    config,
+                                    &head.headers,
+                                )
+                            });
+                            let status = send_script_response_h2(
+                                &mut respond,
+                                response,
+                                head_only,
+                                &continued.metadata,
+                                Some(&continued_hook_state),
+                                continued_encode_state.as_ref(),
+                            )
+                            .await?;
+                            log_caddy_access(
+                                &shared,
+                                &head,
+                                peer,
+                                scheme,
+                                status,
+                                &continued.metadata,
+                            )
+                            .await;
+                            return Ok(());
+                        }
+                        match head.method {
+                            Method::GET | Method::HEAD => {
+                                if let Some(status) = serve_static_h2(
+                                    &head,
+                                    &shared,
+                                    head_only,
+                                    &mut respond,
+                                    Some(&continued.early_response_headers),
+                                    &continued.metadata,
+                                    Some(&continued_hook_state),
+                                    &normalized_path,
+                                )
+                                .await?
+                                {
+                                    log_caddy_access(
+                                        &shared,
+                                        &head,
+                                        peer,
+                                        scheme,
+                                        status,
+                                        &continued.metadata,
+                                    )
+                                    .await;
+                                } else {
+                                    let status = send_h2_response(
+                                        &mut respond,
+                                        not_found(),
+                                        head_only,
+                                        Some(&continued.early_response_headers),
+                                        &continued.metadata,
+                                        Some(&continued_hook_state),
+                                    )
+                                    .await?;
+                                    log_caddy_access(
+                                        &shared,
+                                        &head,
+                                        peer,
+                                        scheme,
+                                        status,
+                                        &continued.metadata,
+                                    )
+                                    .await;
+                                }
+                            }
+                            _ => {
+                                let status = send_h2_response(
+                                    &mut respond,
+                                    method_not_allowed(),
+                                    head_only,
+                                    Some(&continued.early_response_headers),
+                                    &continued.metadata,
+                                    Some(&continued_hook_state),
+                                )
+                                .await?;
+                                log_caddy_access(
+                                    &shared,
+                                    &head,
+                                    peer,
+                                    scheme,
+                                    status,
+                                    &continued.metadata,
+                                )
+                                .await;
+                            }
+                        }
+                    } else if let Some(status) = proxy_outcome.status {
+                        log_caddy_access(
+                            &shared,
+                            &head,
+                            peer,
+                            scheme,
+                            status,
+                            &script_outcome.metadata,
+                        )
+                        .await;
+                    }
+                }
+                Err(err) => {
+                    async_log(
+                        format!("[handle] {}: reverse proxy: {:?}\n", request_id, err).into_bytes(),
+                    )
+                    .await;
+                }
             }
         } else {
             async_log(
@@ -977,42 +1643,114 @@ where
         return Ok(());
     }
 
-    if let Some(response) = script_outcome.response {
-        send_script_response_h2(&mut respond, response, head_only, &script_outcome.metadata)
-            .await?;
+    if let Some(status) = caddy::try_serve_file_server_response_h2(
+        &head,
+        &shared,
+        head_only,
+        &mut respond,
+        &script_outcome,
+        &hook_state,
+        &normalized_path,
+    )
+    .await?
+    {
+        log_caddy_access(
+            &shared,
+            &head,
+            peer,
+            scheme,
+            status,
+            &script_outcome.metadata,
+        )
+        .await;
+        return Ok(());
+    }
+
+    if let Some(response) = script_outcome.response.clone() {
+        let status = send_script_response_h2(
+            &mut respond,
+            response,
+            head_only,
+            &script_outcome.metadata,
+            Some(&hook_state),
+            encode_state.as_ref(),
+        )
+        .await?;
+        log_caddy_access(
+            &shared,
+            &head,
+            peer,
+            scheme,
+            status,
+            &script_outcome.metadata,
+        )
+        .await;
         return Ok(());
     }
 
     match head.method {
         Method::GET | Method::HEAD => {
-            if serve_static_h2(
+            if let Some(status) = serve_static_h2(
                 &head,
                 &shared,
                 head_only,
                 &mut respond,
+                Some(&script_outcome.early_response_headers),
                 &script_outcome.metadata,
+                Some(&hook_state),
                 &normalized_path,
             )
             .await?
-            .is_none()
             {
-                send_h2_response(
+                log_caddy_access(
+                    &shared,
+                    &head,
+                    peer,
+                    scheme,
+                    status,
+                    &script_outcome.metadata,
+                )
+                .await;
+            } else {
+                let status = send_h2_response(
                     &mut respond,
                     not_found(),
                     head_only,
+                    Some(&script_outcome.early_response_headers),
                     &script_outcome.metadata,
+                    Some(&hook_state),
                 )
                 .await?;
+                log_caddy_access(
+                    &shared,
+                    &head,
+                    peer,
+                    scheme,
+                    status,
+                    &script_outcome.metadata,
+                )
+                .await;
             }
         }
         _ => {
-            send_h2_response(
+            let status = send_h2_response(
                 &mut respond,
                 method_not_allowed(),
                 head_only,
+                Some(&script_outcome.early_response_headers),
                 &script_outcome.metadata,
+                Some(&hook_state),
             )
             .await?;
+            log_caddy_access(
+                &shared,
+                &head,
+                peer,
+                scheme,
+                status,
+                &script_outcome.metadata,
+            )
+            .await;
         }
     }
 
@@ -1032,19 +1770,68 @@ fn ensure_content_length(res: &mut ::http::Response<Bytes>) {
     }
 }
 
+fn ensure_static_content_length(response: &mut StaticResponse) {
+    if response
+        .headers
+        .contains_key(::http::header::CONTENT_LENGTH)
+        || response
+            .headers
+            .contains_key(::http::header::TRANSFER_ENCODING)
+    {
+        return;
+    }
+    let len = match &response.body {
+        StaticBody::Empty => 0,
+        StaticBody::Bytes(body) => body.len() as u64,
+        StaticBody::File { entry, range } => range.map(|range| range.len).unwrap_or(entry.size),
+        StaticBody::FsFile { size, range, .. } => range.map(|range| range.len).unwrap_or(*size),
+    };
+    let value = ::http::HeaderValue::from_str(&len.to_string())
+        .unwrap_or_else(|_| ::http::HeaderValue::from_static("0"));
+    response
+        .headers
+        .insert(::http::header::CONTENT_LENGTH, value);
+}
+
+fn status_allows_body(status: StatusCode) -> bool {
+    !status.is_informational()
+        && !matches!(status, StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED)
+}
+
+fn raw_status_allows_body(status: u16) -> bool {
+    !(100..200).contains(&status) && status != 204 && status != 304
+}
+
+fn strip_no_body_headers(headers: &mut ::http::HeaderMap) {
+    headers.remove(::http::header::CONTENT_LENGTH);
+    headers.remove(::http::header::TRANSFER_ENCODING);
+}
+
 async fn send_fixed(
     w: &mut impl AsyncWriteRent,
     mut res: ::http::Response<Bytes>,
+    early_response_headers: Option<&::http::HeaderMap>,
     metadata: &HashMap<String, String>,
-) {
-    ensure_content_length(&mut res);
-    apply_metadata_response_headers(res.headers_mut(), metadata);
+    hook_state: Option<&ResponseHookState<'_>>,
+) -> H1SendOutcome {
+    let hook_outcome =
+        caddy::prepare_fixed_response(&mut res, early_response_headers, metadata, hook_state).await;
+    let _ = hook_outcome.continue_request;
+    let send_body = status_allows_body(res.status());
+    if !send_body {
+        strip_no_body_headers(res.headers_mut());
+    }
     let (parts, body) = res.into_parts();
+    let continue_conn = !connection_has_close(&parts.headers);
     let _ = write_response_head(w, parts.status, &parts.headers).await;
-    if !body.is_empty() {
+    if send_body && !body.is_empty() {
         let _ = w.write_all(body.to_vec()).await;
     }
     let _ = w.flush().await;
+    H1SendOutcome {
+        keep_client: continue_conn,
+        status: parts.status.as_u16(),
+    }
 }
 
 fn ensure_host_header(head: &mut RequestHead) {
@@ -1084,10 +1871,42 @@ async fn send_h2_response(
     respond: &mut h2::server::SendResponse<Bytes>,
     mut res: ::http::Response<Bytes>,
     head_only: bool,
+    early_response_headers: Option<&::http::HeaderMap>,
     metadata: &HashMap<String, String>,
+    hook_state: Option<&ResponseHookState<'_>>,
+) -> Result<u16> {
+    let hook_outcome =
+        caddy::prepare_fixed_response(&mut res, early_response_headers, metadata, hook_state).await;
+    let _ = hook_outcome.continue_request;
+    let send_body = status_allows_body(res.status());
+    if !send_body {
+        strip_no_body_headers(res.headers_mut());
+    }
+    strip_hop_headers(res.headers_mut(), false);
+    let (parts, body) = res.into_parts();
+    let mut head = ::http::Response::builder()
+        .status(parts.status)
+        .version(::http::Version::HTTP_2)
+        .body(())
+        .map_err(|err| anyhow!("failed to build h2 response: {err}"))?;
+    *head.headers_mut() = parts.headers;
+    let end_stream = head_only || !send_body || body.is_empty();
+    let mut stream = respond.send_response(head, end_stream)?;
+    if !end_stream {
+        send_h2_data(&mut stream, body, true).await?;
+    }
+    Ok(parts.status.as_u16())
+}
+
+async fn send_h2_response_with_prepared_headers(
+    respond: &mut h2::server::SendResponse<Bytes>,
+    mut res: ::http::Response<Bytes>,
+    head_only: bool,
 ) -> Result<()> {
     ensure_content_length(&mut res);
-    apply_metadata_response_headers(res.headers_mut(), metadata);
+    if !status_allows_body(res.status()) {
+        strip_no_body_headers(res.headers_mut());
+    }
     strip_hop_headers(res.headers_mut(), false);
     let (parts, body) = res.into_parts();
     let mut head = ::http::Response::builder()
@@ -1110,15 +1929,25 @@ async fn send_h2_bytes_response(
     content_type: &str,
     body: Vec<u8>,
     head_only: bool,
+    early_response_headers: Option<&::http::HeaderMap>,
     metadata: &HashMap<String, String>,
-) -> Result<()> {
+    hook_state: Option<&ResponseHookState<'_>>,
+) -> Result<u16> {
     let headers = build_base_headers(body.len() as u64, content_type);
     let mut res = ::http::Response::builder()
         .status(status)
         .body(Bytes::from(body))
         .map_err(|err| anyhow!("failed to build h2 response: {err}"))?;
     *res.headers_mut() = headers;
-    send_h2_response(respond, res, head_only, metadata).await
+    send_h2_response(
+        respond,
+        res,
+        head_only,
+        early_response_headers,
+        metadata,
+        hook_state,
+    )
+    .await
 }
 
 async fn send_script_response_h2(
@@ -1126,16 +1955,57 @@ async fn send_script_response_h2(
     response: ScriptResponse,
     head_only: bool,
     metadata: &HashMap<String, String>,
-) -> Result<()> {
-    let status = StatusCode::from_u16(response.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    let mut headers = build_base_headers(response.body.len() as u64, "text/plain; charset=utf-8");
+    hook_state: Option<&ResponseHookState<'_>>,
+    encode: Option<&crate::helpers::compress::EncodeState>,
+) -> Result<u16> {
+    let mut status =
+        StatusCode::from_u16(response.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let mut headers = response
+        .content_type
+        .as_deref()
+        .map(|content_type| build_base_headers(response.body.len() as u64, content_type))
+        .unwrap_or_else(|| {
+            let mut headers = ::http::HeaderMap::new();
+            if let Ok(value) = ::http::HeaderValue::from_str(&response.body.len().to_string()) {
+                headers.insert(::http::header::CONTENT_LENGTH, value);
+            }
+            headers
+        });
     append_script_response_headers(&mut headers, &response.headers);
+    let body = response.body;
+    let hook_outcome =
+        caddy::prepare_script_response_headers(status, &mut headers, metadata, hook_state).await;
+    let _ = hook_outcome.continue_request;
+    status = hook_outcome.status;
+    let send_body = status_allows_body(status);
+    if !send_body {
+        strip_no_body_headers(&mut headers);
+    }
+    strip_hop_headers(&mut headers, false);
+    let mut body = if send_body { body } else { Vec::new() };
+    // Streaming response compression (Caddy `encode` handler), buffered case.
+    if send_body && let Some(state) = encode {
+        if let Some(chosen) = state.decide(status.as_u16(), &headers, Some(body.len() as u64)) {
+            if head_only {
+                crate::helpers::compress::apply_encoding_headers(&mut headers, &chosen.name);
+            } else if let Ok(compressed) =
+                crate::helpers::compress::BodyEncoder::compress_buffer(chosen.spec, &body)
+            {
+                crate::helpers::compress::apply_encoding_headers(&mut headers, &chosen.name);
+                if let Ok(value) = ::http::HeaderValue::from_str(&compressed.len().to_string()) {
+                    headers.insert(::http::header::CONTENT_LENGTH, value);
+                }
+                body = compressed;
+            }
+        }
+    }
     let mut res = ::http::Response::builder()
         .status(status)
-        .body(Bytes::from(response.body))
+        .body(Bytes::from(body))
         .map_err(|err| anyhow!("failed to build h2 response: {err}"))?;
     *res.headers_mut() = headers;
-    send_h2_response(respond, res, head_only, metadata).await
+    send_h2_response_with_prepared_headers(respond, res, head_only).await?;
+    Ok(status.as_u16())
 }
 
 async fn send_h2_data(
@@ -1233,17 +2103,8 @@ async fn prepare_static_response(
         return Some(response);
     }
 
-    if if_none_match_matches(&head.headers, &entry.etag) {
-        let mut headers = ::http::HeaderMap::new();
-        headers.insert(
-            ::http::header::SERVER,
-            HeaderValue::from_static(crate::SERVER_HEADER),
-        );
-        headers.insert(::http::header::ETAG, etag_header_value(&entry.etag));
-        headers.insert(
-            ::http::header::CONTENT_LENGTH,
-            HeaderValue::from_static("0"),
-        );
+    if not_modified_by_request(&head.headers, &entry.etag, entry.mtime) {
+        let headers = not_modified_headers(&entry.etag, entry.mtime);
         return Some(StaticResponse {
             status: StatusCode::NOT_MODIFIED,
             headers,
@@ -1255,14 +2116,17 @@ async fn prepare_static_response(
 
     let mut headers = build_base_headers(entry.size, mime);
     headers.insert(::http::header::ETAG, etag_header_value(&entry.etag));
+    insert_last_modified(&mut headers, entry.mtime);
     headers.insert(
         ::http::header::ACCEPT_RANGES,
         ::http::HeaderValue::from_static("bytes"),
     );
+    let (status, range) =
+        apply_static_range(head, &mut headers, entry.size, &entry.etag, entry.mtime);
     Some(StaticResponse {
-        status: StatusCode::OK,
+        status,
         headers,
-        body: StaticBody::File(entry),
+        body: StaticBody::File { entry, range },
         head_only,
         site,
     })
@@ -1273,13 +2137,96 @@ async fn send_static_response_h1(
     shared: &Arc<SharedState>,
     peer: std::net::SocketAddr,
     mut response: StaticResponse,
+    early_response_headers: Option<&::http::HeaderMap>,
     metadata: &HashMap<String, String>,
-) {
-    apply_metadata_response_headers(&mut response.headers, metadata);
-    let _ = write_response_head(w, response.status, &response.headers).await;
-    if response.head_only {
+    hook_state: Option<&ResponseHookState<'_>>,
+) -> H1SendOutcome {
+    let hook_outcome = caddy::prepare_static_response_headers_raw_h1(
+        &mut response,
+        early_response_headers,
+        metadata,
+        hook_state,
+    )
+    .await;
+    let _ = hook_outcome.continue_request;
+    let status = hook_outcome.status;
+    let send_body = raw_status_allows_body(status);
+    if !send_body {
+        strip_no_body_headers(&mut response.headers);
+    }
+    send_prepared_static_response_h1(w, shared, peer, response, status, send_body, None).await
+}
+
+async fn send_prepared_static_response_h1(
+    w: &mut impl AsyncWriteRent,
+    shared: &Arc<SharedState>,
+    peer: std::net::SocketAddr,
+    mut response: StaticResponse,
+    status: u16,
+    send_body: bool,
+    encode: Option<&crate::helpers::compress::EncodeState>,
+) -> H1SendOutcome {
+    // Streaming response compression (Caddy `encode` handler). File bodies have
+    // a known length, so the minimum_length gate is exact and no read-ahead is
+    // needed. Byte-range responses are served uncompressed (a compressed stream
+    // is not byte-rangeable), matching Caddy dropping Accept-Ranges on encode.
+    let body_range_present = matches!(
+        &response.body,
+        StaticBody::File { range: Some(_), .. } | StaticBody::FsFile { range: Some(_), .. }
+    );
+    let chosen = if send_body && !body_range_present {
+        encode.and_then(|state| {
+            let len = static_body_len(&response.body);
+            state.decide(status, &response.headers, Some(len))
+        })
+    } else {
+        None
+    };
+    if let Some(chosen) = chosen {
+        crate::helpers::compress::apply_encoding_headers(&mut response.headers, &chosen.name);
+        if response.head_only {
+            let _ = write_response_head_raw(w, status, &response.headers).await;
+            let _ = w.flush().await;
+            return H1SendOutcome {
+                keep_client: !connection_has_close(&response.headers),
+                status,
+            };
+        }
+        response.headers.insert(
+            ::http::header::TRANSFER_ENCODING,
+            ::http::HeaderValue::from_static("chunked"),
+        );
+        let continue_conn = !connection_has_close(&response.headers);
+        let _ = write_response_head_raw(w, status, &response.headers).await;
+        match write_static_body_compressed_h1(w, shared, &response, chosen.spec).await {
+            Ok(()) => {
+                let _ = w.flush().await;
+            }
+            Err(e) => {
+                if e.kind() != ErrorKind::ConnectionReset && e.kind() != ErrorKind::BrokenPipe {
+                    eprintln!("aborting stream with {} due to io error: {:?}", peer, e);
+                    let _ = w.shutdown().await;
+                    return H1SendOutcome {
+                        keep_client: false,
+                        status,
+                    };
+                }
+            }
+        }
+        return H1SendOutcome {
+            keep_client: continue_conn,
+            status,
+        };
+    }
+
+    let continue_conn = !connection_has_close(&response.headers);
+    let _ = write_response_head_raw(w, status, &response.headers).await;
+    if response.head_only || !send_body {
         let _ = w.flush().await;
-        return;
+        return H1SendOutcome {
+            keep_client: continue_conn,
+            status,
+        };
     }
 
     match response.body {
@@ -1292,9 +2239,21 @@ async fn send_static_response_h1(
             }
             let _ = w.flush().await;
         }
-        StaticBody::File(entry) => {
-            match stream_tar_entry(entry.clone(), &response.site, shared.config.chunk_size, w).await
-            {
+        StaticBody::File { entry, range } => {
+            let stream_result = if let Some(range) = range {
+                crate::shared::stream_tar_entry_range(
+                    entry.clone(),
+                    &response.site,
+                    range.start,
+                    range.len,
+                    shared.config.chunk_size,
+                    w,
+                )
+                .await
+            } else {
+                stream_tar_entry(entry.clone(), &response.site, shared.config.chunk_size, w).await
+            };
+            match stream_result {
                 Ok(()) => {
                     let _ = w.flush().await;
                 }
@@ -1302,11 +2261,122 @@ async fn send_static_response_h1(
                     if e.kind() != ErrorKind::ConnectionReset && e.kind() != ErrorKind::BrokenPipe {
                         eprintln!("aborting stream with {} due to io error: {:?}", peer, e);
                         let _ = w.shutdown().await;
+                        return H1SendOutcome {
+                            keep_client: false,
+                            status,
+                        };
+                    }
+                }
+            };
+        }
+        StaticBody::FsFile { path, size, range } => {
+            let stream_result = stream_fs_file(
+                &path,
+                range.map(|range| range.start).unwrap_or(0),
+                range.map(|range| range.len).unwrap_or(size),
+                shared.config.chunk_size,
+                w,
+            )
+            .await;
+            match stream_result {
+                Ok(()) => {
+                    let _ = w.flush().await;
+                }
+                Err(e) => {
+                    if e.kind() != ErrorKind::ConnectionReset && e.kind() != ErrorKind::BrokenPipe {
+                        eprintln!("aborting stream with {} due to io error: {:?}", peer, e);
+                        let _ = w.shutdown().await;
+                        return H1SendOutcome {
+                            keep_client: false,
+                            status,
+                        };
                     }
                 }
             };
         }
     }
+    H1SendOutcome {
+        keep_client: continue_conn,
+        status,
+    }
+}
+
+/// The byte length of a static body's full content (ignoring ranges, which are
+/// not compressed).
+fn static_body_len(body: &StaticBody) -> u64 {
+    match body {
+        StaticBody::Empty => 0,
+        StaticBody::Bytes(bytes) => bytes.len() as u64,
+        StaticBody::File { entry, range } => range.map(|r| r.len).unwrap_or(entry.size),
+        StaticBody::FsFile { size, range, .. } => range.map(|r| r.len).unwrap_or(*size),
+    }
+}
+
+/// Stream a (non-range) static body to the client compressed with `spec`,
+/// framed as HTTP/1.1 chunks. File bodies are read in chunks and fed through the
+/// encoder so large files do not need to be buffered in full.
+async fn write_static_body_compressed_h1(
+    w: &mut impl AsyncWriteRent,
+    shared: &Arc<SharedState>,
+    response: &StaticResponse,
+    spec: crate::helpers::compress::EncoderSpec,
+) -> std::io::Result<()> {
+    use crate::helpers::compress::BodyEncoder;
+
+    fn map_io(e: h1::HttpError) -> std::io::Error {
+        std::io::Error::other(e.to_string())
+    }
+    let mut enc = BodyEncoder::new(spec)?;
+
+    match &response.body {
+        StaticBody::Empty => {}
+        StaticBody::Bytes(bytes) => {
+            let out = enc.push(bytes)?;
+            if !out.is_empty() {
+                h1::write_chunk(w, &out).await.map_err(map_io)?;
+            }
+        }
+        StaticBody::File { entry, .. } => {
+            // Tar entries are backed by an mmap; read the full entry then
+            // compress. (Range bodies are never routed here.)
+            let bytes = crate::shared::read_tar_entry(entry.clone(), &response.site).await?;
+            let out = enc.push(&bytes)?;
+            if !out.is_empty() {
+                h1::write_chunk(w, &out).await.map_err(map_io)?;
+            }
+        }
+        StaticBody::FsFile { path, size, .. } => {
+            let file = monoio::fs::File::open(path).await?;
+            let chunk_size = shared.config.chunk_size;
+            let mut remaining = *size;
+            let mut offset = 0u64;
+            let mut buffer = vec![0u8; chunk_size];
+            while remaining > 0 {
+                let read_len = remaining.min(chunk_size as u64) as usize;
+                let view = monoio::buf::SliceMut::new(buffer, 0, read_len);
+                let (res, view) = file.read_at(view, offset).await;
+                buffer = view.into_inner();
+                let n = res?;
+                if n == 0 {
+                    return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+                }
+                let out = enc.push(&buffer[..n])?;
+                if !out.is_empty() {
+                    h1::write_chunk(w, &out).await.map_err(map_io)?;
+                    let _ = w.flush().await;
+                }
+                remaining -= n as u64;
+                offset += n as u64;
+            }
+        }
+    }
+
+    let tail = enc.finish()?;
+    if !tail.is_empty() {
+        h1::write_chunk(w, &tail).await.map_err(map_io)?;
+    }
+    h1::write_chunk_end(w).await.map_err(map_io)?;
+    Ok(())
 }
 
 async fn serve_static(
@@ -1315,13 +2385,25 @@ async fn serve_static(
     head_only: bool,
     peer: std::net::SocketAddr,
     w: &mut impl AsyncWriteRent,
+    early_response_headers: Option<&::http::HeaderMap>,
     metadata: &HashMap<String, String>,
+    hook_state: Option<&ResponseHookState<'_>>,
     normalized_path: &NormalizedPath,
-) -> Option<()> {
+) -> Option<H1SendOutcome> {
     let response =
         prepare_static_response(head, shared, head_only, metadata, normalized_path).await?;
-    send_static_response_h1(w, shared, peer, response, metadata).await;
-    Some(())
+    Some(
+        send_static_response_h1(
+            w,
+            shared,
+            peer,
+            response,
+            early_response_headers,
+            metadata,
+            hook_state,
+        )
+        .await,
+    )
 }
 
 async fn serve_static_h2(
@@ -1329,26 +2411,81 @@ async fn serve_static_h2(
     shared: &Arc<SharedState>,
     head_only: bool,
     respond: &mut h2::server::SendResponse<Bytes>,
+    early_response_headers: Option<&::http::HeaderMap>,
     metadata: &HashMap<String, String>,
+    hook_state: Option<&ResponseHookState<'_>>,
     normalized_path: &NormalizedPath,
-) -> Result<Option<()>> {
+) -> Result<Option<u16>> {
     let response =
         match prepare_static_response(head, shared, head_only, metadata, normalized_path).await {
             Some(response) => response,
             None => return Ok(None),
         };
-    send_static_response_h2(respond, shared, response, metadata).await?;
-    Ok(Some(()))
+    let status = send_static_response_h2(
+        respond,
+        shared,
+        response,
+        early_response_headers,
+        metadata,
+        hook_state,
+    )
+    .await?;
+    Ok(Some(status))
 }
 
 async fn send_static_response_h2(
     respond: &mut h2::server::SendResponse<Bytes>,
     shared: &Arc<SharedState>,
     mut response: StaticResponse,
+    early_response_headers: Option<&::http::HeaderMap>,
     metadata: &HashMap<String, String>,
+    hook_state: Option<&ResponseHookState<'_>>,
+) -> Result<u16> {
+    let hook_outcome = caddy::prepare_static_response_headers(
+        &mut response,
+        early_response_headers,
+        metadata,
+        hook_state,
+    )
+    .await;
+    let _ = hook_outcome.continue_request;
+    let send_body = status_allows_body(response.status);
+    if !send_body {
+        strip_no_body_headers(&mut response.headers);
+    }
+    let status = response.status.as_u16();
+    send_prepared_static_response_h2(respond, shared, response, send_body, None).await?;
+    Ok(status)
+}
+
+async fn send_prepared_static_response_h2(
+    respond: &mut h2::server::SendResponse<Bytes>,
+    shared: &Arc<SharedState>,
+    mut response: StaticResponse,
+    send_body: bool,
+    encode: Option<&crate::helpers::compress::EncodeState>,
 ) -> Result<()> {
-    apply_metadata_response_headers(&mut response.headers, metadata);
     strip_hop_headers(&mut response.headers, false);
+
+    // Streaming response compression (Caddy `encode` handler). Range bodies are
+    // served uncompressed; full bodies have a known length so the
+    // minimum_length gate is exact.
+    let body_range_present = matches!(
+        &response.body,
+        StaticBody::File { range: Some(_), .. } | StaticBody::FsFile { range: Some(_), .. }
+    );
+    let chosen = if send_body && !response.head_only && !body_range_present {
+        encode.and_then(|state| {
+            let len = static_body_len(&response.body);
+            state.decide(response.status.as_u16(), &response.headers, Some(len))
+        })
+    } else {
+        None
+    };
+    if let Some(chosen) = &chosen {
+        crate::helpers::compress::apply_encoding_headers(&mut response.headers, &chosen.name);
+    }
+
     let mut head = ::http::Response::builder()
         .status(response.status)
         .version(::http::Version::HTTP_2)
@@ -1359,32 +2496,127 @@ async fn send_static_response_h2(
     let body_is_empty = match &response.body {
         StaticBody::Empty => true,
         StaticBody::Bytes(body) => body.is_empty(),
-        StaticBody::File(entry) => entry.size == 0,
+        StaticBody::File { entry, range } => {
+            range.map(|range| range.len).unwrap_or(entry.size) == 0
+        }
+        StaticBody::FsFile { size, range, .. } => {
+            range.map(|range| range.len).unwrap_or(*size) == 0
+        }
     };
-    let end_stream = response.head_only || body_is_empty;
+    let end_stream = response.head_only || !send_body || body_is_empty;
     let mut stream = respond.send_response(head, end_stream)?;
     if end_stream {
         return Ok(());
     }
 
+    if let Some(chosen) = chosen {
+        return write_static_body_compressed_h2(
+            &mut stream,
+            shared,
+            &response.body,
+            &response.site,
+            chosen.spec,
+        )
+        .await;
+    }
+
     match response.body {
         StaticBody::Empty => Ok(()),
         StaticBody::Bytes(body) => send_h2_data(&mut stream, Bytes::from(body), true).await,
-        StaticBody::File(entry) => {
-            stream_tar_entry_h2(entry, &response.site, shared.config.chunk_size, &mut stream).await
+        StaticBody::File { entry, range } => {
+            stream_tar_entry_h2(
+                entry,
+                &response.site,
+                range,
+                shared.config.chunk_size,
+                &mut stream,
+            )
+            .await
+        }
+        StaticBody::FsFile { path, size, range } => {
+            stream_fs_file_h2(
+                &path,
+                range.map(|range| range.start).unwrap_or(0),
+                range.map(|range| range.len).unwrap_or(size),
+                shared.config.chunk_size,
+                &mut stream,
+            )
+            .await
         }
     }
+}
+
+/// Stream a (non-range) static body over HTTP/2 compressed with `spec`.
+async fn write_static_body_compressed_h2(
+    stream: &mut h2::SendStream<Bytes>,
+    shared: &Arc<SharedState>,
+    body: &StaticBody,
+    site: &Arc<crate::site::Site>,
+    spec: crate::helpers::compress::EncoderSpec,
+) -> Result<()> {
+    use crate::helpers::compress::BodyEncoder;
+    let mut enc = BodyEncoder::new(spec).map_err(|err| anyhow!("encoder init failed: {err}"))?;
+    match body {
+        StaticBody::Empty => {}
+        StaticBody::Bytes(bytes) => {
+            let out = enc
+                .push(bytes)
+                .map_err(|err| anyhow!("compression failed: {err}"))?;
+            if !out.is_empty() {
+                send_h2_data(stream, Bytes::from(out), false).await?;
+            }
+        }
+        StaticBody::File { entry, .. } => {
+            let bytes = crate::shared::read_tar_entry(entry.clone(), site).await?;
+            let out = enc
+                .push(&bytes)
+                .map_err(|err| anyhow!("compression failed: {err}"))?;
+            if !out.is_empty() {
+                send_h2_data(stream, Bytes::from(out), false).await?;
+            }
+        }
+        StaticBody::FsFile { path, size, .. } => {
+            let file = monoio::fs::File::open(path).await?;
+            let chunk_size = shared.config.chunk_size;
+            let mut remaining = *size;
+            let mut offset = 0u64;
+            let mut buffer = vec![0u8; chunk_size];
+            while remaining > 0 {
+                let read_len = remaining.min(chunk_size as u64) as usize;
+                let view = monoio::buf::SliceMut::new(buffer, 0, read_len);
+                let (res, view) = file.read_at(view, offset).await;
+                buffer = view.into_inner();
+                let n = res?;
+                if n == 0 {
+                    return Err(anyhow!("unexpected EOF reading {}", path.display()));
+                }
+                let out = enc
+                    .push(&buffer[..n])
+                    .map_err(|err| anyhow!("compression failed: {err}"))?;
+                if !out.is_empty() {
+                    send_h2_data(stream, Bytes::from(out), false).await?;
+                }
+                remaining -= n as u64;
+                offset += n as u64;
+            }
+        }
+    }
+    let tail = enc
+        .finish()
+        .map_err(|err| anyhow!("compression finish failed: {err}"))?;
+    send_h2_data(stream, Bytes::from(tail), true).await
 }
 
 async fn stream_tar_entry_h2(
     entry: Arc<crate::site::TarEntry>,
     site: &Arc<crate::site::Site>,
+    range: Option<ByteRange>,
     chunk_size: usize,
     stream: &mut h2::SendStream<Bytes>,
 ) -> Result<()> {
     let file = crate::shared::get_tar_file(site)?;
-    let mut remaining = entry.size;
-    let mut offset = entry.offset;
+    let mut remaining = range.map(|range| range.len).unwrap_or(entry.size);
+    let mut offset = entry.offset + range.map(|range| range.start).unwrap_or(0);
     let mut buffer = vec![0u8; chunk_size];
     while remaining > 0 {
         let read_len = remaining.min(chunk_size as u64) as usize;
@@ -1394,6 +2626,35 @@ async fn stream_tar_entry_h2(
         let n = res?;
         if n == 0 {
             return Err(anyhow!("h2 static stream failed: empty read"));
+        }
+        let is_last = remaining == n as u64;
+        let data = Bytes::copy_from_slice(&buffer[..n]);
+        send_h2_data(stream, data, is_last).await?;
+        remaining -= n as u64;
+        offset += n as u64;
+    }
+    Ok(())
+}
+
+async fn stream_fs_file_h2(
+    path: &Path,
+    start: u64,
+    len: u64,
+    chunk_size: usize,
+    stream: &mut h2::SendStream<Bytes>,
+) -> Result<()> {
+    let file = monoio::fs::File::open(path).await?;
+    let mut remaining = len;
+    let mut offset = start;
+    let mut buffer = vec![0u8; chunk_size];
+    while remaining > 0 {
+        let read_len = remaining.min(chunk_size as u64) as usize;
+        let view = monoio::buf::SliceMut::new(buffer, 0, read_len);
+        let (res, view) = file.read_at(view, offset).await;
+        buffer = view.into_inner();
+        let n = res?;
+        if n == 0 {
+            return Err(anyhow!("h2 filesystem stream failed: empty read"));
         }
         let is_last = remaining == n as u64;
         let data = Bytes::copy_from_slice(&buffer[..n]);
@@ -1438,8 +2699,6 @@ fn apply_template(body: &str, metadata: &HashMap<String, String>) -> String {
     out
 }
 
-const RESPONSE_HEADER_PREFIX: &str = "zs.response.header.";
-
 fn build_base_headers(content_length: u64, content_type: &str) -> ::http::HeaderMap {
     let mut headers = ::http::HeaderMap::new();
     let length = HeaderValue::from_str(&content_length.to_string())
@@ -1455,29 +2714,20 @@ fn build_base_headers(content_length: u64, content_type: &str) -> ::http::Header
     headers
 }
 
-fn apply_metadata_response_headers(
-    headers: &mut ::http::HeaderMap,
-    metadata: &HashMap<String, String>,
-) {
-    for (key, value) in metadata {
-        let Some(header_name) = key.strip_prefix(RESPONSE_HEADER_PREFIX) else {
-            continue;
-        };
-        let header_name = header_name.trim();
-        if header_name.is_empty() {
-            continue;
-        }
-        let Ok(header_name) = HeaderName::from_bytes(header_name.as_bytes()) else {
-            continue;
-        };
-        let Ok(header_value) = HeaderValue::from_str(value) else {
-            continue;
-        };
-        headers.insert(header_name, header_value);
-    }
+fn if_none_match_matches(headers: &::http::HeaderMap, etag: &str) -> bool {
+    // A resource with no entity tag has no concrete validator: it must never
+    // match a specific `If-None-Match` tag (only `*`, which matches any current
+    // representation). Pass an empty actual tag rather than the `""` that
+    // `response_etag_string` would synthesize for an empty etag.
+    let actual = if etag.is_empty() {
+        String::new()
+    } else {
+        response_etag_string(etag).unwrap_or_default()
+    };
+    if_none_match_matches_response(headers, &actual)
 }
 
-fn if_none_match_matches(headers: &::http::HeaderMap, etag: &str) -> bool {
+fn if_none_match_matches_response(headers: &::http::HeaderMap, actual_etag: &str) -> bool {
     let value = match headers.get(::http::header::IF_NONE_MATCH) {
         Some(value) => value,
         None => return false,
@@ -1489,21 +2739,303 @@ fn if_none_match_matches(headers: &::http::HeaderMap, etag: &str) -> bool {
     if value.trim() == "*" {
         return true;
     }
-    let quoted = format!("\"{etag}\"");
-    for part in value.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
+    if actual_etag.is_empty() {
+        return false;
+    }
+    let mut rest = value;
+    loop {
+        rest = rest.trim();
+        if rest.is_empty() {
+            break;
+        }
+        if let Some(after_comma) = rest.strip_prefix(',') {
+            rest = after_comma;
             continue;
         }
-        let part = part.strip_prefix("W/").unwrap_or(part).trim();
-        if part == etag || part == quoted {
+        if rest.starts_with('*') {
             return true;
         }
+        let Some((candidate, after_candidate)) = scan_entity_tag(rest) else {
+            break;
+        };
+        if etag_weak_match(candidate, actual_etag) {
+            return true;
+        }
+        rest = after_candidate;
     }
     false
 }
 
+fn if_match_condition_response(headers: &::http::HeaderMap, actual_etag: &str) -> Option<bool> {
+    let value = headers
+        .get(::http::header::IF_MATCH)
+        .and_then(|value| value.to_str().ok())?;
+    if value.trim().is_empty() {
+        return None;
+    }
+    let mut rest = value;
+    loop {
+        rest = rest.trim();
+        if rest.is_empty() {
+            break;
+        }
+        if let Some(after_comma) = rest.strip_prefix(',') {
+            rest = after_comma;
+            continue;
+        }
+        if rest.starts_with('*') {
+            return Some(true);
+        }
+        let Some((candidate, after_candidate)) = scan_entity_tag(rest) else {
+            break;
+        };
+        if etag_strong_match(candidate, actual_etag) {
+            return Some(true);
+        }
+        rest = after_candidate;
+    }
+    Some(false)
+}
+
+fn if_unmodified_since_condition(headers: &::http::HeaderMap, last_modified: u64) -> Option<bool> {
+    if last_modified == 0 {
+        return None;
+    }
+    let value = headers
+        .get(::http::header::IF_UNMODIFIED_SINCE)
+        .and_then(|value| value.to_str().ok())?;
+    let value = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+    let last_modified = i64::try_from(last_modified).ok()?;
+    Some(last_modified <= value.timestamp())
+}
+
+fn response_etag_string(etag: &str) -> Option<String> {
+    etag_header_value(etag).to_str().ok().map(ToOwned::to_owned)
+}
+
+fn scan_entity_tag(value: &str) -> Option<(&str, &str)> {
+    let value = value.trim();
+    let start = if value.starts_with("W/") { 2 } else { 0 };
+    let bytes = value.as_bytes();
+    if bytes.get(start) != Some(&b'"') {
+        return None;
+    }
+    for idx in (start + 1)..bytes.len() {
+        match bytes[idx] {
+            b'\x21' | b'\x23'..=b'\x7e' | b'\x80'..=u8::MAX => {}
+            b'"' => return Some((&value[..=idx], &value[(idx + 1)..])),
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn etag_strong_match(candidate: &str, actual: &str) -> bool {
+    candidate == actual && actual.starts_with('"')
+}
+
+fn etag_weak_match(candidate: &str, actual: &str) -> bool {
+    candidate.strip_prefix("W/").unwrap_or(candidate) == actual.strip_prefix("W/").unwrap_or(actual)
+}
+
+fn not_modified_by_request(headers: &::http::HeaderMap, etag: &str, last_modified: u64) -> bool {
+    if headers.contains_key(::http::header::IF_NONE_MATCH) {
+        return if_none_match_matches(headers, etag);
+    }
+    if_modified_since_matches(headers, last_modified)
+}
+
+fn if_modified_since_matches(headers: &::http::HeaderMap, last_modified: u64) -> bool {
+    if last_modified == 0 {
+        return false;
+    }
+    let Some(value) = headers
+        .get(::http::header::IF_MODIFIED_SINCE)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    let Ok(value) = chrono::DateTime::parse_from_rfc2822(value) else {
+        return false;
+    };
+    let Ok(last_modified) = i64::try_from(last_modified) else {
+        return false;
+    };
+    last_modified <= value.timestamp()
+}
+
+fn not_modified_headers(etag: &str, last_modified: u64) -> ::http::HeaderMap {
+    let mut headers = ::http::HeaderMap::new();
+    headers.insert(
+        ::http::header::SERVER,
+        HeaderValue::from_static(crate::SERVER_HEADER),
+    );
+    if !etag.is_empty() {
+        headers.insert(::http::header::ETAG, etag_header_value(etag));
+    }
+    insert_last_modified(&mut headers, last_modified);
+    headers.insert(
+        ::http::header::CONTENT_LENGTH,
+        HeaderValue::from_static("0"),
+    );
+    headers
+}
+
+fn precondition_failed_headers(etag: &str, last_modified: u64) -> ::http::HeaderMap {
+    let mut headers = ::http::HeaderMap::new();
+    headers.insert(
+        ::http::header::SERVER,
+        HeaderValue::from_static(crate::SERVER_HEADER),
+    );
+    if !etag.is_empty() {
+        headers.insert(::http::header::ETAG, etag_header_value(etag));
+    }
+    insert_last_modified(&mut headers, last_modified);
+    headers.insert(
+        ::http::header::CONTENT_LENGTH,
+        HeaderValue::from_static("0"),
+    );
+    headers
+}
+
+fn insert_last_modified(headers: &mut ::http::HeaderMap, last_modified: u64) {
+    if last_modified == 0 {
+        return;
+    }
+    if let Ok(value) = HeaderValue::from_str(&http_date(last_modified)) {
+        headers.insert(::http::header::LAST_MODIFIED, value);
+    }
+}
+
+fn http_date(secs: u64) -> String {
+    match chrono::DateTime::from_timestamp(secs as i64, 0) {
+        Some(value) => value.format("%a, %d %b %Y %H:%M:%S GMT").to_string(),
+        None => "Thu, 01 Jan 1970 00:00:00 GMT".to_string(),
+    }
+}
+
+fn apply_static_range(
+    head: &RequestHead,
+    headers: &mut ::http::HeaderMap,
+    total: u64,
+    etag: &str,
+    last_modified: u64,
+) -> (StatusCode, Option<ByteRange>) {
+    let Some(range) = head.headers.get(::http::header::RANGE) else {
+        return (StatusCode::OK, None);
+    };
+    if !if_range_allows_range(&head.headers, etag, last_modified) {
+        return (StatusCode::OK, None);
+    }
+    let Ok(range) = range.to_str() else {
+        return (StatusCode::OK, None);
+    };
+    let Some(spec) = range.trim().strip_prefix("bytes=") else {
+        return (StatusCode::OK, None);
+    };
+    if spec.contains(',') {
+        return (StatusCode::OK, None);
+    }
+    let Some((start, end)) = spec.split_once('-') else {
+        return (StatusCode::OK, None);
+    };
+    let parsed = if start.is_empty() {
+        let Ok(suffix) = end.trim().parse::<u64>() else {
+            return (StatusCode::OK, None);
+        };
+        if suffix == 0 {
+            None
+        } else if suffix >= total {
+            Some((0, total.saturating_sub(1)))
+        } else {
+            Some((total - suffix, total.saturating_sub(1)))
+        }
+    } else {
+        let Ok(start) = start.trim().parse::<u64>() else {
+            return (StatusCode::OK, None);
+        };
+        let end = if end.trim().is_empty() {
+            total.saturating_sub(1)
+        } else {
+            let Ok(end) = end.trim().parse::<u64>() else {
+                return (StatusCode::OK, None);
+            };
+            end
+        };
+        Some((start, end))
+    };
+    let Some((start, end)) = parsed else {
+        return unsatisfiable_range(headers, total);
+    };
+    if total == 0 || start >= total || end < start {
+        return unsatisfiable_range(headers, total);
+    }
+    let end = end.min(total - 1);
+    let len = end - start + 1;
+    if let Ok(value) = HeaderValue::from_str(&len.to_string()) {
+        headers.insert(::http::header::CONTENT_LENGTH, value);
+    }
+    if let Ok(value) = HeaderValue::from_str(&format!("bytes {start}-{end}/{total}")) {
+        headers.insert(::http::header::CONTENT_RANGE, value);
+    }
+    (StatusCode::PARTIAL_CONTENT, Some(ByteRange { start, len }))
+}
+
+fn if_range_allows_range(headers: &::http::HeaderMap, etag: &str, last_modified: u64) -> bool {
+    let Some(value) = headers
+        .get(::http::header::IF_RANGE)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return true;
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+    if value.starts_with("W/") {
+        return false;
+    }
+    let quoted = format!("\"{etag}\"");
+    if !etag.is_empty() && (value == etag || value == quoted) {
+        return true;
+    }
+    if last_modified == 0 {
+        return false;
+    }
+    let Ok(value) = chrono::DateTime::parse_from_rfc2822(value) else {
+        return false;
+    };
+    let Ok(last_modified) = i64::try_from(last_modified) else {
+        return false;
+    };
+    last_modified <= value.timestamp()
+}
+
+fn unsatisfiable_range(
+    headers: &mut ::http::HeaderMap,
+    total: u64,
+) -> (StatusCode, Option<ByteRange>) {
+    set_unsatisfiable_range(headers, total);
+    (
+        StatusCode::RANGE_NOT_SATISFIABLE,
+        Some(ByteRange { start: 0, len: 0 }),
+    )
+}
+
+fn set_unsatisfiable_range(headers: &mut ::http::HeaderMap, total: u64) {
+    headers.insert(
+        ::http::header::CONTENT_LENGTH,
+        HeaderValue::from_static("0"),
+    );
+    if let Ok(value) = HeaderValue::from_str(&format!("bytes */{total}")) {
+        headers.insert(::http::header::CONTENT_RANGE, value);
+    }
+}
+
 fn etag_header_value(etag: &str) -> HeaderValue {
+    if is_entity_tag_header_value(etag) {
+        return HeaderValue::from_str(etag).unwrap_or_else(|_| HeaderValue::from_static("\"\""));
+    }
     let mut value = String::with_capacity(etag.len() + 2);
     value.push('"');
     value.push_str(etag);
@@ -1511,86 +3043,172 @@ fn etag_header_value(etag: &str) -> HeaderValue {
     HeaderValue::from_str(&value).unwrap_or_else(|_| HeaderValue::from_static("\"\""))
 }
 
+fn is_entity_tag_header_value(value: &str) -> bool {
+    (value.starts_with('"') || value.starts_with("W/\"")) && value.ends_with('"')
+}
+
 fn build_script_request(
     request_id: Ulid,
     head: &RequestHead,
     peer: std::net::SocketAddr,
+    local: std::net::SocketAddr,
     scheme: Scheme,
     normalized_path: &NormalizedPath,
+    transfer_encodings: Vec<String>,
     connection: ConnectionInfo,
 ) -> ScriptRequest {
     let mut headers = HashMap::new();
-    for (name, value) in head.headers.iter() {
-        if let Ok(value) = value.to_str() {
-            headers.insert(name.as_str().to_ascii_lowercase(), value.to_string());
+    let mut header_values = HashMap::<String, Vec<String>>::new();
+    for name in head.headers.keys() {
+        let lower_name = name.as_str().to_ascii_lowercase();
+        if header_values.contains_key(&lower_name) {
+            continue;
+        }
+        let values = head
+            .headers
+            .get_all(name)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if let Some(value) = values.last() {
+            headers.insert(lower_name.clone(), value.clone());
+        }
+        if !values.is_empty() {
+            header_values.insert(lower_name, values);
         }
     }
 
-    // Convert NormalizedPath to sanitized + urlencoded path string (with leading /)
-    let encoded_path = normalized_path.encoded_path();
+    // Convert NormalizedPath to sanitized + urlencoded path string (with leading /).
+    // Script matchers/placeholders need to preserve the trailing slash hint.
+    let encoded_path = normalized_path.encoded_path_with_dir_hint();
 
     let query = head.uri.query().unwrap_or("").to_string();
-    let mut query_params = HashMap::new();
+    let mut query_param_values = HashMap::new();
     if !query.is_empty() {
         for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
-            query_params
+            query_param_values
                 .entry(key.into_owned())
-                .or_insert(value.into_owned());
+                .or_insert_with(Vec::new)
+                .push(value.into_owned());
         }
     }
+    let query_params = query_param_values
+        .iter()
+        .filter_map(|(key, values)| values.first().map(|value| (key.clone(), value.clone())))
+        .collect();
 
     // Build URI from re-encoded normalized path + original query
     let uri = match head.uri.query() {
         Some(q) => format!("{}?{}", encoded_path, q),
         None => encoded_path.clone(),
     };
+    let (proto_major, proto_minor) = match head.version {
+        ::http::Version::HTTP_09 => (0, 9),
+        ::http::Version::HTTP_10 => (1, 0),
+        ::http::Version::HTTP_11 => (1, 1),
+        ::http::Version::HTTP_2 => (2, 0),
+        ::http::Version::HTTP_3 => (3, 0),
+        _ => (0, 0),
+    };
 
-    ScriptRequest {
+    let mut request = ScriptRequest {
         request_id,
+        start_time: std::time::Instant::now(),
         method: head.method.as_str().to_string(),
-        path: encoded_path,
-        uri,
-        query,
+        original_method: head.method.as_str().to_string(),
+        path: encoded_path.clone(),
+        original_path: encoded_path,
+        normalized_path: normalized_path.relative().to_string(),
+        uri: uri.clone(),
+        original_uri: uri,
+        query: query.clone(),
+        original_query: query,
         scheme: scheme.as_str().to_string(),
+        proto_major,
+        proto_minor,
         peer: peer.to_string(),
+        local: local.to_string(),
         headers,
+        header_values,
+        transfer_encodings,
         query_params,
+        query_param_values,
+        caddy_query_params: HashMap::new(),
+        caddy_query_valid: true,
         connection,
+        proxy_method: None,
+        proxy_uri: None,
+        proxy_headers: None,
         uri_changed: false,
-        header_changes: HashMap::new(),
-    }
+        method_changed: false,
+        header_changes: Vec::new(),
+    };
+    caddy::populate_request_fields(&mut request);
+    request
 }
 
 fn apply_script_request(head: &mut RequestHead, request: &ScriptRequest) -> Result<()> {
+    if request.method_changed() {
+        head.method = Method::from_bytes(request.method.as_bytes())
+            .map_err(|err| anyhow!("invalid script method: {err}"))?;
+    }
+
     if request.uri_changed() {
-        let uri: Uri = request
-            .uri
-            .parse()
-            .map_err(|err| anyhow!("invalid script uri: {err}"))?;
-        head.uri = uri;
+        caddy::apply_request_uri(head, request)?;
     }
 
     if request.header_changes().is_empty() {
         return Ok(());
     }
 
-    for (name, value) in request.header_changes() {
-        let Ok(header_name) = HeaderName::from_bytes(name.as_bytes()) else {
-            continue;
-        };
-        match value {
-            Some(value) => {
+    for change in request.header_changes() {
+        match change {
+            HeaderChange::Set(name, value) => {
+                let Ok(header_name) = HeaderName::from_bytes(name.as_bytes()) else {
+                    continue;
+                };
                 let Ok(header_value) = HeaderValue::from_str(value) else {
                     continue;
                 };
                 head.headers.insert(header_name, header_value);
             }
-            None => {
+            HeaderChange::Append(name, value) => {
+                let Ok(header_name) = HeaderName::from_bytes(name.as_bytes()) else {
+                    continue;
+                };
+                let Ok(header_value) = HeaderValue::from_str(value) else {
+                    continue;
+                };
+                head.headers.append(header_name, header_value);
+            }
+            HeaderChange::Remove(name) => {
+                let Ok(header_name) = HeaderName::from_bytes(name.as_bytes()) else {
+                    continue;
+                };
                 head.headers.remove(&header_name);
+            }
+            HeaderChange::RemovePattern(pattern) => {
+                let names = head
+                    .headers
+                    .keys()
+                    .filter(|name| header_pattern_matches(name.as_str(), pattern))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for name in names {
+                    head.headers.remove(name);
+                }
+            }
+            HeaderChange::Clear => {
+                head.headers.clear();
             }
         }
     }
     Ok(())
+}
+
+fn normalized_script_request_path(request: &ScriptRequest) -> Option<NormalizedPath> {
+    normalize_request_path(&request.path)
 }
 
 async fn send_script_response(
@@ -1598,34 +3216,93 @@ async fn send_script_response(
     response: ScriptResponse,
     head_only: bool,
     metadata: &HashMap<String, String>,
-) {
-    let status = StatusCode::from_u16(response.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    let mut headers = build_base_headers(response.body.len() as u64, "text/plain; charset=utf-8");
-    apply_metadata_response_headers(&mut headers, metadata);
+    hook_state: Option<&ResponseHookState<'_>>,
+    encode: Option<&crate::helpers::compress::EncodeState>,
+) -> H1SendOutcome {
+    let mut status = if (100..=999).contains(&response.status) {
+        response.status
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR.as_u16()
+    };
+    let mut headers = response
+        .content_type
+        .as_deref()
+        .map(|content_type| build_base_headers(response.body.len() as u64, content_type))
+        .unwrap_or_else(|| {
+            let mut headers = ::http::HeaderMap::new();
+            if let Ok(value) = ::http::HeaderValue::from_str(&response.body.len().to_string()) {
+                headers.insert(::http::header::CONTENT_LENGTH, value);
+            }
+            headers
+        });
     append_script_response_headers(&mut headers, &response.headers);
-    let _ = write_response_head(w, status, &headers).await;
-    if !head_only {
-        let _ = w.write_all(response.body).await;
+    let mut body = response.body;
+    status =
+        caddy::prepare_script_response_raw_h1_headers(status, &mut headers, metadata, hook_state)
+            .await
+            .status;
+    let send_body = raw_status_allows_body(status);
+    if !send_body {
+        strip_no_body_headers(&mut headers);
+    }
+    // Streaming response compression (Caddy `encode` handler). The body is
+    // fully buffered here, so we compress it in one shot and report the exact
+    // compressed length. On HEAD we still advertise the encoding but send no
+    // body, matching Caddy.
+    let mut encoded = false;
+    if send_body && let Some(state) = encode {
+        if let Some(chosen) = state.decide(status, &headers, Some(body.len() as u64)) {
+            if head_only {
+                crate::helpers::compress::apply_encoding_headers(&mut headers, &chosen.name);
+                encoded = true;
+            } else if let Ok(compressed) =
+                crate::helpers::compress::BodyEncoder::compress_buffer(chosen.spec, &body)
+            {
+                crate::helpers::compress::apply_encoding_headers(&mut headers, &chosen.name);
+                if let Ok(value) = ::http::HeaderValue::from_str(&compressed.len().to_string()) {
+                    headers.insert(::http::header::CONTENT_LENGTH, value);
+                }
+                body = compressed;
+                encoded = true;
+            }
+        }
+    }
+    if !encoded
+        && !headers.contains_key(::http::header::CONTENT_LENGTH)
+        && !headers.contains_key(::http::header::TRANSFER_ENCODING)
+        && send_body
+    {
+        if let Ok(value) = ::http::HeaderValue::from_str(&body.len().to_string()) {
+            headers.insert(::http::header::CONTENT_LENGTH, value);
+        }
+    }
+    let continue_conn = !response.force_close && !connection_has_close(&headers);
+    let _ = write_response_head_raw(w, status, &headers).await;
+    if !head_only && send_body && !body.is_empty() {
+        let _ = w.write_all(body).await;
     }
     let _ = w.flush().await;
+    H1SendOutcome {
+        keep_client: continue_conn,
+        status,
+    }
 }
 
 /// Append helper-provided response headers (`ScriptResponse::headers`) onto a
-/// response. `Content-Type` replaces the default; `Content-Length` is ignored
-/// (already computed); everything else is appended so repeated names such as
-/// `Set-Cookie` are all emitted.
+/// response. `Content-Type` and `Content-Length` replace the defaults;
+/// everything else is appended so repeated names such as `Set-Cookie` are all
+/// emitted.
 fn append_script_response_headers(headers: &mut ::http::HeaderMap, extra: &[(String, String)]) {
     for (name, value) in extra {
         let Ok(header_name) = HeaderName::from_bytes(name.as_bytes()) else {
             continue;
         };
-        if header_name == ::http::header::CONTENT_LENGTH {
-            continue;
-        }
         let Ok(header_value) = HeaderValue::from_str(value) else {
             continue;
         };
-        if header_name == ::http::header::CONTENT_TYPE {
+        if header_name == ::http::header::CONTENT_TYPE
+            || header_name == ::http::header::CONTENT_LENGTH
+        {
             headers.insert(header_name, header_value);
         } else {
             headers.append(header_name, header_value);
@@ -1640,8 +3317,17 @@ async fn reverse_proxy_request(
     reader: &mut h1::H1Connection<impl AsyncReadRent>,
     w: &mut impl AsyncWriteRent,
     head_only: bool,
+    peer: std::net::SocketAddr,
+    scheme: Scheme,
+    early_response_headers: Option<&::http::HeaderMap>,
     metadata: &HashMap<String, String>,
-) -> Result<bool> {
+    hook_state: Option<&ResponseHookState<'_>>,
+    proxy_method: Option<&str>,
+    proxy_uri: Option<&str>,
+    proxy_headers: Option<&::http::HeaderMap>,
+    request_body_limit: Option<usize>,
+    encode: Option<&crate::helpers::compress::EncodeState>,
+) -> Result<ProxyOutcome> {
     let target = match parse_backend_target(backend_url) {
         Ok(target) => target,
         Err(err) => {
@@ -1649,6 +3335,16 @@ async fn reverse_proxy_request(
             return Err(err);
         }
     };
+    if let Some(method) = proxy_method {
+        head.method = Method::from_bytes(method.as_bytes())
+            .map_err(|err| anyhow!("invalid proxy method override: {err}"))?;
+    }
+    let send_request_body = !matches!(proxy_method, Some("GET" | "HEAD"));
+    if let Some(uri) = proxy_uri {
+        head.uri = uri
+            .parse()
+            .map_err(|err| anyhow!("invalid proxy uri override: {err}"))?;
+    }
     let uri = match build_backend_uri(&target, &head.uri) {
         Ok(uri) => uri,
         Err(err) => {
@@ -1656,12 +3352,38 @@ async fn reverse_proxy_request(
             return Err(err);
         }
     };
+    if send_request_body && request_body_content_length_exceeds(&head.headers, request_body_limit) {
+        drain_payload(reader, &mut body).await;
+        return Ok(ProxyOutcome {
+            reuse_backend: false,
+            send: send_fixed(
+                w,
+                payload_too_large(),
+                early_response_headers,
+                metadata,
+                hook_state,
+            )
+            .await,
+            continue_request: false,
+            preserved_body: None,
+        });
+    }
 
     let is_ws_request = h1::is_websocket_upgrade_request(&head);
-
-    let mut headers = head.headers;
-    strip_hop_headers(&mut headers, is_ws_request);
-    apply_proxy_request_headers(&mut headers, &body);
+    let mut headers = proxy_headers.cloned().unwrap_or(head.headers);
+    caddy::prepare_reverse_proxy_request_headers_h1(
+        &mut headers,
+        if send_request_body {
+            &body
+        } else {
+            &h1::Body::None
+        },
+        is_ws_request,
+        peer,
+        scheme,
+        metadata,
+        hook_state,
+    );
 
     head.uri = uri;
     head.headers = headers;
@@ -1692,8 +3414,13 @@ async fn reverse_proxy_request(
                 reader,
                 w,
                 head_only,
+                early_response_headers,
                 metadata,
+                hook_state,
                 is_ws_request,
+                send_request_body,
+                request_body_limit,
+                encode,
             )
             .await?
         }
@@ -1705,8 +3432,13 @@ async fn reverse_proxy_request(
                 reader,
                 w,
                 head_only,
+                early_response_headers,
                 metadata,
+                hook_state,
                 is_ws_request,
+                send_request_body,
+                request_body_limit,
+                encode,
             )
             .await?
         }
@@ -1716,7 +3448,13 @@ async fn reverse_proxy_request(
         pool::return_connection(pool_key, conn);
     }
 
-    Ok(outcome.keep_client)
+    Ok(outcome)
+}
+
+struct H2ProxyOutcome {
+    continue_request: bool,
+    preserved_body: Option<h2::RecvStream>,
+    status: Option<u16>,
 }
 
 async fn reverse_proxy_request_h2(
@@ -1725,25 +3463,66 @@ async fn reverse_proxy_request_h2(
     body: h2::RecvStream,
     respond: &mut h2::server::SendResponse<Bytes>,
     head_only: bool,
+    peer: std::net::SocketAddr,
+    scheme: Scheme,
+    early_response_headers: Option<&::http::HeaderMap>,
     metadata: &HashMap<String, String>,
-) -> Result<()> {
+    hook_state: Option<&ResponseHookState<'_>>,
+    proxy_method: Option<&str>,
+    proxy_uri: Option<&str>,
+    proxy_headers: Option<&::http::HeaderMap>,
+    request_body_limit: Option<usize>,
+    encode: Option<&crate::helpers::compress::EncodeState>,
+) -> Result<H2ProxyOutcome> {
     let target = match parse_backend_target(backend_url) {
         Ok(target) => target,
         Err(err) => {
             return Err(err);
         }
     };
+    if let Some(method) = proxy_method {
+        head.method = Method::from_bytes(method.as_bytes())
+            .map_err(|err| anyhow!("invalid proxy method override: {err}"))?;
+    }
+    let send_request_body = !matches!(proxy_method, Some("GET" | "HEAD"));
+    if let Some(uri) = proxy_uri {
+        head.uri = uri
+            .parse()
+            .map_err(|err| anyhow!("invalid proxy uri override: {err}"))?;
+    }
     let uri = match build_backend_uri(&target, &head.uri) {
         Ok(uri) => uri,
         Err(err) => {
             return Err(err);
         }
     };
+    if send_request_body && request_body_content_length_exceeds(&head.headers, request_body_limit) {
+        let status = send_h2_response(
+            respond,
+            payload_too_large(),
+            head_only,
+            early_response_headers,
+            metadata,
+            hook_state,
+        )
+        .await?;
+        return Ok(H2ProxyOutcome {
+            continue_request: false,
+            preserved_body: None,
+            status: Some(status),
+        });
+    }
 
-    let has_body = !body.is_end_stream();
-    let mut headers = head.headers;
-    strip_hop_headers(&mut headers, false);
-    let chunked = apply_proxy_request_headers_h2(&mut headers, has_body);
+    let has_body = send_request_body && !body.is_end_stream();
+    let mut headers = proxy_headers.cloned().unwrap_or(head.headers);
+    let chunked = caddy::prepare_reverse_proxy_request_headers_h2(
+        &mut headers,
+        has_body,
+        peer,
+        scheme,
+        metadata,
+        hook_state,
+    );
 
     head.uri = uri;
     head.headers = headers;
@@ -1764,22 +3543,52 @@ async fn reverse_proxy_request_h2(
         },
     };
 
-    let reuse_backend = match &mut conn {
+    let outcome = match &mut conn {
         PooledConnection::Http(codec) => {
-            proxy_over_connection_h2(codec, head, body, respond, head_only, metadata, chunked)
-                .await?
+            proxy_over_connection_h2(
+                codec,
+                head,
+                body,
+                respond,
+                head_only,
+                early_response_headers,
+                metadata,
+                hook_state,
+                chunked,
+                send_request_body,
+                request_body_limit,
+                encode,
+            )
+            .await?
         }
         PooledConnection::Https(codec) => {
-            proxy_over_connection_h2(codec, head, body, respond, head_only, metadata, chunked)
-                .await?
+            proxy_over_connection_h2(
+                codec,
+                head,
+                body,
+                respond,
+                head_only,
+                early_response_headers,
+                metadata,
+                hook_state,
+                chunked,
+                send_request_body,
+                request_body_limit,
+                encode,
+            )
+            .await?
         }
     };
 
-    if reuse_backend {
+    if outcome.reuse_backend {
         pool::return_connection(pool_key, conn);
     }
 
-    Ok(())
+    Ok(H2ProxyOutcome {
+        continue_request: outcome.continue_request,
+        preserved_body: outcome.preserved_body,
+        status: outcome.status,
+    })
 }
 
 pub(crate) async fn connect_backend(target: &BackendTarget) -> Result<PooledConnection> {
@@ -1834,7 +3643,9 @@ async fn connect_tls(stream: TcpStream, host: &str) -> Result<BoringStream<TcpSt
 
 struct ProxyOutcome {
     reuse_backend: bool,
-    keep_client: bool,
+    send: H1SendOutcome,
+    continue_request: bool,
+    preserved_body: Option<HttpBody>,
 }
 
 async fn proxy_over_connection<IO, R>(
@@ -1844,25 +3655,52 @@ async fn proxy_over_connection<IO, R>(
     reader: &mut h1::H1Connection<R>,
     w: &mut impl AsyncWriteRent,
     head_only: bool,
+    early_response_headers: Option<&::http::HeaderMap>,
     metadata: &HashMap<String, String>,
+    hook_state: Option<&ResponseHookState<'_>>,
     is_ws_request: bool,
+    send_request_body: bool,
+    request_body_limit: Option<usize>,
+    encode: Option<&crate::helpers::compress::EncodeState>,
 ) -> Result<ProxyOutcome>
 where
     IO: AsyncReadRent + AsyncWriteRent + Split,
     R: AsyncReadRent,
 {
+    let roundtrip_start = Instant::now();
     h1::write_request_head(conn.io_mut()?, &head)
         .await
         .map_err(|err| anyhow!("failed to send proxy request head: {err}"))?;
-    forward_request_body(conn, reader, &mut body)
-        .await
-        .map_err(|err| anyhow!("failed to send proxy request body: {err}"))?;
+    if send_request_body {
+        match forward_request_body(conn, reader, &mut body, request_body_limit).await {
+            Ok(()) => {}
+            Err(ProxyRequestBodyError::TooLarge) => {
+                return Ok(ProxyOutcome {
+                    reuse_backend: false,
+                    send: send_fixed(
+                        w,
+                        payload_too_large(),
+                        early_response_headers,
+                        metadata,
+                        hook_state,
+                    )
+                    .await,
+                    continue_request: false,
+                    preserved_body: None,
+                });
+            }
+            Err(ProxyRequestBodyError::Other(err)) => {
+                return Err(anyhow!("failed to send proxy request body: {err}"));
+            }
+        }
+    }
 
     let response = match conn.next_response().await {
         Ok(Some(resp)) => resp,
         Ok(None) => return Err(anyhow!("proxy backend closed without response")),
         Err(err) => return Err(anyhow!("failed to read proxy response: {err}")),
     };
+    let upstream_latency = roundtrip_start.elapsed();
 
     let (resp_head, mut resp_body) = response.into_parts();
     let status = resp_head.status;
@@ -1875,13 +3713,28 @@ where
         strip_hop_headers(&mut headers, false);
     }
     let body_hint = resp_body.hint();
+    let fixed_content_length = if matches!(body_hint, StreamHint::Fixed) {
+        headers.get(::http::header::CONTENT_LENGTH).cloned()
+    } else {
+        None
+    };
     if resp_body.is_eof() {
         can_reuse = false;
     }
 
     if is_ws_response {
-        apply_metadata_response_headers(&mut headers, metadata);
-        write_response_head(w, status, &headers).await?;
+        let hook_outcome = caddy::prepare_reverse_proxy_raw_h1_response_headers(
+            hook_state,
+            status,
+            Some(&resp_head.status_text),
+            &mut headers,
+            upstream_latency,
+            early_response_headers,
+            metadata,
+        )
+        .await;
+        let raw_status = hook_outcome.status;
+        write_response_head_raw(w, raw_status, &headers).await?;
         let _ = w.flush().await;
 
         let (backend_io, backend_leftover) = conn
@@ -1893,14 +3746,87 @@ where
         tunnel_websocket(client_io, w, backend_io, client_leftover, backend_leftover).await?;
         return Ok(ProxyOutcome {
             reuse_backend: false,
-            keep_client: false,
+            send: H1SendOutcome {
+                keep_client: false,
+                status: raw_status,
+            },
+            continue_request: false,
+            preserved_body: None,
         });
     }
 
-    let send_body = should_send_proxy_body(status, body_hint, head_only);
-    apply_proxy_response_headers(&mut headers, body_hint, send_body);
-    apply_metadata_response_headers(&mut headers, metadata);
-    write_response_head(w, status, &headers).await?;
+    let pre_hook_send_body = should_send_proxy_body(status, body_hint, head_only);
+    apply_proxy_response_headers(&mut headers, body_hint, pre_hook_send_body);
+    let hook_outcome = caddy::prepare_reverse_proxy_raw_h1_response_headers(
+        hook_state,
+        status,
+        Some(&resp_head.status_text),
+        &mut headers,
+        upstream_latency,
+        early_response_headers,
+        metadata,
+    )
+    .await;
+    let raw_status = hook_outcome.status;
+    if hook_outcome.continue_request {
+        if !head_only {
+            drain_proxy_payload(conn, &mut resp_body).await?;
+        }
+        let _ = w.flush().await;
+        return Ok(ProxyOutcome {
+            reuse_backend: can_reuse,
+            send: H1SendOutcome {
+                keep_client: true,
+                status: raw_status,
+            },
+            continue_request: true,
+            preserved_body: if send_request_body { None } else { Some(body) },
+        });
+    }
+    if !send_request_body {
+        drain_payload(reader, &mut body).await;
+    }
+    let send_body = should_send_proxy_body_raw(raw_status, body_hint, head_only);
+    if send_body {
+        apply_proxy_response_headers(&mut headers, body_hint, send_body);
+        restore_fixed_proxy_content_length(&mut headers, body_hint, fixed_content_length.as_ref());
+        // Streaming response compression (Caddy `encode` handler). The upstream
+        // body is forwarded through a gzip/zstd encoder and re-framed as chunked
+        // since the compressed length is unknown ahead of time.
+        if !head_only && let Some(state) = encode {
+            let content_length = headers
+                .get(::http::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok());
+            if let Some(chosen) = state.decide(raw_status, &headers, content_length) {
+                forward_proxy_body_encoded(
+                    w,
+                    conn,
+                    &mut resp_body,
+                    &mut headers,
+                    raw_status,
+                    chosen,
+                    state.min_length(),
+                )
+                .await?;
+                let _ = w.flush().await;
+                return Ok(ProxyOutcome {
+                    reuse_backend: can_reuse,
+                    send: H1SendOutcome {
+                        keep_client: true,
+                        status: raw_status,
+                    },
+                    continue_request: false,
+                    preserved_body: None,
+                });
+            }
+        }
+    } else if !raw_status_allows_body(raw_status) {
+        strip_no_body_headers(&mut headers);
+    } else {
+        apply_proxy_response_headers(&mut headers, body_hint, send_body);
+    }
+    write_response_head_raw(w, raw_status, &headers).await?;
 
     if !send_body {
         if !head_only {
@@ -1909,7 +3835,12 @@ where
         let _ = w.flush().await;
         return Ok(ProxyOutcome {
             reuse_backend: can_reuse,
-            keep_client: true,
+            send: H1SendOutcome {
+                keep_client: true,
+                status: raw_status,
+            },
+            continue_request: false,
+            preserved_body: None,
         });
     }
 
@@ -1917,7 +3848,12 @@ where
     let _ = w.flush().await;
     Ok(ProxyOutcome {
         reuse_backend: can_reuse,
-        keep_client: true,
+        send: H1SendOutcome {
+            keep_client: true,
+            status: raw_status,
+        },
+        continue_request: false,
+        preserved_body: None,
     })
 }
 
@@ -1927,56 +3863,161 @@ async fn proxy_over_connection_h2<IO>(
     mut body: h2::RecvStream,
     respond: &mut h2::server::SendResponse<Bytes>,
     head_only: bool,
+    early_response_headers: Option<&::http::HeaderMap>,
     metadata: &HashMap<String, String>,
+    hook_state: Option<&ResponseHookState<'_>>,
     chunked: bool,
-) -> Result<bool>
+    send_request_body: bool,
+    request_body_limit: Option<usize>,
+    encode: Option<&crate::helpers::compress::EncodeState>,
+) -> Result<H2ProxyConnectionOutcome>
 where
     IO: AsyncReadRent + AsyncWriteRent + Split,
 {
+    let roundtrip_start = Instant::now();
     h1::write_request_head(conn.io_mut()?, &head)
         .await
         .map_err(|err| anyhow!("failed to send proxy request head: {err}"))?;
-    forward_h2_request_body(conn, &mut body, chunked)
-        .await
-        .map_err(|err| anyhow!("failed to send proxy request body: {err}"))?;
+    if send_request_body {
+        match forward_h2_request_body(conn, &mut body, chunked, request_body_limit).await {
+            Ok(()) => {}
+            Err(ProxyRequestBodyError::TooLarge) => {
+                send_h2_response(
+                    respond,
+                    payload_too_large(),
+                    head_only,
+                    early_response_headers,
+                    metadata,
+                    hook_state,
+                )
+                .await?;
+                return Ok(H2ProxyConnectionOutcome {
+                    reuse_backend: false,
+                    continue_request: false,
+                    preserved_body: None,
+                    status: Some(StatusCode::PAYLOAD_TOO_LARGE.as_u16()),
+                });
+            }
+            Err(ProxyRequestBodyError::Other(err)) => {
+                return Err(anyhow!("failed to send proxy request body: {err}"));
+            }
+        }
+    }
 
     let response = match conn.next_response().await {
         Ok(Some(resp)) => resp,
         Ok(None) => return Err(anyhow!("proxy backend closed without response")),
         Err(err) => return Err(anyhow!("failed to read proxy response: {err}")),
     };
+    let upstream_latency = roundtrip_start.elapsed();
 
     let (resp_head, mut resp_body) = response.into_parts();
-    let status = resp_head.status;
+    let mut status = resp_head.status;
     let mut can_reuse = should_reuse_proxy_connection(resp_head.version, &resp_head.headers);
     let mut headers = resp_head.headers;
     strip_hop_headers(&mut headers, false);
     let body_hint = resp_body.hint();
+    let fixed_content_length = if matches!(body_hint, StreamHint::Fixed) {
+        headers.get(::http::header::CONTENT_LENGTH).cloned()
+    } else {
+        None
+    };
     if resp_body.is_eof() {
         can_reuse = false;
     }
 
-    let send_body = should_send_proxy_body(status, body_hint, head_only);
-    apply_proxy_response_headers(&mut headers, body_hint, send_body);
+    let pre_hook_send_body = should_send_proxy_body(status, body_hint, head_only);
+    apply_proxy_response_headers(&mut headers, body_hint, pre_hook_send_body);
     headers.remove(::http::header::TRANSFER_ENCODING);
-    apply_metadata_response_headers(&mut headers, metadata);
+    let hook_outcome = caddy::prepare_reverse_proxy_response_headers(
+        hook_state,
+        status,
+        None,
+        &mut headers,
+        upstream_latency,
+        early_response_headers,
+        metadata,
+    )
+    .await;
+    status = hook_outcome.status;
+    if hook_outcome.continue_request {
+        if !head_only {
+            drain_proxy_payload(conn, &mut resp_body).await?;
+        }
+        return Ok(H2ProxyConnectionOutcome {
+            reuse_backend: can_reuse,
+            continue_request: true,
+            preserved_body: if send_request_body { None } else { Some(body) },
+            status: Some(status.as_u16()),
+        });
+    }
+    let send_body = should_send_proxy_body(status, body_hint, head_only);
+    if send_body {
+        apply_proxy_response_headers(&mut headers, body_hint, send_body);
+        restore_fixed_proxy_content_length(&mut headers, body_hint, fixed_content_length.as_ref());
+    } else if !status_allows_body(status) {
+        strip_no_body_headers(&mut headers);
+    } else {
+        apply_proxy_response_headers(&mut headers, body_hint, send_body);
+    }
+    // Streaming response compression (Caddy `encode` handler). HTTP/2 frames the
+    // body as DATA frames, so there is no Content-Length to maintain.
+    let chosen_encoding = if send_body && !head_only {
+        encode.and_then(|state| {
+            let content_length = headers
+                .get(::http::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok());
+            state
+                .decide(status.as_u16(), &headers, content_length)
+                .map(|chosen| (chosen, state.min_length()))
+        })
+    } else {
+        None
+    };
+    if let Some((chosen, _)) = &chosen_encoding {
+        crate::helpers::compress::apply_encoding_headers(&mut headers, &chosen.name);
+    }
+    headers.remove(::http::header::TRANSFER_ENCODING);
     let mut head = ::http::Response::builder()
         .status(status)
         .version(::http::Version::HTTP_2)
         .body(())
         .map_err(|err| anyhow!("failed to build h2 response: {err}"))?;
     *head.headers_mut() = headers;
-    let mut stream = respond.send_response(head, !send_body)?;
+    let end_stream = !send_body;
+    let mut stream = respond.send_response(head, end_stream)?;
 
     if !send_body {
         if !head_only {
             drain_proxy_payload(conn, &mut resp_body).await?;
         }
-        return Ok(can_reuse);
+        return Ok(H2ProxyConnectionOutcome {
+            reuse_backend: can_reuse,
+            continue_request: false,
+            preserved_body: None,
+            status: Some(status.as_u16()),
+        });
     }
 
-    forward_proxy_body_h2(&mut stream, conn, &mut resp_body).await?;
-    Ok(can_reuse)
+    if let Some((chosen, _min_length)) = chosen_encoding {
+        forward_proxy_body_h2_encoded(&mut stream, conn, &mut resp_body, chosen).await?;
+    } else {
+        forward_proxy_body_h2(&mut stream, conn, &mut resp_body).await?;
+    }
+    Ok(H2ProxyConnectionOutcome {
+        reuse_backend: can_reuse,
+        continue_request: false,
+        preserved_body: None,
+        status: Some(status.as_u16()),
+    })
+}
+
+struct H2ProxyConnectionOutcome {
+    reuse_backend: bool,
+    continue_request: bool,
+    preserved_body: Option<h2::RecvStream>,
+    status: Option<u16>,
 }
 
 fn should_reuse_proxy_connection(version: ::http::Version, headers: &::http::HeaderMap) -> bool {
@@ -1999,12 +4040,14 @@ fn connection_has_close(headers: &::http::HeaderMap) -> bool {
 }
 
 fn should_send_proxy_body(status: StatusCode, body_hint: StreamHint, head_only: bool) -> bool {
+    should_send_proxy_body_raw(status.as_u16(), body_hint, head_only)
+}
+
+fn should_send_proxy_body_raw(status: u16, body_hint: StreamHint, head_only: bool) -> bool {
     if head_only {
         return false;
     }
-    if matches!(status, StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED)
-        || status.is_informational()
-    {
+    if !raw_status_allows_body(status) {
         return false;
     }
     !matches!(body_hint, StreamHint::None)
@@ -2038,8 +4081,26 @@ fn apply_proxy_response_headers(
     }
 }
 
+fn restore_fixed_proxy_content_length(
+    headers: &mut ::http::HeaderMap,
+    body_hint: StreamHint,
+    content_length: Option<&::http::HeaderValue>,
+) {
+    if !matches!(body_hint, StreamHint::Fixed)
+        || headers.contains_key(::http::header::CONTENT_LENGTH)
+    {
+        return;
+    }
+    if let Some(value) = content_length {
+        headers.insert(::http::header::CONTENT_LENGTH, value.clone());
+    }
+}
+
 fn apply_proxy_request_headers(headers: &mut ::http::HeaderMap, body: &h1::Body) {
-    if body.is_chunked() {
+    if matches!(body.hint(), StreamHint::None) {
+        headers.remove(::http::header::CONTENT_LENGTH);
+        headers.remove(::http::header::TRANSFER_ENCODING);
+    } else if body.is_chunked() {
         headers.remove(::http::header::CONTENT_LENGTH);
         headers.insert(
             ::http::header::TRANSFER_ENCODING,
@@ -2052,6 +4113,7 @@ fn apply_proxy_request_headers(headers: &mut ::http::HeaderMap, body: &h1::Body)
 
 fn apply_proxy_request_headers_h2(headers: &mut ::http::HeaderMap, has_body: bool) -> bool {
     if !has_body {
+        headers.remove(::http::header::CONTENT_LENGTH);
         headers.remove(::http::header::TRANSFER_ENCODING);
         return false;
     }
@@ -2067,11 +4129,46 @@ fn apply_proxy_request_headers_h2(headers: &mut ::http::HeaderMap, has_body: boo
     true
 }
 
+fn request_body_content_length_exceeds(
+    headers: &::http::HeaderMap,
+    request_body_limit: Option<usize>,
+) -> bool {
+    let Some(limit) = request_body_limit else {
+        return false;
+    };
+    headers
+        .get(::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|len| len > limit as u64)
+}
+
+enum ProxyRequestBodyError {
+    TooLarge,
+    Other(anyhow::Error),
+}
+
+fn add_limited_request_body_bytes(
+    bytes_seen: &mut usize,
+    chunk_len: usize,
+    request_body_limit: Option<usize>,
+) -> Result<(), ProxyRequestBodyError> {
+    let Some(limit) = request_body_limit else {
+        return Ok(());
+    };
+    *bytes_seen = bytes_seen.saturating_add(chunk_len);
+    if *bytes_seen > limit {
+        return Err(ProxyRequestBodyError::TooLarge);
+    }
+    Ok(())
+}
+
 async fn forward_h2_request_body<IO>(
     conn: &mut h1::H1Connection<IO>,
     body: &mut h2::RecvStream,
     chunked: bool,
-) -> Result<()>
+    request_body_limit: Option<usize>,
+) -> Result<(), ProxyRequestBodyError>
 where
     IO: AsyncWriteRent,
 {
@@ -2079,26 +4176,47 @@ where
         return Ok(());
     }
 
+    let mut bytes_seen = 0usize;
     if chunked {
         while let Some(chunk) = body.data().await {
-            let chunk = chunk.map_err(|err| anyhow!("proxy request body read failed: {err}"))?;
-            h1::write_chunk(conn.io_mut()?, chunk.as_ref())
-                .await
-                .map_err(|err| anyhow!("failed to write proxy body chunk: {err}"))?;
+            let chunk = chunk.map_err(|err| {
+                ProxyRequestBodyError::Other(anyhow!("proxy request body read failed: {err}"))
+            })?;
+            add_limited_request_body_bytes(&mut bytes_seen, chunk.len(), request_body_limit)?;
+            let io = conn
+                .io_mut()
+                .map_err(|err| ProxyRequestBodyError::Other(anyhow!("{err}")))?;
+            h1::write_chunk(io, chunk.as_ref()).await.map_err(|err| {
+                ProxyRequestBodyError::Other(anyhow!("failed to write proxy body chunk: {err}"))
+            })?;
             let _ = body.flow_control().release_capacity(chunk.len());
         }
-        h1::write_chunk_end(conn.io_mut()?)
-            .await
-            .map_err(|err| anyhow!("failed to write proxy body end: {err}"))?;
+        let io = conn
+            .io_mut()
+            .map_err(|err| ProxyRequestBodyError::Other(anyhow!("{err}")))?;
+        h1::write_chunk_end(io).await.map_err(|err| {
+            ProxyRequestBodyError::Other(anyhow!("failed to write proxy body end: {err}"))
+        })?;
     } else {
         while let Some(chunk) = body.data().await {
-            let chunk = chunk.map_err(|err| anyhow!("proxy request body read failed: {err}"))?;
-            let (res, _) = conn.io_mut()?.write_all(chunk.to_vec()).await;
-            res.map_err(|err| anyhow!("failed to write proxy body: {err}"))?;
+            let chunk = chunk.map_err(|err| {
+                ProxyRequestBodyError::Other(anyhow!("proxy request body read failed: {err}"))
+            })?;
+            add_limited_request_body_bytes(&mut bytes_seen, chunk.len(), request_body_limit)?;
+            let io = conn
+                .io_mut()
+                .map_err(|err| ProxyRequestBodyError::Other(anyhow!("{err}")))?;
+            let (res, _) = io.write_all(chunk.to_vec()).await;
+            res.map_err(|err| {
+                ProxyRequestBodyError::Other(anyhow!("failed to write proxy body: {err}"))
+            })?;
             let _ = body.flow_control().release_capacity(chunk.len());
         }
     }
-    let _ = conn.io_mut()?.flush().await;
+    let io = conn
+        .io_mut()
+        .map_err(|err| ProxyRequestBodyError::Other(anyhow!("{err}")))?;
+    let _ = io.flush().await;
     Ok(())
 }
 
@@ -2125,14 +4243,57 @@ where
     Ok(())
 }
 
+/// Forward an upstream response body over HTTP/2 while applying streaming
+/// compression (Caddy `encode`). The `Content-Encoding` header has already been
+/// set on the response, so this just compresses each chunk into DATA frames and
+/// closes the stream with the encoder's trailing bytes.
+async fn forward_proxy_body_h2_encoded<IO>(
+    stream: &mut h2::SendStream<Bytes>,
+    conn: &mut h1::H1Connection<IO>,
+    body: &mut h1::Body,
+    chosen: crate::helpers::compress::ChosenEncoding,
+) -> Result<()>
+where
+    IO: AsyncReadRent,
+{
+    let mut enc = crate::helpers::compress::BodyEncoder::new(chosen.spec)
+        .map_err(|err| anyhow!("encoder init failed: {err}"))?;
+    while let Some(chunk) = body.next_data(conn).await {
+        let chunk = chunk.map_err(|err| anyhow!("proxy body read failed: {err}"))?;
+        let out = enc
+            .push(chunk.as_ref())
+            .map_err(|err| anyhow!("compression failed: {err}"))?;
+        if !out.is_empty() {
+            send_h2_data(stream, Bytes::from(out), false).await?;
+        }
+    }
+    let tail = enc
+        .finish()
+        .map_err(|err| anyhow!("compression finish failed: {err}"))?;
+    // Always send a final frame (possibly empty) to close the stream.
+    send_h2_data(stream, Bytes::from(tail), true).await?;
+    Ok(())
+}
+
 async fn write_response_head(
     w: &mut impl AsyncWriteRent,
     status: StatusCode,
     headers: &::http::HeaderMap,
 ) -> Result<()> {
-    let reason = status.canonical_reason().unwrap_or("");
+    write_response_head_raw(w, status.as_u16(), headers).await
+}
+
+async fn write_response_head_raw(
+    w: &mut impl AsyncWriteRent,
+    status: u16,
+    headers: &::http::HeaderMap,
+) -> Result<()> {
+    let reason = StatusCode::from_u16(status)
+        .ok()
+        .and_then(|status| status.canonical_reason().map(str::to_string))
+        .unwrap_or_else(|| format!("status code {status}"));
     let mut buf = Vec::new();
-    buf.extend_from_slice(format!("HTTP/1.1 {} {}\r\n", status.as_u16(), reason).as_bytes());
+    buf.extend_from_slice(format!("HTTP/1.1 {status:03} {reason}\r\n").as_bytes());
     for (name, value) in headers.iter() {
         buf.extend_from_slice(name.as_str().as_bytes());
         buf.extend_from_slice(b": ");
@@ -2149,7 +4310,8 @@ async fn forward_request_body<IO, R>(
     conn: &mut h1::H1Connection<IO>,
     reader: &mut h1::H1Connection<R>,
     body: &mut h1::Body,
-) -> Result<()>
+    request_body_limit: Option<usize>,
+) -> Result<(), ProxyRequestBodyError>
 where
     IO: AsyncWriteRent,
     R: AsyncReadRent,
@@ -2157,29 +4319,52 @@ where
     match body.hint() {
         StreamHint::None => return Ok(()),
         StreamHint::Stream if body.is_eof() => {
-            return Err(anyhow!("proxy request body missing length"));
+            return Err(ProxyRequestBodyError::Other(anyhow!(
+                "proxy request body missing length"
+            )));
         }
         _ => {}
     }
 
+    let mut bytes_seen = 0usize;
     if body.is_chunked() {
         while let Some(chunk) = body.next_data(reader).await {
-            let chunk = chunk.map_err(|err| anyhow!("proxy request body read failed: {err}"))?;
-            h1::write_chunk(conn.io_mut()?, chunk.as_ref())
-                .await
-                .map_err(|err| anyhow!("failed to write proxy body chunk: {err}"))?;
+            let chunk = chunk.map_err(|err| {
+                ProxyRequestBodyError::Other(anyhow!("proxy request body read failed: {err}"))
+            })?;
+            add_limited_request_body_bytes(&mut bytes_seen, chunk.len(), request_body_limit)?;
+            let io = conn
+                .io_mut()
+                .map_err(|err| ProxyRequestBodyError::Other(anyhow!("{err}")))?;
+            h1::write_chunk(io, chunk.as_ref()).await.map_err(|err| {
+                ProxyRequestBodyError::Other(anyhow!("failed to write proxy body chunk: {err}"))
+            })?;
         }
-        h1::write_chunk_end(conn.io_mut()?)
-            .await
-            .map_err(|err| anyhow!("failed to write proxy body end: {err}"))?;
+        let io = conn
+            .io_mut()
+            .map_err(|err| ProxyRequestBodyError::Other(anyhow!("{err}")))?;
+        h1::write_chunk_end(io).await.map_err(|err| {
+            ProxyRequestBodyError::Other(anyhow!("failed to write proxy body end: {err}"))
+        })?;
     } else {
         while let Some(chunk) = body.next_data(reader).await {
-            let chunk = chunk.map_err(|err| anyhow!("proxy request body read failed: {err}"))?;
-            let (res, _) = conn.io_mut()?.write_all(chunk.to_vec()).await;
-            res.map_err(|err| anyhow!("failed to write proxy body: {err}"))?;
+            let chunk = chunk.map_err(|err| {
+                ProxyRequestBodyError::Other(anyhow!("proxy request body read failed: {err}"))
+            })?;
+            add_limited_request_body_bytes(&mut bytes_seen, chunk.len(), request_body_limit)?;
+            let io = conn
+                .io_mut()
+                .map_err(|err| ProxyRequestBodyError::Other(anyhow!("{err}")))?;
+            let (res, _) = io.write_all(chunk.to_vec()).await;
+            res.map_err(|err| {
+                ProxyRequestBodyError::Other(anyhow!("failed to write proxy body: {err}"))
+            })?;
         }
     }
-    let _ = conn.io_mut()?.flush().await;
+    let io = conn
+        .io_mut()
+        .map_err(|err| ProxyRequestBodyError::Other(anyhow!("{err}")))?;
+    let _ = io.flush().await;
     Ok(())
 }
 
@@ -2225,6 +4410,106 @@ where
             Ok(())
         }
     }
+}
+
+/// Forward an upstream response body while applying streaming compression
+/// (Caddy `encode`). Output is HTTP/1.1 chunked since the compressed length is
+/// not known ahead of time. The response head is written here (after deciding
+/// the final framing). For unknown-length (streamed) upstreams, reads ahead up
+/// to `min_length` bytes to honor the minimum-length gate: if the whole body is
+/// at or below `min_length`, it is sent uncompressed with a fixed length.
+async fn forward_proxy_body_encoded<IO>(
+    w: &mut impl AsyncWriteRent,
+    conn: &mut h1::H1Connection<IO>,
+    body: &mut h1::Body,
+    headers: &mut ::http::HeaderMap,
+    raw_status: u16,
+    chosen: crate::helpers::compress::ChosenEncoding,
+    min_length: usize,
+) -> Result<()>
+where
+    IO: AsyncReadRent,
+{
+    use crate::helpers::compress::{BodyEncoder, apply_encoding_headers};
+
+    let streamed = matches!(body.hint(), StreamHint::Stream);
+    let mut prebuf: Vec<u8> = Vec::new();
+    if streamed {
+        // Read ahead until we exceed minimum_length or hit EOF.
+        let mut eof = false;
+        while prebuf.len() <= min_length {
+            match body.next_data(conn).await {
+                Some(chunk) => {
+                    let chunk = chunk.map_err(|err| anyhow!("proxy body read failed: {err}"))?;
+                    prebuf.extend_from_slice(chunk.as_ref());
+                }
+                None => {
+                    eof = true;
+                    break;
+                }
+            }
+        }
+        if eof && prebuf.len() <= min_length {
+            // Below the threshold: send uncompressed with a known length.
+            headers.remove(::http::header::TRANSFER_ENCODING);
+            if let Ok(value) = ::http::HeaderValue::from_str(&prebuf.len().to_string()) {
+                headers.insert(::http::header::CONTENT_LENGTH, value);
+            }
+            write_response_head_raw(w, raw_status, headers).await?;
+            if !prebuf.is_empty() {
+                let (res, _) = w.write_all(prebuf).await;
+                res.map_err(|err| anyhow!("failed to write proxy body: {err}"))?;
+            }
+            return Ok(());
+        }
+    }
+
+    // Commit to compression: chunked transfer with the encoding headers.
+    apply_encoding_headers(headers, &chosen.name);
+    headers.remove(::http::header::TRANSFER_ENCODING);
+    headers.insert(
+        ::http::header::TRANSFER_ENCODING,
+        ::http::HeaderValue::from_static("chunked"),
+    );
+    write_response_head_raw(w, raw_status, headers).await?;
+
+    let mut enc =
+        BodyEncoder::new(chosen.spec).map_err(|err| anyhow!("encoder init failed: {err}"))?;
+    if !prebuf.is_empty() {
+        let out = enc
+            .push(&prebuf)
+            .map_err(|err| anyhow!("compression failed: {err}"))?;
+        if !out.is_empty() {
+            h1::write_chunk(w, &out)
+                .await
+                .map_err(|err| anyhow!("failed to write proxy body chunk: {err}"))?;
+            let _ = w.flush().await;
+        }
+    }
+    while let Some(chunk) = body.next_data(conn).await {
+        let chunk = chunk.map_err(|err| anyhow!("proxy body read failed: {err}"))?;
+        let out = enc
+            .push(chunk.as_ref())
+            .map_err(|err| anyhow!("compression failed: {err}"))?;
+        if !out.is_empty() {
+            h1::write_chunk(w, &out)
+                .await
+                .map_err(|err| anyhow!("failed to write proxy body chunk: {err}"))?;
+            let _ = w.flush().await;
+        }
+    }
+    let tail = enc
+        .finish()
+        .map_err(|err| anyhow!("compression finish failed: {err}"))?;
+    if !tail.is_empty() {
+        h1::write_chunk(w, &tail)
+            .await
+            .map_err(|err| anyhow!("failed to write proxy body chunk: {err}"))?;
+    }
+    h1::write_chunk_end(w)
+        .await
+        .map_err(|err| anyhow!("failed to write proxy body end: {err}"))?;
+    Ok(())
 }
 
 async fn tunnel_websocket<R, IO>(
@@ -2276,13 +4561,34 @@ where
 }
 
 fn strip_hop_headers(headers: &mut ::http::HeaderMap, keep_upgrade: bool) {
+    strip_hop_headers_inner(headers, keep_upgrade, false);
+}
+
+fn strip_proxy_request_hop_headers(
+    headers: &mut ::http::HeaderMap,
+    keep_upgrade: bool,
+    preserve_te_trailers: bool,
+) {
+    strip_hop_headers_inner(headers, keep_upgrade, preserve_te_trailers);
+}
+
+fn strip_hop_headers_inner(
+    headers: &mut ::http::HeaderMap,
+    keep_upgrade: bool,
+    preserve_te_trailers: bool,
+) {
     let connection_values = headers
-        .get(::http::header::CONNECTION)
-        .and_then(|value| value.to_str().ok())
-        .map(|value| value.to_string());
-    if let Some(value) = connection_values {
+        .get_all(::http::header::CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if !connection_values.is_empty() {
         let mut saw_upgrade = false;
-        for name in value.split(',').map(|name| name.trim()) {
+        for name in connection_values
+            .iter()
+            .flat_map(|value| value.split(',').map(str::trim))
+        {
             if name.is_empty() {
                 continue;
             }
@@ -2305,9 +4611,14 @@ fn strip_hop_headers(headers: &mut ::http::HeaderMap, keep_upgrade: bool) {
         }
     }
 
+    let keep_te_trailers =
+        preserve_te_trailers && header_values_contain_token(headers, "te", "trailers");
     for name in [
+        "alt-svc",
         "connection",
         "proxy-connection",
+        "proxy-authenticate",
+        "proxy-authorization",
         "keep-alive",
         "te",
         "trailer",
@@ -2317,8 +4628,23 @@ fn strip_hop_headers(headers: &mut ::http::HeaderMap, keep_upgrade: bool) {
         if keep_upgrade && (name == "connection" || name == "upgrade") {
             continue;
         }
+        if name == "te" && keep_te_trailers {
+            headers.insert("te", ::http::HeaderValue::from_static("trailers"));
+            continue;
+        }
         headers.remove(name);
     }
+}
+
+fn header_values_contain_token(headers: &::http::HeaderMap, name: &str, token: &str) -> bool {
+    headers.get_all(name).iter().any(|value| {
+        value.to_str().ok().is_some_and(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .any(|part| part.eq_ignore_ascii_case(token))
+        })
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -2424,6 +4750,10 @@ fn bad_request() -> ::http::Response<Bytes> {
     text_response(StatusCode::BAD_REQUEST, "Bad Request")
 }
 
+fn payload_too_large() -> ::http::Response<Bytes> {
+    text_response(StatusCode::PAYLOAD_TOO_LARGE, "Request Entity Too Large")
+}
+
 fn method_not_allowed() -> ::http::Response<Bytes> {
     text_response(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed")
 }
@@ -2433,6 +4763,7 @@ fn text_response(status: StatusCode, body: &str) -> ::http::Response<Bytes> {
         .status(status)
         .header(::http::header::SERVER, crate::SERVER_HEADER)
         .header(::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(::http::header::CONTENT_LENGTH, body.len().to_string())
         .body(Bytes::copy_from_slice(body.as_bytes()))
         .unwrap()
 }
@@ -2494,6 +4825,52 @@ async fn log_request(
         .into_bytes(),
     )
     .await
+}
+
+async fn log_caddy_access(
+    shared: &Arc<SharedState>,
+    head: &RequestHead,
+    peer: std::net::SocketAddr,
+    scheme: Scheme,
+    status: u16,
+    metadata: &HashMap<String, String>,
+) {
+    if !shared.config.expose_filesystem {
+        return;
+    }
+    if metadata.get("http.vars.log_skip").is_some_and(|value| {
+        matches!(
+            value.as_str(),
+            "true" | "1" | "yes" | "on" | "True" | "TRUE"
+        )
+    }) {
+        return;
+    }
+    let Some(file) = metadata.get("zs.caddy.access_log.file") else {
+        return;
+    };
+    if file.is_empty() {
+        return;
+    }
+    let logger_name = metadata
+        .get("zs.caddy.access_log.name")
+        .map(String::as_str)
+        .unwrap_or("default");
+    let line = serde_json::json!({
+        "logger": logger_name,
+        "status": status,
+        "method": head.method.as_str(),
+        "uri": head.uri.to_string(),
+        "proto": format!("{:?}", head.version),
+        "remote_ip": peer.ip().to_string(),
+        "remote_port": peer.port(),
+        "scheme": scheme.as_str(),
+    })
+    .to_string()
+        + "\n";
+    shared
+        .file_logger
+        .write(PathBuf::from(file), line.into_bytes());
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2620,5 +4997,130 @@ fn parse_proxy_protocol_v1(
             Ok(addr)
         }
         other => Err(anyhow!("unsupported PROXY protocol family: {other}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request_head(headers: ::http::HeaderMap) -> RequestHead {
+        RequestHead {
+            method: Method::GET,
+            uri: "/".parse().unwrap(),
+            version: ::http::Version::HTTP_11,
+            headers,
+            tls: false,
+        }
+    }
+
+    #[test]
+    fn malformed_and_multi_ranges_are_ignored() {
+        for value in ["bytes=0-1,3-4", "bytes=abc-9"] {
+            let mut headers = ::http::HeaderMap::new();
+            headers.insert(::http::header::RANGE, value.parse().unwrap());
+            let head = request_head(headers);
+            let mut response_headers = ::http::HeaderMap::new();
+            let (status, range) = apply_static_range(&head, &mut response_headers, 10, "etag", 0);
+            assert_eq!(status, StatusCode::OK);
+            assert!(range.is_none());
+            assert!(!response_headers.contains_key(::http::header::CONTENT_RANGE));
+        }
+    }
+
+    #[test]
+    fn unsatisfiable_single_range_returns_416() {
+        let mut headers = ::http::HeaderMap::new();
+        headers.insert(::http::header::RANGE, "bytes=99-100".parse().unwrap());
+        let head = request_head(headers);
+        let mut response_headers = ::http::HeaderMap::new();
+        let (status, range) = apply_static_range(&head, &mut response_headers, 10, "etag", 0);
+        assert_eq!(status, StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            response_headers
+                .get(::http::header::CONTENT_RANGE)
+                .and_then(|value| value.to_str().ok()),
+            Some("bytes */10")
+        );
+        assert!(range.is_some());
+    }
+
+    #[test]
+    fn hop_headers_strip_full_standard_list() {
+        let mut headers = ::http::HeaderMap::new();
+        for name in [
+            "Alt-Svc",
+            "Connection",
+            "Proxy-Connection",
+            "Proxy-Authenticate",
+            "Proxy-Authorization",
+            "Keep-Alive",
+            "TE",
+            "Trailer",
+            "Transfer-Encoding",
+            "Upgrade",
+        ] {
+            headers.insert(
+                ::http::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                "value".parse().unwrap(),
+            );
+        }
+
+        strip_hop_headers(&mut headers, false);
+
+        for name in [
+            "alt-svc",
+            "connection",
+            "proxy-connection",
+            "proxy-authenticate",
+            "proxy-authorization",
+            "keep-alive",
+            "te",
+            "trailer",
+            "transfer-encoding",
+            "upgrade",
+        ] {
+            assert!(!headers.contains_key(name), "{name} should be stripped");
+        }
+
+        let mut headers = ::http::HeaderMap::new();
+        headers.append(::http::header::CONNECTION, "X-First".parse().unwrap());
+        headers.append(::http::header::CONNECTION, "X-Second".parse().unwrap());
+        headers.insert("x-first", "one".parse().unwrap());
+        headers.insert("x-second", "two".parse().unwrap());
+
+        strip_hop_headers(&mut headers, false);
+
+        assert!(!headers.contains_key("x-first"));
+        assert!(!headers.contains_key("x-second"));
+    }
+
+    #[test]
+    fn etag_header_value_preserves_sidecar_entity_tags() {
+        assert_eq!(etag_header_value("abc").to_str().unwrap(), "\"abc\"");
+        assert_eq!(
+            etag_header_value("\"sidecar\"").to_str().unwrap(),
+            "\"sidecar\""
+        );
+        assert_eq!(
+            etag_header_value("W/\"sidecar\"").to_str().unwrap(),
+            "W/\"sidecar\""
+        );
+    }
+
+    #[test]
+    fn empty_etags_do_not_match_empty_entity_tag_headers() {
+        let mut headers = ::http::HeaderMap::new();
+        headers.insert(::http::header::IF_NONE_MATCH, "\"\"".parse().unwrap());
+        assert!(!if_none_match_matches(&headers, ""));
+
+        headers.insert(::http::header::IF_NONE_MATCH, "*".parse().unwrap());
+        assert!(if_none_match_matches(&headers, ""));
+
+        let not_modified = not_modified_headers("", 100);
+        assert!(!not_modified.contains_key(::http::header::ETAG));
+
+        let precondition_failed = precondition_failed_headers("", 100);
+        assert!(!precondition_failed.contains_key(::http::header::ETAG));
     }
 }

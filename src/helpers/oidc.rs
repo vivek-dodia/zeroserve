@@ -77,6 +77,8 @@ fn respond(
     ctx.response = Some(ScriptResponse {
         status,
         body: body.as_bytes().to_vec(),
+        content_type: Some("text/plain; charset=utf-8".to_string()),
+        force_close: false,
         headers,
     });
 }

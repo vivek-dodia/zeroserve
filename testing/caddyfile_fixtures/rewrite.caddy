@@ -1,0 +1,6 @@
+example.com {
+	rewrite /foo /bar
+	uri strip_prefix /api
+	uri replace /a /b
+	method POST
+}

@@ -1,0 +1,29 @@
+{
+	order respond before header
+}
+
+example.com {
+	root * /srv
+	try_files {path}.html {path}/index.html =404
+	file_server /static/* {
+		browse {
+			sort namedirfirst desc
+		}
+	}
+	map {host} {tenant} {tier} {
+		example.com acme prod
+		default default dev
+	}
+	reverse_proxy /api/* http://localhost:9000 {
+		@ok status 2xx
+		header_up X-Test {host}
+		header_down +X-Down yes
+		handle_response @ok {
+			copy_response_headers {
+				include X-Upstream
+			}
+			header X-Hooked yes
+		}
+	}
+	respond ok
+}

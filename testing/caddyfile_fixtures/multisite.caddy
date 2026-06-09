@@ -1,0 +1,6 @@
+a.example.com {
+	respond "a"
+}
+b.example.com, www.b.example.com {
+	respond "b"
+}

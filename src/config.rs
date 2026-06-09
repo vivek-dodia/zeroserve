@@ -1,4 +1,4 @@
-use std::{path::PathBuf, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Result, anyhow};
 
@@ -8,6 +8,10 @@ pub struct StaticConfig {
     pub http_addr: ListenAddr,
     pub tls_addr: Option<ListenAddr>,
     pub tar_path: PathBuf,
+    /// When set (the `--caddy` flow), the site is served from this in-memory
+    /// tarball rather than read from `tar_path`. `tar_path` then points at the
+    /// source Caddyfile, only for diagnostics and landlock parent rules.
+    pub caddy_tarball: Option<Arc<Vec<u8>>>,
     pub plugin_paths: Vec<PathBuf>,
     pub cert_path: Option<PathBuf>,
     pub key_path: Option<PathBuf>,
@@ -17,6 +21,7 @@ pub struct StaticConfig {
     pub index_file: String,
     pub chunk_size: usize,
     pub try_html: bool,
+    pub expose_filesystem: bool,
     pub disable_request_logging: bool,
     pub enable_proxy_protocol: bool,
     pub disable_ns_isolation: bool,
@@ -80,14 +85,19 @@ impl TryFrom<Cli> for StaticConfig {
             cli.index
         };
 
+        // In the `--caddy` flow there is no SITE_TAR; the source Caddyfile path
+        // stands in for `tar_path` (diagnostics + landlock parent rule). The
+        // in-memory tarball itself is attached by the caller via `caddy_tarball`.
         let tar_path = cli
             .tarball
+            .or_else(|| cli.caddy.clone())
             .ok_or_else(|| anyhow!("SITE_TAR is required unless --pack or --dump-sdk is used"))?;
 
         Ok(Self {
             http_addr,
             tls_addr,
             tar_path,
+            caddy_tarball: None,
             plugin_paths: cli.plugin,
             cert_path,
             key_path,
@@ -97,6 +107,10 @@ impl TryFrom<Cli> for StaticConfig {
             index_file,
             chunk_size: cli.chunk_size.max(1024),
             try_html: cli.try_html,
+            // The `--caddy` flow serves a Caddyfile that can reference absolute
+            // host filesystem roots (e.g. `root * /var/www`), so expose-filesystem
+            // is always forced on for it (a warning is logged at startup).
+            expose_filesystem: cli.expose_filesystem || cli.caddy.is_some(),
             disable_request_logging: cli.disable_request_logging,
             enable_proxy_protocol: cli.enable_proxy_protocol,
             disable_ns_isolation: cli.disable_ns_isolation,

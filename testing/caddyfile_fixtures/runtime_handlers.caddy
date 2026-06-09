@@ -1,0 +1,58 @@
+example.com {
+	request_body {
+		max_size 4KB
+		read_timeout 2s
+		write_timeout 3s
+	}
+	push /inline.js {
+		HEAD /head.css
+		/asset.png
+		headers {
+			X-Push yes
+			+X-Trace trace
+			-X-Drop
+		}
+	}
+	encode gzip zstd {
+		minimum_length 256
+		match {
+			status 200 204
+			header Content-Type text/*
+		}
+	}
+	templates {
+		mime text/html text/plain
+		delimiters [[ ]]
+	}
+	metrics /metrics {
+		disable_openmetrics
+	}
+	log_append <tenant example
+	log_name main audit
+	skip_log /quiet/*
+	tracing {
+		span request
+		span_attributes {
+			component zeroserve
+		}
+	}
+	acme_server /.well-known/acme/* {
+		ca local
+		lifetime 24h
+		resolvers 1.1.1.1:53 8.8.8.8:53
+		challenges http-01 dns-01
+		allow_wildcard_names
+		allow {
+			domains example.com *.example.com
+			ip_ranges 10.0.0.0/8
+		}
+		deny {
+			domains bad.example
+		}
+		sign_with_root
+	}
+	basic_auth /admin/* bcrypt "Admin Area" {
+		alice $2a$14$gqs5yvNgSqb/ksrUoam91ewSE1TjpYIgCuaiuZH395DQEPsiCVIei
+	}
+	respond ok
+}

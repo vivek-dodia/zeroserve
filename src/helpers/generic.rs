@@ -287,6 +287,198 @@ pub fn h_req_query_param(
     })
 }
 
+pub fn h_req_set_method(
+    scope: &HelperScope,
+    method_ptr: u64,
+    method_len: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    let method = read_utf8(scope, method_ptr, method_len)?;
+    with_ectx(scope, |ctx| {
+        ctx.request.borrow_mut().set_method(method)?;
+        Ok(0)
+    })
+}
+
+pub fn h_req_normalized_path(
+    scope: &HelperScope,
+    out_ptr: u64,
+    out_len: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    with_ectx(scope, |ctx| {
+        let request = ctx.request.borrow();
+        let path = if request.normalized_path.is_empty() {
+            "/".to_string()
+        } else {
+            format!("/{}", request.normalized_path)
+        };
+        deref_and_write_cstr(scope, out_ptr, out_len, &path)
+    })
+}
+
+pub fn h_req_proto_major(
+    scope: &HelperScope,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    with_ectx(scope, |ctx| Ok(ctx.request.borrow().proto_major as u64))
+}
+
+pub fn h_req_proto_minor(
+    scope: &HelperScope,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    with_ectx(scope, |ctx| Ok(ctx.request.borrow().proto_minor as u64))
+}
+
+pub fn h_req_is_tls(
+    scope: &HelperScope,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    with_ectx(scope, |ctx| Ok(ctx.request.borrow().connection.tls as u64))
+}
+
+pub fn h_req_tls_handshake_complete(
+    scope: &HelperScope,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    with_ectx(scope, |ctx| {
+        Ok(ctx.request.borrow().connection.tls_handshake_complete as u64)
+    })
+}
+
+pub fn h_req_append_header(
+    scope: &HelperScope,
+    name_ptr: u64,
+    name_len: u64,
+    value_ptr: u64,
+    value_len: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    let name = read_utf8(scope, name_ptr, name_len)?;
+    let value = read_utf8(scope, value_ptr, value_len)?;
+    with_ectx(scope, |ctx| {
+        ctx.request.borrow_mut().append_header(name, value)?;
+        Ok(0)
+    })
+}
+
+pub fn h_req_delete_header(
+    scope: &HelperScope,
+    pattern_ptr: u64,
+    pattern_len: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    let pattern = read_utf8(scope, pattern_ptr, pattern_len)?;
+    with_ectx(scope, |ctx| {
+        ctx.request.borrow_mut().delete_header_pattern(pattern)?;
+        Ok(0)
+    })
+}
+
+pub fn h_req_query_param_matches(
+    scope: &HelperScope,
+    name_ptr: u64,
+    name_len: u64,
+    value_ptr: u64,
+    value_len: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    let name = read_utf8(scope, name_ptr, name_len)?;
+    let value = read_utf8(scope, value_ptr, value_len)?;
+    with_ectx(scope, |ctx| {
+        Ok(
+            if ctx.request.borrow().query_param_matches(name.trim(), value) {
+                1
+            } else {
+                0
+            },
+        )
+    })
+}
+
+pub fn h_req_body_limit(
+    scope: &HelperScope,
+    max_size: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    let max_size = usize::try_from(max_size).map_err(|_| ())?;
+    with_ectx(scope, |ctx| {
+        let content_length_exceeds = ctx
+            .request
+            .borrow()
+            .header("content-length")
+            .and_then(|value| value.parse::<u64>().ok())
+            .is_some_and(|len| len > max_size as u64);
+        ctx.body_source.set_max_size(max_size);
+        let current = ctx.request_body_limit.get();
+        if current.is_none_or(|current| max_size < current) {
+            ctx.request_body_limit.set(Some(max_size));
+        }
+        Ok(content_length_exceeds as u64)
+    })
+}
+
+pub fn h_response_pending(
+    scope: &HelperScope,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    with_ectx(scope, |ctx| Ok(ctx.response.is_some() as u64))
+}
+
+pub fn h_response_clear(
+    scope: &HelperScope,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    with_ectx(scope, |ctx| {
+        ctx.response = None;
+        Ok(0)
+    })
+}
+
+pub fn h_abort(scope: &HelperScope, _: u64, _: u64, _: u64, _: u64, _: u64) -> Result<u64, ()> {
+    with_ectx(scope, |ctx| {
+        if ctx.response_context.is_some() {
+            return Err(());
+        }
+        ctx.abort_and_clear_outputs();
+        Ok(0)
+    })
+}
+
 pub fn h_meta_get(
     scope: &HelperScope,
     key_ptr: u64,
@@ -341,6 +533,8 @@ pub fn h_respond(
         ctx.response = Some(ScriptResponse {
             status,
             body,
+            content_type: None,
+            force_close: false,
             headers: Vec::new(),
         });
         Ok(0)

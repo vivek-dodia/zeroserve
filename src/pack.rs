@@ -10,6 +10,7 @@ use tar::Builder;
 use ulid::Ulid;
 
 pub const ZEROSERVE_H: &[u8] = include_bytes!("../sdk/zeroserve.h");
+pub const ZEROSERVE_CADDY_H: &[u8] = include_bytes!("../sdk/zeroserve_caddy.h");
 
 pub fn pack_site(root: &Path) -> Result<()> {
     let meta = fs::metadata(root)
@@ -46,17 +47,19 @@ fn pack_dir(
             .file_type()
             .with_context(|| format!("failed to stat {}", entry.path().display()))?;
         let path = entry.path();
+        let rel = path
+            .strip_prefix(root)
+            .with_context(|| format!("failed to strip prefix {}", root.display()))?;
         if file_type.is_dir() {
+            builder
+                .append_dir(rel, &path)
+                .with_context(|| format!("failed to append directory {}", rel.display()))?;
             pack_dir(builder, root, &path, temp_dir, header_dir)?;
             continue;
         }
         if !file_type.is_file() {
             continue;
         }
-
-        let rel = path
-            .strip_prefix(root)
-            .with_context(|| format!("failed to strip prefix {}", root.display()))?;
 
         if is_script_c(rel) {
             let compiled = compile_script(&path, temp_dir, header_dir)?;
@@ -123,6 +126,9 @@ fn extract_header(temp_dir: &Path) -> Result<PathBuf> {
     let header_path = temp_dir.join("zeroserve.h");
     fs::write(&header_path, ZEROSERVE_H)
         .with_context(|| format!("failed to write {}", header_path.display()))?;
+    let caddy_header_path = temp_dir.join("zeroserve_caddy.h");
+    fs::write(&caddy_header_path, ZEROSERVE_CADDY_H)
+        .with_context(|| format!("failed to write {}", caddy_header_path.display()))?;
     Ok(temp_dir.to_path_buf())
 }
 

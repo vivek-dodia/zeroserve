@@ -615,6 +615,34 @@ impl<IO> BoringStream<IO> {
         self.ssl.ssl().ech_accepted()
     }
 
+    /// TLS protocol version in Caddy placeholder form (e.g. `tls1.3`).
+    pub fn caddy_tls_version(&self) -> String {
+        let name = match self.ssl.ssl().version_str() {
+            "SSLv3" => "ssl3.0",
+            "TLSv1" => "tls1.0",
+            "TLSv1.1" => "tls1.1",
+            "TLSv1.2" => "tls1.2",
+            "TLSv1.3" => "tls1.3",
+            other => return other.to_string(),
+        };
+        name.to_string()
+    }
+
+    /// RFC-standard TLS cipher suite selected for this connection, if any.
+    pub fn caddy_tls_cipher_suite(&self) -> Option<String> {
+        self.ssl.ssl().current_cipher().map(|cipher| {
+            cipher
+                .standard_name()
+                .unwrap_or_else(|| cipher.name())
+                .to_string()
+        })
+    }
+
+    /// Whether this TLS connection resumed a previous session.
+    pub fn tls_session_reused(&self) -> bool {
+        self.ssl.ssl().session_reused()
+    }
+
     /// The SNI BoringSSL is serving. When ECH was accepted this is the inner
     /// (real, protected) server name; for plain TLS it is the cleartext SNI.
     pub fn server_name(&self) -> Option<String> {

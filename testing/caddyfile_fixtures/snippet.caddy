@@ -1,0 +1,7 @@
+(common) {
+	header X-Common yes
+}
+example.com {
+	import common
+	respond "ok"
+}

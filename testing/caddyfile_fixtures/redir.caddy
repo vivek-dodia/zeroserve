@@ -1,0 +1,6 @@
+example.com {
+	redir /old /new permanent
+	redir https://example.org{uri}
+	redir /browser https://example.org/a?b=<tag> html
+	redir /auth /login 401
+}

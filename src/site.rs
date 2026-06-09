@@ -15,6 +15,7 @@ pub struct Site {
     pub tar_file: StdFile,
     pub entries: HashMap<String, Arc<TarEntry>>,
     pub directories: HashSet<String>,
+    pub directory_mtimes: HashMap<String, u64>,
     pub total_bytes: u64,
     pub total_entries: usize,
     pub rate_limit_manager: Arc<RateLimitManager>,
@@ -33,12 +34,19 @@ impl Site {
     pub fn load(path: &Path, max_rate_limit_buckets: usize) -> Result<Self> {
         let file = StdFile::open(path)
             .with_context(|| format!("failed to open tarball {}", path.display()))?;
-        let meta = file
-            .metadata()
-            .with_context(|| format!("stat failed for {}", path.display()))?;
+        Self::load_from_file(file, max_rate_limit_buckets)
+            .with_context(|| format!("failed to load tarball {}", path.display()))
+    }
+
+    /// Load a site from an already-open tarball file (e.g. an in-memory
+    /// `memfd`). The file must support positional reads for the lifetime of the
+    /// `Site`, exactly like an on-disk tarball.
+    pub fn load_from_file(file: StdFile, max_rate_limit_buckets: usize) -> Result<Self> {
+        let meta = file.metadata().context("stat failed for tarball file")?;
         let mut archive = Archive::new(file);
         let mut entries = HashMap::new();
         let mut directories = HashSet::new();
+        let mut directory_mtimes = HashMap::new();
 
         let iter = archive
             .entries()
@@ -69,7 +77,9 @@ impl Site {
                     mark_parents(&normalized, &mut directories);
                 }
                 EntryType::Directory => {
+                    let mtime = entry.header().mtime().unwrap_or(0);
                     directories.insert(normalized.clone());
+                    directory_mtimes.insert(normalized.clone(), mtime);
                     mark_parents(&normalized, &mut directories);
                 }
                 _ => {}
@@ -77,10 +87,7 @@ impl Site {
         }
 
         if entries.is_empty() {
-            bail!(
-                "tarball {} does not contain any regular files",
-                path.display()
-            );
+            bail!("tarball does not contain any regular files");
         }
 
         let total_entries = entries.len();
@@ -88,6 +95,7 @@ impl Site {
             tar_file: archive.into_inner(),
             entries,
             directories,
+            directory_mtimes,
             total_bytes: meta.len(),
             total_entries,
             rate_limit_manager: Arc::new(RateLimitManager::new(max_rate_limit_buckets)),
@@ -170,6 +178,15 @@ impl NormalizedPath {
         } else {
             format!("/{}", self.encoded_relative)
         }
+    }
+
+    /// Returns the normalized encoded path with a preserved trailing slash hint.
+    pub fn encoded_path_with_dir_hint(&self) -> String {
+        let mut path = self.encoded_path();
+        if self.dir_hint && path != "/" {
+            path.push('/');
+        }
+        path
     }
 }
 

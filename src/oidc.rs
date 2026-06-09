@@ -435,6 +435,7 @@ async fn request(
         uri,
         version: http::Version::HTTP_11,
         headers,
+        tls: matches!(target.scheme, BackendScheme::Https),
     };
 
     match connect_backend(&target).await? {

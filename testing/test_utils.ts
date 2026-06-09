@@ -24,6 +24,7 @@ export async function packSite(siteRoot: string): Promise<string> {
 export async function withZeroserve(
   tarPath: string,
   fn: (baseUrl: string) => Promise<void>,
+  extraArgs: string[] = [],
 ): Promise<void> {
   const zeroservePath = await getZeroservePath();
   const port = await getFreePort();
@@ -32,6 +33,7 @@ export async function withZeroserve(
       "--addr",
       `127.0.0.1:${port}`,
       "--disable-request-logging",
+      ...extraArgs,
       tarPath,
     ],
     cwd: repoRoot,

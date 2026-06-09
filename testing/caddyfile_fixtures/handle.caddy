@@ -1,0 +1,11 @@
+example.com {
+	handle /api/* {
+		respond "api"
+	}
+	handle_path /strip/* {
+		respond "stripped"
+	}
+	handle {
+		respond "default"
+	}
+}

@@ -1,0 +1,81 @@
+// Caddyfile block-interior grammar. Parses a token stream (a block's interior,
+// or a bare directive run) into a list of "segments" — flat token vectors that
+// each begin with a directive and run to the end of the line or the end of a
+// brace block opened on that line. This mirrors Caddy's parse.go segment rule;
+// the top-level server-block splitting and the bare-vs-braced decision are done
+// in parser.rs (they are procedural in Caddy and not context-free).
+//
+// The grammar uses an external lexer (see toks.rs): the terminals are Word,
+// Open ({), Close (}) and Nl (a line break at any nesting). A top-level Nl ends
+// a segment; an Nl inside a brace block is absorbed by `Balanced`.
+
+use crate::caddyfile::token::Token;
+use crate::caddyfile::toks::Tok;
+
+grammar;
+
+// A list of segments separated by Nl. The token stream is normalized (see
+// toks.rs) so that segments are separated by exactly one Nl, with no leading or
+// trailing Nl; this makes a new segment structurally require an Nl, which
+// resolves what would otherwise be an unbounded shift/reduce ambiguity between
+// continuing the current segment and starting a new one.
+pub Directives: Vec<Vec<Token>> = {
+    => vec![],
+    <s:Segment> => vec![s],
+    <ds:Directives> "Nl" <s:Segment> => { let mut ds = ds; ds.push(s); ds },
+};
+
+// A segment always starts with a Word (the directive name), then consumes
+// further Words and brace blocks on the same logical line.
+Segment: Vec<Token> = {
+    <first:"Word"> <rest:SegItems> => {
+        let mut v = vec![first];
+        v.extend(rest);
+        v
+    },
+};
+
+SegItems: Vec<Token> = {
+    => vec![],
+    <items:SegItems> <part:SegItem> => { let mut items = items; items.extend(part); items },
+};
+
+SegItem: Vec<Token> = {
+    <w:"Word"> => vec![w],
+    <b:Block> => b,
+};
+
+// A brace block, retained flat (including its own braces) within the segment.
+Block: Vec<Token> = {
+    <o:"Open"> <b:Balanced> <c:"Close"> => {
+        let mut v = vec![o];
+        v.extend(b);
+        v.push(c);
+        v
+    },
+};
+
+// Everything between matched braces, flattened. Newlines here are absorbed so
+// they do not end the enclosing segment.
+Balanced: Vec<Token> = {
+    => vec![],
+    <b:Balanced> <part:BalItem> => { let mut b = b; b.extend(part); b },
+};
+
+BalItem: Vec<Token> = {
+    <w:"Word"> => vec![w],
+    "Nl" => vec![],
+    <b:Block> => b,
+};
+
+extern {
+    type Location = usize;
+    type Error = String;
+
+    enum Tok {
+        "Word" => Tok::Word(<Token>),
+        "Open" => Tok::Open(<Token>),
+        "Close" => Tok::Close(<Token>),
+        "Nl" => Tok::Nl,
+    }
+}

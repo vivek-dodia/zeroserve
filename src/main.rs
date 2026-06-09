@@ -1,4 +1,8 @@
 mod boringtls;
+mod caddy_compile;
+mod caddy_file;
+mod caddy_run;
+mod caddyfile;
 mod cli;
 mod config;
 mod ech;
@@ -31,7 +35,9 @@ use crate::cli::ListenAddr;
 use anyhow::{Context, Result};
 use clap::Parser;
 use futures::channel::mpsc;
-use landlock::{Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr};
+use landlock::{
+    Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreated, RulesetCreatedAttr,
+};
 use monoio::{IoUringDriver, RuntimeBuilder};
 use nix::mount::MsFlags;
 use socket2::{Domain, Protocol, Socket, Type};
@@ -41,6 +47,7 @@ use crate::{
     cli::Cli,
     config::StaticConfig,
     hupwatch::HupWatcher,
+    logging::spawn_file_logger,
     pack::ZEROSERVE_H,
     reload::{ReloadRequest, spawn_coordinator, worker_reload_loop},
     script::{ScriptRuntime, ScriptRuntimeConfig},
@@ -53,11 +60,72 @@ use crate::{
 pub const SERVER_HEADER: &str = "zeroserve";
 pub const DEFAULT_INDEX: &str = "index.html";
 
+/// Decides whether `source` is a Caddy JSON config (vs a native Caddyfile).
+/// A filename hint takes precedence; otherwise we rely on the fact that a Caddy
+/// JSON config always parses as a JSON object whereas a Caddyfile never does
+/// (e.g. `{ http_port 80 }` is not valid JSON).
+pub(crate) fn is_caddy_json(source: &str, path: &std::path::Path) -> bool {
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    if name == "caddyfile" || name.ends_with(".caddyfile") || name.ends_with(".caddy") {
+        return false;
+    }
+    if name.ends_with(".json") {
+        return true;
+    }
+    serde_json::from_str::<serde_json::Value>(source)
+        .map(|v| v.is_object())
+        .unwrap_or(false)
+}
+
 fn main() -> Result<()> {
     let args = Cli::parse();
     if args.dump_sdk {
         let mut out = std::io::stdout().lock();
         out.write_all(ZEROSERVE_H)?;
+        out.flush()?;
+        return Ok(());
+    }
+    if let Some(caddyfile_path) = args.adapt_caddyfile.as_ref() {
+        let source = std::fs::read_to_string(caddyfile_path)
+            .with_context(|| format!("failed to read {}", caddyfile_path.display()))?;
+        let name = caddyfile_path.to_string_lossy();
+        let (json, warnings) = caddyfile::adapt_to_string(&source, &name)
+            .with_context(|| format!("failed to adapt {}", caddyfile_path.display()))?;
+        for warning in &warnings {
+            eprintln!("warning: {warning}");
+        }
+        let mut out = std::io::stdout().lock();
+        out.write_all(json.as_bytes())?;
+        out.write_all(b"\n")?;
+        out.flush()?;
+        return Ok(());
+    }
+    if let Some(config_path) = args.caddy_compile.as_ref() {
+        let source = std::fs::read_to_string(config_path)
+            .with_context(|| format!("failed to read {}", config_path.display()))?;
+        // Auto-detect: a Caddy JSON config parses as a JSON object; a native
+        // Caddyfile does not. Adapt the Caddyfile to JSON first, then compile.
+        let json_source = if is_caddy_json(&source, config_path) {
+            source
+        } else {
+            let name = config_path.to_string_lossy();
+            let (json, warnings) = caddyfile::adapt_to_string(&source, &name)
+                .with_context(|| format!("failed to adapt {}", config_path.display()))?;
+            for warning in &warnings {
+                eprintln!("warning: {warning}");
+            }
+            json
+        };
+        let (generated, warnings) = caddy_compile::compile_caddy_json_collecting(&json_source)
+            .with_context(|| format!("failed to compile {}", config_path.display()))?;
+        for warning in &warnings {
+            eprintln!("warning: {warning}");
+        }
+        let mut out = std::io::stdout().lock();
+        out.write_all(generated.as_bytes())?;
         out.flush()?;
         return Ok(());
     }
@@ -73,7 +141,29 @@ fn main() -> Result<()> {
         pack::pack_site(pack_root)?;
         return Ok(());
     }
-    let config = Arc::new(StaticConfig::try_from(args)?);
+    // The `--caddy` flow builds the entire site in memory up front, while clang
+    // and a writable filesystem are still available (before namespace isolation
+    // and landlock). The generated middleware C and the tarball stay in memfds.
+    let caddy_tarball = match args.caddy.as_ref() {
+        Some(path) => {
+            eprintln!(
+                "warning: --caddy forces expose-filesystem on; generated middleware \
+                 may read absolute host filesystem roots referenced by the Caddyfile"
+            );
+            let bytes = caddy_run::build_caddy_tarball(path)
+                .with_context(|| format!("failed to build site from {}", path.display()))?;
+            eprintln!(
+                "built in-memory caddy site from {} ({} bytes)",
+                path.display(),
+                bytes.len()
+            );
+            Some(Arc::new(bytes))
+        }
+        None => None,
+    };
+    let mut config = StaticConfig::try_from(args)?;
+    config.caddy_tarball = caddy_tarball;
+    let config = Arc::new(config);
 
     let fdlimit =
         rlimit::increase_nofile_limit(1048576).with_context(|| "failed to raise fd limit")?;
@@ -148,12 +238,15 @@ fn main() -> Result<()> {
     let sighup_blocked = SighupBlocked::new();
 
     let plugin_sites = load_plugin_sites(&config)?;
-    let site = Arc::new(Site::load(&config.tar_path, config.max_rate_limit_buckets)?);
+    let site = Arc::new(caddy_run::load_site(&config)?);
+    let site_origin = if config.caddy_tarball.is_some() {
+        format!("in-memory caddy site ({})", config.tar_path.display())
+    } else {
+        config.tar_path.display().to_string()
+    };
     eprintln!(
         "loaded {} entries from {} ({} bytes)",
-        site.total_entries,
-        config.tar_path.display(),
-        site.total_bytes
+        site.total_entries, site_origin, site.total_bytes
     );
 
     let tls_runtime = load_tls_if_configured(&config)?;
@@ -166,11 +259,13 @@ fn main() -> Result<()> {
         config.preempt_timer_interval
     );
 
+    let file_logger = spawn_file_logger().with_context(|| "failed to spawn file logger")?;
     let shared = Arc::new(SharedState::new(
         config.clone(),
         site,
         plugin_sites,
         tls_runtime,
+        file_logger,
     ));
 
     // One reload channel per worker. The coordinator stages reloads on these:
@@ -271,6 +366,7 @@ fn run_worker(
                 ScriptRuntime::new(ScriptRuntimeConfig {
                     preempt_timer_interval: config.preempt_timer_interval,
                     max_memory_footprint: config.max_request_external_memory_footprint,
+                    expose_filesystem: config.expose_filesystem,
                 })
             };
             let script_runtime = Rc::new(script_runtime);
@@ -313,33 +409,63 @@ fn load_plugin_sites(config: &StaticConfig) -> Result<Vec<Arc<Site>>> {
 
 fn setup_landlock(config: &StaticConfig) -> anyhow::Result<()> {
     let abi = landlock::ABI::V2;
-    let access_read = AccessFs::ReadFile;
     let access_all = AccessFs::from_all(abi);
 
     let mut ruleset = Ruleset::default().handle_access(access_all)?.create()?;
-    ruleset = ruleset.add_rule(PathBeneath::new(PathFd::new("/")?, access_read))?;
-
-    // The broad rule above grants ReadFile everywhere but not ReadDir. Directory
-    // based TLS and ECH configuration need enumeration on reload.
-    if let Some(cert_dir) = &config.cert_dir_path {
-        ruleset = ruleset.add_rule(PathBeneath::new(
-            PathFd::new(cert_dir)?,
-            AccessFs::ReadFile | AccessFs::ReadDir,
-        ))?;
-    }
-    if let Some(ech_path) = &config.ech_key_path {
-        let meta = std::fs::metadata(ech_path)
-            .with_context(|| format!("stat ECH key path {}", ech_path.display()))?;
-        if meta.is_dir() {
-            ruleset = ruleset.add_rule(PathBeneath::new(
-                PathFd::new(ech_path)?,
-                AccessFs::ReadFile | AccessFs::ReadDir,
-            ))?;
+    if config.expose_filesystem {
+        ruleset = ruleset.add_rule(PathBeneath::new(PathFd::new("/")?, access_all))?;
+    } else {
+        ruleset = add_landlock_read_parent(ruleset, &config.tar_path)?;
+        for plugin_path in &config.plugin_paths {
+            ruleset = add_landlock_read_parent(ruleset, plugin_path)?;
+        }
+        if let Some(path) = &config.cert_path {
+            ruleset = add_landlock_read_parent(ruleset, path)?;
+        }
+        if let Some(path) = &config.key_path {
+            ruleset = add_landlock_read_parent(ruleset, path)?;
+        }
+        if let Some(path) = &config.cert_dir_path {
+            ruleset = add_landlock_read_path(ruleset, path)?;
+        }
+        if let Some(path) = &config.ech_key_path {
+            ruleset = add_landlock_read_parent(ruleset, path)?;
+        }
+        if let Some(path) = &config.reload_signal_file {
+            ruleset = add_landlock_read_parent(ruleset, path)?;
         }
     }
 
     ruleset.restrict_self()?;
     Ok(())
+}
+
+fn add_landlock_read_path(
+    ruleset: RulesetCreated,
+    path: &std::path::Path,
+) -> anyhow::Result<RulesetCreated> {
+    let meta = std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    let access = if meta.is_dir() {
+        AccessFs::ReadFile | AccessFs::ReadDir
+    } else {
+        AccessFs::ReadFile.into()
+    };
+    ruleset
+        .add_rule(PathBeneath::new(PathFd::new(path)?, access))
+        .with_context(|| format!("allow landlock read access to {}", path.display()))
+}
+
+fn add_landlock_read_parent(
+    ruleset: RulesetCreated,
+    path: &std::path::Path,
+) -> anyhow::Result<RulesetCreated> {
+    let parent = path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    ruleset
+        .add_rule(PathBeneath::new(PathFd::new(parent)?, AccessFs::ReadFile))
+        .with_context(|| format!("allow landlock read access to parent of {}", path.display()))
 }
 
 fn setup_ns_isolation(config: &StaticConfig) -> anyhow::Result<()> {

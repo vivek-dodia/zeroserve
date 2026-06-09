@@ -1,0 +1,18 @@
+example.com {
+	@get {
+		method GET
+		path /data/*
+	}
+	respond @get "data" 200
+	@notadmin not path /admin/*
+	respond @notadmin "ok"
+	@secure tls
+	respond @secure "secure"
+	@notinline not path /a path /b
+	respond @notinline "not inline"
+	@filecombo file /a /b {
+		try_policy first_exist
+		split_path .php
+	}
+	respond @filecombo "file combo"
+}

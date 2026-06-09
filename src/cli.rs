@@ -85,6 +85,10 @@ pub struct Cli {
     #[arg(long)]
     pub try_html: bool,
 
+    /// Allow generated Caddy middleware to read from absolute host filesystem roots.
+    #[arg(long)]
+    pub expose_filesystem: bool,
+
     /// Comma-separated plugin tarballs. Scripts from plugins run before site scripts.
     #[arg(
         long,
@@ -101,6 +105,22 @@ pub struct Cli {
     /// Dump the embedded SDK header to stdout.
     #[arg(long, conflicts_with_all = ["pack", "tarball"])]
     pub dump_sdk: bool,
+
+    /// Compile a Caddy config into a zeroserve eBPF C request script on stdout.
+    /// Accepts either Caddy JSON or a native Caddyfile (auto-detected by content).
+    #[arg(long, value_name = "CONFIG", conflicts_with_all = ["pack", "tarball", "dump_sdk", "gen_ech_key", "caddy"])]
+    pub caddy_compile: Option<PathBuf>,
+
+    /// Run a Caddyfile (or Caddy JSON) directly: adapt -> compile -> in-memory
+    /// site tarball -> serve, with the generated middleware C and tarball kept
+    /// entirely in memory (memfd). Used in place of a SITE_TAR argument.
+    #[arg(long, value_name = "CADDYFILE", conflicts_with_all = ["pack", "tarball", "dump_sdk", "gen_ech_key", "caddy_compile", "adapt_caddyfile"])]
+    pub caddy: Option<PathBuf>,
+
+    /// Adapt a Caddyfile into Caddy JSON and print it to stdout (does not
+    /// compile). Useful for inspecting the adapter output.
+    #[arg(long, value_name = "CADDYFILE", conflicts_with_all = ["pack", "tarball", "dump_sdk", "gen_ech_key", "caddy_compile"])]
+    pub adapt_caddyfile: Option<PathBuf>,
 
     /// Generate a new ECH (Encrypted Client Hello) keypair and ECHConfig and
     /// print them to stdout (PEM bundle) and stderr (DNS guidance).
@@ -122,7 +142,7 @@ pub struct Cli {
     /// Path to the site tarball.
     #[arg(
         value_name = "SITE_TAR",
-        required_unless_present_any = ["pack", "dump_sdk", "gen_ech_key"],
+        required_unless_present_any = ["pack", "dump_sdk", "gen_ech_key", "caddy_compile", "adapt_caddyfile", "caddy"],
         conflicts_with = "pack"
     )]
     pub tarball: Option<PathBuf>,

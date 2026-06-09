@@ -1,14 +1,18 @@
 pub mod aws_sign;
+pub mod caddy;
 pub mod call;
+pub mod compress;
 pub mod crypto;
 pub mod encoding;
 pub mod generic;
 pub mod json;
 pub mod oidc;
 pub mod ratelimit;
+pub mod response;
 pub mod vici;
 
 pub use aws_sign::*;
+pub use caddy::*;
 pub use call::*;
 pub use crypto::*;
 pub use encoding::*;
@@ -16,4 +20,5 @@ pub use generic::*;
 pub use json::*;
 pub use oidc::*;
 pub use ratelimit::*;
+pub use response::*;
 pub use vici::*;

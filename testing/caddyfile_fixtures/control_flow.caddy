@@ -1,0 +1,27 @@
+&(shared) {
+	header X-Shared yes
+}
+
+example.com {
+	route /flow/* {
+		header X-Route yes
+		respond "flow"
+	}
+	intercept {
+		@created {
+			status 201
+			header X-Origin app*
+		}
+		replace_status @created 202
+		handle_response {
+			header X-Intercept yes
+		}
+	}
+	invoke shared
+	abort /abort
+	error /boom 418
+	handle_errors {
+		respond "error {http.error.status_code}" {http.error.status_code}
+	}
+	respond ok
+}

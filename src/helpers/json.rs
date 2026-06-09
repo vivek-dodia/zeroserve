@@ -100,6 +100,7 @@ pub fn h_load_file_metadata(
 ///
 /// Fields:
 /// - `tls`        — `true` when the request arrived over TLS.
+/// - `tls_handshake_complete` — true when TLS is complete for this request.
 /// - `alpn`       — negotiated ALPN protocol, or `null` if ALPN was not used.
 /// - `sni`        — `{ "inner": string|null, "outer": string|null }`.
 ///     - `inner` is the server name BoringSSL is serving: the real, protected
@@ -130,6 +131,7 @@ pub fn h_connection_info(
             };
             serde_json::json!({
                 "tls": conn.tls,
+                "tls_handshake_complete": conn.tls_handshake_complete,
                 "alpn": conn.alpn,
                 "sni": {
                     "inner": conn.inner_sni,
@@ -598,6 +600,7 @@ pub fn h_json_respond(
             .view(|x| serde_json::to_vec(x))
             .inspect_err(|()| ctx.error = INVALID_JSON_REF_ERROR.into())?
             .map_err(|_| ())?;
+        ctx.alloc_memory_footprint(body.len() as u64)?;
         ctx.metadata.borrow_mut().insert(
             "zs.response.header.content-type".to_string(),
             "application/json".to_string(),
@@ -605,6 +608,8 @@ pub fn h_json_respond(
         ctx.response = Some(ScriptResponse {
             status,
             body,
+            content_type: Some("application/json".to_string()),
+            force_close: false,
             headers: Vec::new(),
         });
         Ok(0)

@@ -6,7 +6,11 @@ edition = "2024"
 [profile.release]
 panic = "abort"
 
+[build-dependencies]
+lalrpop = "0.23"
+
 [dependencies]
+lalrpop-util = "0.23"
 arc-swap = "1"
 chrono = "0.4"
 async-ebpf = "0.2.2"
@@ -24,18 +28,22 @@ monoio-compat = "0.2"
 boring = "5"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
+argon2 = "0.5.3"
+bcrypt = "0.19.1"
 hmac = "0.12"
 http = "1"
+idna = "1"
 io-uring = "0.6"
 landlock = "0.4"
 libc = "0.2"
 mini-moka = { version = "0.10", default-features = false }
-nix = { version = "0.30", features = ["mount", "event"] }
+nix = { version = "0.30", features = ["mount", "event", "fs"] }
 parking_lot = "0.12"
 rand = "0.8"
 rayon = "1.11"
 rlimit = "0.10"
 scopeguard = "1"
+regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
@@ -47,6 +55,8 @@ moka = { version = "0.12", features = ["future"] }
 tar = "0.4"
 chacha20poly1305 = "0.10"
 serde_vici = "0.1.5"
+flate2 = "1.1.9"
+zstd = "0.13.3"
 
 [patch.crates-io]
 monoio = { git = "https://github.com/bytedance/monoio", rev = "212fde187f3d41f65ecd35b9cac80f7e246bb58e" }

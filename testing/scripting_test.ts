@@ -2893,3 +2893,138 @@ Deno.test({
         }
     },
 });
+
+const RESPONSE_HOOK_METADATA_SCRIPT = String.raw`#include <zeroserve.h>
+
+ZS_CALL_ENTRY(after_response, input) {
+  (void)input;
+  char phase[32];
+  phase[0] = '\0';
+  zs_meta_get(ZS_STR("phase-note"), phase, sizeof(phase));
+  if (zs_strcmp(phase, "entry") == 0) {
+    zs_meta_set(ZS_STR("zs.response.header.x-hook-saw-meta"), ZS_STR("yes"));
+  }
+  zs_meta_set(ZS_STR("phase-note"), ZS_STR("hook"));
+  zs_meta_set(ZS_STR("zs.response.header.x-hook-set"), ZS_STR("set-in-hook"));
+  return zs_json_new_object();
+}
+
+ZS_ENTRY
+zs_u64 entry(void) {
+  char path[32];
+  zs_req_path(path, sizeof(path));
+  if (zs_strcmp(path, "/hook-cleared") == 0) {
+    zs_s64 payload = zs_json_new_object();
+    zs_res_hook(ZS_STR(""), ZS_STR("after_response"), payload);
+    zs_object_free(payload);
+    zs_res_hooks_clear();
+    zs_respond(200, ZS_STR("cleared body"));
+    return 0;
+  }
+
+  if (zs_strcmp(path, "/hook-metadata") != 0)
+    return 0;
+
+  zs_meta_set(ZS_STR("phase-note"), ZS_STR("entry"));
+  zs_s64 payload = zs_json_new_object();
+  zs_res_hook(ZS_STR(""), ZS_STR("after_response"), payload);
+  zs_object_free(payload);
+  zs_respond(200, ZS_STR("hook body"));
+  return 0;
+}
+`;
+
+Deno.test({
+    name: "e2e: response hooks share metadata and metadata response headers",
+    ignore: !canRunScripts,
+    fn: async () => {
+        const siteDir = await Deno.makeTempDir();
+        let tarPath: string | null = null;
+        try {
+            await Deno.writeTextFile(join(siteDir, "index.html"), "fallback\n");
+            const scriptsDir = join(siteDir, ".zeroserve", "scripts");
+            await Deno.mkdir(scriptsDir, { recursive: true });
+            await Deno.writeTextFile(
+                join(scriptsDir, "hook-metadata.c"),
+                RESPONSE_HOOK_METADATA_SCRIPT,
+            );
+            tarPath = await packSite(siteDir);
+
+            await withZeroserve(tarPath, async (baseUrl) => {
+                const res = await fetch(`${baseUrl}/hook-metadata`);
+                assertEquals(res.status, 200);
+                assertEquals(await res.text(), "hook body");
+                assertEquals(res.headers.get("x-hook-saw-meta"), "yes");
+                assertEquals(res.headers.get("x-hook-set"), "set-in-hook");
+
+                const cleared = await fetch(`${baseUrl}/hook-cleared`);
+                assertEquals(cleared.status, 200);
+                assertEquals(await cleared.text(), "cleared body");
+                assertEquals(cleared.headers.get("x-hook-set"), null);
+            });
+        } finally {
+            if (tarPath) {
+                await Deno.remove(tarPath).catch(() => {});
+            }
+            await Deno.remove(siteDir, { recursive: true }).catch(() => {});
+        }
+    },
+});
+
+const REQ_BODY_LIMIT_REPORT_SCRIPT = String.raw`#include <zeroserve.h>
+
+ZS_ENTRY
+zs_u64 entry(void) {
+  char path[32];
+  zs_req_path(path, sizeof(path));
+  if (zs_strcmp(path, "/body-limit") != 0)
+    return 0;
+
+  if (zs_req_body_limit(8)) {
+    zs_respond(200, ZS_STR("exceeded"));
+  } else {
+    zs_respond(200, ZS_STR("ok"));
+  }
+  return 0;
+}
+`;
+
+Deno.test({
+    name: "e2e: zs_req_body_limit reports oversized content length",
+    ignore: !canRunScripts,
+    fn: async () => {
+        const siteDir = await Deno.makeTempDir();
+        let tarPath: string | null = null;
+        try {
+            await Deno.writeTextFile(join(siteDir, "index.html"), "fallback\n");
+            const scriptsDir = join(siteDir, ".zeroserve", "scripts");
+            await Deno.mkdir(scriptsDir, { recursive: true });
+            await Deno.writeTextFile(
+                join(scriptsDir, "body_limit_report.c"),
+                REQ_BODY_LIMIT_REPORT_SCRIPT,
+            );
+            tarPath = await packSite(siteDir);
+
+            await withZeroserve(tarPath, async (baseUrl) => {
+                const exceeded = await fetch(`${baseUrl}/body-limit`, {
+                    method: "POST",
+                    body: "123456789",
+                });
+                assertEquals(exceeded.status, 200);
+                assertEquals(await exceeded.text(), "exceeded");
+
+                const ok = await fetch(`${baseUrl}/body-limit`, {
+                    method: "POST",
+                    body: "12345678",
+                });
+                assertEquals(ok.status, 200);
+                assertEquals(await ok.text(), "ok");
+            });
+        } finally {
+            if (tarPath) {
+                await Deno.remove(tarPath).catch(() => {});
+            }
+            await Deno.remove(siteDir, { recursive: true }).catch(() => {});
+        }
+    },
+});

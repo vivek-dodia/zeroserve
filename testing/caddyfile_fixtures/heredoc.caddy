@@ -1,0 +1,5 @@
+example.com {
+	respond <<HTML
+	<h1>Hi</h1>
+	HTML 200
+}

@@ -1,0 +1,11 @@
+example.com {
+	map {host} {dest} {
+		example.com foo
+		~^(.*)\.example\.com$ bar
+		default baz
+	}
+	vars {
+		greeting hello
+		count 42
+	}
+}

@@ -143,11 +143,7 @@ fn perform_reload(
         ));
     }
     let site = Arc::new(
-        Site::load(
-            &shared.config.tar_path,
-            shared.config.max_rate_limit_buckets,
-        )
-        .with_context(|| "failed to reload site tarball")?,
+        crate::caddy_run::load_site(&shared.config).with_context(|| "failed to reload site")?,
     );
     let tls_result = load_tls_if_configured(&shared.config);
 
@@ -188,6 +184,7 @@ fn perform_reload(
     // Stage 2: canary succeeded — commit the shared assets, then notify the rest.
     shared.plugin_sites.store(Arc::new(plugin_sites));
     shared.site.store(site);
+    shared.file_logger.invalidate();
     match tls_result {
         Ok(runtime_opt) => {
             let tls_present = runtime_opt.is_some();

@@ -49,6 +49,154 @@ If you want the SDK header without packing:
 zeroserve --dump-sdk > zeroserve.h
 ```
 
+## Compiling Caddy configs to a script
+
+Zeroserve can compile the HTTP routing portion of a Caddy config into a
+zeroserve request script. `--caddy-compile` accepts either a Caddy JSON
+config or a native **Caddyfile** — the input format is auto-detected (a JSON
+config parses as a JSON object; anything else is treated as a Caddyfile):
+
+```bash
+zeroserve --caddy-compile caddy.json  > .zeroserve/scripts/caddy.c
+zeroserve --caddy-compile Caddyfile   > .zeroserve/scripts/caddy.c
+zeroserve --pack ./public > site.tar
+```
+
+To skip the manual pack-and-run steps, `--caddy` performs the whole pipeline
+(adapt → compile → in-memory site tarball → serve) in one shot, keeping the
+generated middleware C and the tarball entirely in memory (memfd):
+
+```bash
+zeroserve --caddy Caddyfile --addr 0.0.0.0:8080
+```
+
+### Caddyfile support
+
+When given a Caddyfile, zeroserve parses it (with an LALRPOP-based parser) and
+adapts it to Caddy JSON before compiling, reproducing the output of Caddy's own
+`caddyfile` adapter for the supported HTTP surface. Supported syntax includes:
+global options blocks, snippets and `import` (snippets and file globs with
+`{args[...]}` substitution), site addresses (scheme/host/port/path, comma lists,
+brace-less single sites), named matchers (`@name`) and inline `/path`/`*`
+matchers, heredocs, backtick/quoted strings, `{$ENV}` substitution, and
+placeholder shorthands (e.g. `{path}`, `{header.X}`).
+
+Supported directives map to the same handlers the JSON path supports: `respond`,
+`error`, `abort`, `redir`, `header`/`request_header`, `rewrite`/`uri`/`method`,
+`handle`/`handle_path`/`route`/`handle_errors`, `root`/`fs`/`vars`/`map`,
+`basic_auth`/`basicauth`, `request_body`, `file_server`, and `reverse_proxy`
+(common options). Directives
+are ordered by Caddy's canonical directive order and wrapped in terminal
+subroutes under each site's host/path matchers, exactly as Caddy does.
+
+To inspect the adapter output without compiling, use `--adapt-caddyfile`:
+
+```bash
+zeroserve --adapt-caddyfile Caddyfile   # prints Caddy JSON to stdout
+```
+
+TLS/PKI/admin/automatic-HTTPS global options are accepted but reported as
+warnings, since they live outside zeroserve's eBPF request-processing surface
+(the same surface the JSON path documents below).
+
+The generated script implements Caddy HTTP routes, matcher sets, route groups,
+terminal routes, method/query/header/header-regexp/path-regexp/file/protocol/TLS/
+remote-IP/vars/vars-regexp matchers, host matchers with Caddy-compatible IDNA
+normalization, case-folding, port stripping, and label wildcards, case-folded path matchers with ordinary
+`*` wildcards, and the Caddy handlers that map to zeroserve's script surface:
+`static_response` including placeholder-expanded status/body and `abort`,
+placeholder-expanded `vars`,
+lazy `map`, `invoke` of server `named_routes`, `headers` request and response
+add/set/delete/string/regex-replace operations including deferred response
+`require` status/header matchers. Header operations expand Caddy placeholders in
+header names/values; response `require` header matcher values are matched
+literally, as in Caddy.
+`rewrite.method`, `rewrite.uri`, `rewrite.strip_path_prefix`,
+`rewrite.strip_path_suffix`, non-regex `rewrite.uri_substring`, and
+`rewrite.path_regexp`, and `rewrite.query` rename/set/add/string/regex
+replace/delete operations, nested
+`subroute`, `file_server` over packed tar entries and, when
+`--expose-filesystem` is set, absolute host-filesystem roots (`root`, `hide`, `index_names`,
+`fs: "file"`/`fs: "default"` explicit filesystem mode,
+`browse` listings including Caddy-shaped JSON responses, `sort`, `file_limit`,
+and `reveal_symlinks`, `canonical_uris`,
+placeholder-expanded `status_code`, `pass_thru`, byte-range responses, built-in `precompressed`
+sidecars, `precompressed_order`, and `etag_file_extensions`),
+`request_body.max_size`, and single-upstream `reverse_proxy` including
+placeholder-expanded upstream dials, Caddy forwarded-header defaults,
+and upstream request method/URI/query/path rewrites, upstream response status/header
+placeholders, upstream latency placeholders, `handle_response` status replacement,
+and request-mutating `handle_response.routes` flows such as `forward_auth`;
+response-only reverse-proxy response routes, including `copy_response_headers`,
+are rejected because Caddy represents them as replacement responses and
+zeroserve intentionally does not implement Caddy response-body rewrite or
+suppression compatibility. Authentication with the Caddy `http_basic` provider
+using `bcrypt` or `argon2id` hashes is supported. For Caddy `intercept`,
+`handle_response.status_code: 0` runs matching response routes and preserves
+the generated response status; nonzero `intercept` status replacement is
+ignored to match current Caddy behavior;
+for `reverse_proxy`, `handle_response.status_code: 0` preserves the upstream
+status and takes priority over any routes, matching Caddy's distinct handler
+semantics.
+Server `errors.routes`, including grouped error routes, and
+`subroute.errors.routes` are supported for generated error responses from the
+`error` handler, including
+`http.error.status_code`, `http.error.status_text`, and `http.error.message`
+placeholders.
+The Caddy `expression` matcher is supported for the request-matcher subset that
+can be represented directly in generated middleware: boolean `&&`/`||`/`!`,
+parentheses, string equality/inequality and string-list `in`, string
+concatenation, and matcher macro calls for `method`, `path`, `path_regexp`,
+`host`, `remote_ip`, `client_ip`, `protocol`, `header`, `header_regexp`,
+`query`, `vars`, `vars_regexp`, and `file`. Full CEL evaluation, arithmetic,
+dynamic values, comprehensions, request object access, and typed numeric/bool
+placeholder comparisons are intentionally not emitted.
+Listener, TLS,
+certificate, automatic HTTPS, load balancing, HTTP/2 server push,
+observability-only handlers (`log_append`, `tracing`), response-body handlers
+(`encode`, `templates`, `copy_response`), Caddy body-inspection placeholders
+(`{http.request.body}`, `{http.request.body_base64}`,
+`{http.response.body}`, `{http.response.body_base64}`), metrics-serving handlers,
+authentication providers other than `http_basic`, ACME handlers, full CEL expression evaluation,
+body/certificate-derived placeholders, error-route `http.error.id`/`trace` placeholders,
+dynamic `client_ip` trusted-proxy IP sources, TLS early-data matching,
+request-body replacement/timeouts, reverse-proxy buffering, streaming lifetime
+controls, retries, custom upstream TLS settings, file-server
+custom browse templates, and non-default filesystem modules are intentionally
+not emitted because they require runtime features outside
+zeroserve's current eBPF-configurable surface. `reverse_proxy` with multiple
+upstreams also fails compilation, since balancing across upstreams is not
+exposed by zeroserve. Fields outside the request-processing surface, such as
+listener binding and TLS termination settings, are ignored with warnings.
+Site `log` directives with `output file <path>` are the supported exception:
+generated middleware selects the Caddy access log file and zeroserve writes JSON
+access records from a dedicated monoio/io_uring logging thread, but only when
+the server is started with `--expose-filesystem`. Without that flag, Caddy file
+logging is a no-op.
+Unsupported HTTP features fail compilation instead of silently generating
+different behavior.
+
+Configuration that lives entirely outside the eBPF request-processing surface —
+HTTP app listener defaults/shutdown timing (`http_port`, `https_port`,
+`grace_period`, `shutdown_delay`), server listener binding (`listen`,
+`listener_wrappers`, `packet_conn_wrappers`), TLS termination and certificates
+(`tls_connection_policies`, `automatic_https`, and the top-level `tls`/`pki`
+apps), connection transport tuning (`protocols`, `listen_protocols`, timeouts,
+keepalive settings, `max_header_bytes`, `enable_full_duplex`), logging outside
+supported file access logs, metrics (`metrics`), the `events` app, and a `reverse_proxy`
+`load_balancing` policy on a single-upstream proxy (where it is a no-op), plus
+reverse-proxy buffering and stream lifetime knobs —
+cannot be observed or altered by a script. The compiler prints a
+`warning: ignoring ...` line to stderr and continues, rather than failing, since
+these fields are configured elsewhere when running zeroserve. The generated
+script on stdout is unaffected, so redirecting it to a file keeps the warnings
+visible on the terminal.
+The `log_append` and `tracing` handlers are also ignored with warnings because
+they only affect Caddy's access logging/tracing pipeline, not HTTP
+request/response semantics.
+The `push` handler is ignored with warnings because it creates HTTP/2 server
+push side effects rather than modifying the eventual response.
+
 ## Running the server
 
 Command synopsis:
@@ -74,10 +222,22 @@ Key options:
 - `--gen-ech-key`: Generate a new ECH keypair and ECHConfig. Writes the PEM
   bundle to stdout and a base64 ECHConfigList to stderr. Requires
   `--ech-public-name`.
+- `--caddy-compile <CONFIG>`: Compile a Caddy config's HTTP routes into a
+  zeroserve eBPF C request script on stdout. Accepts a Caddy JSON config or a
+  native Caddyfile (auto-detected). The output can be placed under
+  `.zeroserve/scripts/` and compiled by `--pack`.
+- `--caddy <CADDYFILE>`: Run a Caddyfile (or Caddy JSON) directly — adapt,
+  compile, build an in-memory site tarball, and serve it, all in memory
+  (memfd). Used in place of the `SITE_TAR` argument.
+- `--adapt-caddyfile <CADDYFILE>`: Adapt a Caddyfile to Caddy JSON and print it
+  to stdout (without compiling), for inspecting the adapter output.
 - `--ech-public-name <NAME>`: Public DNS name to embed in a generated
   ECHConfig (used only with `--gen-ech-key`).
 - `--index <NAME>`: Default document for directories (default `index.html`).
 - `--try-html`: Try `<path>.html` when a request path is missing.
+- `--expose-filesystem`: Allow generated Caddy middleware to read absolute host
+  filesystem roots. Without this flag, Caddy `file` matchers and `file_server`
+  handlers with absolute roots do not read the host filesystem.
 - `--plugin <PLUGIN_TAR[,PLUGIN_TAR...]>`: Load scripts from one or more
   plugin tarballs before scripts from `SITE_TAR`. Plugin tarballs use the same
   layout as site tarballs; eBPF objects are read from `.zeroserve/scripts/*.o`.
@@ -553,19 +713,149 @@ Inter-script calls:
   **metadata map**, however, are shared by reference for the whole request: a
   callee's `zs_req_set_header`/`zs_req_set_uri` and `zs_meta_set` are visible to
   the caller and propagate out to the wire (including `zs.response.header.*`
-  metadata). Each callee gets its own response/reverse-proxy slot and JSON object
-  table. Calls may nest (a callee can `zs_call` again) up to a depth of 8; the
-  whole chain is torn down immediately if the client disconnects. See
+  metadata). Response hooks registered with `zs_res_hook` also share the same
+  metadata map. Each callee gets its own response/reverse-proxy slot and JSON
+  object table. Calls may nest (a callee can `zs_call` again) up to a depth of 8;
+  the whole chain is torn down immediately if the client disconnects. See
   `examples/call_gateway.c` and `examples/call_greeter.c`.
 
 Request inspection:
 
 - `zs_req_method`, `zs_req_path`, `zs_req_uri`, `zs_req_query`, `zs_req_scheme`, `zs_req_peer`
+- `zs_req_normalized_path(out, out_len)` returns the cleaned decoded request
+  path used by zeroserve static-file lookup.
+- `zs_caddy_path_regexp_subject(out, out_len)` returns the decoded, cleaned
+  request path used by Caddy `path_regexp` matching.
+- `zs_req_proto_major()` and `zs_req_proto_minor()` return the HTTP protocol
+  version numbers used by Caddy's `protocol` matcher.
+- `zs_req_is_tls()` returns `1` for TLS requests. `zs_req_tls_handshake_complete()`
+  returns `1` once TLS is complete for the current request; zeroserve currently
+  only runs middleware after TCP TLS handshakes complete.
 - `zs_req_header(name, name_len, out, out_len)`
-- `zs_req_query_param(name, name_len, out, out_len)`
+- `zs_req_query_param(name, name_len, out, out_len)` returns the first decoded
+  query value for `name`.
+- `zs_req_query_param_matches(name, name_len, value, value_len)` returns `1`
+  when any decoded query value for `name` equals `value`, or when `value` is
+  `*` and the key is present.
+- `zs_req_remote_ip_matches(ranges_json, ranges_json_len)` returns `1` when the
+  current direct peer IP matches any IP or CIDR range in the JSON string array.
+- `zs_caddy_remote_ip_matches(ranges_json, ranges_json_len)` expands each range
+  as Caddy placeholders before matching the current direct peer IP.
+- `zs_caddy_client_ip_matches(config_json, config_json_len)` resolves the Caddy
+  client IP using Caddy's server-level `client_ip_headers`,
+  `trusted_proxies_strict`, `trusted_proxies_unix`, and optional static
+  `trusted_proxies`, then matches it against configured IP/CIDR ranges. Without
+  static TCP trusted-proxy ranges, TCP requests use the direct peer IP while
+  `trusted_proxies_unix` can still trust Unix-socket peers. The matcher ranges
+  are expanded as Caddy placeholders.
+- `zs_caddy_vars_match(vars_json, vars_json_len)` returns `1` when any Caddy
+  `vars` matcher entry matches. Single-placeholder keys are resolved as
+  placeholders, literal keys read values from `zs_caddy_vars_set`, and expected
+  values are placeholder-expanded.
+- `zs_caddy_path_match(pattern, pattern_len)` returns `1` when the current
+  request path matches a Caddy path matcher pattern, including Caddy's
+  case-insensitive matching, cleaned paths, glob syntax, and escaped `%`
+  comparison behavior.
+- `zs_caddy_query_match(name_template, name_template_len, value_template,
+  value_template_len)` expands both templates as Caddy placeholders, then
+  returns `1` when the decoded query key is present with the decoded value, or
+  when the expanded value is `*` and the key is present.
+- `zs_caddy_query_present(name_template, name_template_len)` expands the key
+  template as Caddy placeholders and returns `1` when the decoded query key is
+  present.
+- `zs_caddy_query_empty()` returns `1` when Caddy's parsed query map is empty,
+  matching an empty Caddy query matcher. Malformed query strings make Caddy
+  query matchers return false, matching Go's `url.ParseQuery` path.
+- `zs_caddy_header_match(name, name_len, value_template, value_template_len)`
+  expands the allowed value template and evaluates Caddy request-header matcher
+  semantics against every repeated value for `name`.
+- `zs_caddy_header_present(name, name_len)` returns `1` when the request header
+  exists. Generated header matchers use this for Caddy's empty-array
+  present-header case and negate it for Caddy's `null` absent-header case.
+- `zs_caddy_header_regexp_match(name, name_len, config_json, config_json_len)`
+  evaluates a Caddy regex matcher config (`pattern`, optional `name`) against
+  every repeated request-header value for `name` and stores captures on success.
+- `zs_caddy_regex_match(input, input_len, config_json, config_json_len)`
+  evaluates a Caddy regex matcher config (`pattern`, optional `name`) and stores
+  numbered/named captures in metadata under `http.regexp...` keys.
+- `zs_caddy_file_match(config_json, config_json_len)` evaluates a supported
+  Caddy `file` matcher against the packed site or, when `--expose-filesystem`
+  is set, an absolute host filesystem root and stores `http.matchers.file.relative`, `.absolute`, `.type`, and
+  `.remainder` placeholders on success. If `root` is omitted, it uses
+  `http.vars.root` and falls back to the packed site root when unset, matching
+  Caddy's default. Static glob expansion is supported for packed-site roots and
+  absolute host filesystem roots; `=status` error fallbacks produce that
+  response status when reached.
+- `zs_caddy_expand(input, input_len, out, out_len)` expands supported Caddy
+  placeholders from the current request, response hook headers, shared
+  metadata, regex captures, and Caddy vars. Supported request placeholders
+  include method, scheme, host/port/hostport, host labels, local address
+  host/port, request duration, request cookies, remote address host/port including
+  `http.request.remote.host/<bits>` CIDR masks,
+  URI/path/query with escaped variants, prefixed query, path
+  file/dir/base/ext and indexed path segments, original method/URI/path/query
+  state from before request mutation, protocol/protocol name, request UUID, and
+  available TLS version, cipher suite, session resumption, ALPN/SNI/ECH state,
+  including Caddy's always-true `http.request.tls.proto_mutual` on TLS requests.
+  Caddy shutdown placeholders resolve to the inactive zeroserve state:
+  `http.shutting_down=false` and an empty `http.time_until_shutdown`.
+  Supported response placeholders include `http.response.header.*` while a
+  response hook is running. Unknown placeholders expand to an empty string.
+  Generated Caddy middleware rejects Caddy request/response body placeholders
+  at compile time instead of inspecting or rewriting body contents.
+- `zs_caddy_rewrite_uri(uri_template, uri_template_len)` expands a Caddy
+  `rewrite.uri` template against the current request metadata, then updates the
+  path, query, and fragment using Caddy's preservation rules. It is intended
+  for generated Caddy middleware.
+- `zs_caddy_respond(status_template, status_template_len, body_template,
+  body_template_len)` expands Caddy placeholders in a static response status and
+  body, applies Caddy's static-response content-type inference, and sets a
+  terminal response. It is intended for generated Caddy request middleware and
+  is not supported from response hooks.
+- `zs_caddy_respond_static(status_template, status_template_len, config_json,
+  config_json_len)` is the generated Caddy `static_response` helper. The config
+  contains the body, headers, and close flag; headers are expanded before
+  Caddy's implicit `Content-Type` decision.
+- `zs_caddy_basic_auth(config_json, config_json_len)` implements generated
+  Caddy `authentication.providers.http_basic` checks. It returns `1` when the
+  current request is authenticated, sets `{http.auth.user.id}`, and returns `0`
+  after setting Caddy 401 error metadata and `WWW-Authenticate` on failure.
+- `zs_abort()` closes the current request without writing an HTTP response. It
+  is terminal and is used for Caddy `static_response.abort`.
+- `zs_caddy_map(config_json, config_json_len)` registers a lazy Caddy map
+  provider for the current request. The config is Caddy's `map` handler JSON
+  without the `handler` field; mapped placeholders are evaluated when later
+  placeholder expansion asks for them.
+- `zs_caddy_response_headers(ops_json, ops_json_len)` applies non-deferred
+  Caddy `headers.response` operations to the current request's early response
+  header map before a downstream handler creates the response.
+- `zs_caddy_reverse_proxy_url(url_template, url_template_len, out, out_len)`
+  expands a generated reverse-proxy backend URL template, stores
+  `http.reverse_proxy.upstream.*` placeholders in metadata for subsequent
+  header operations, and writes the expanded URL to `out`. The
+  `upstream.address` and `upstream.hostport` placeholders use Caddy's dial
+  hostport form with default ports, not the full proxy URL.
+- `zs_caddy_reverse_proxy_forwarded(config_json, config_json_len)` applies
+  Caddy reverse-proxy `X-Forwarded-*` preparation, including server-level static
+  trusted proxies and handler `trusted_proxies` preservation rules. It is
+  intended for generated Caddy middleware.
+- `zs_caddy_reverse_proxy_request_headers(ops_json, ops_json_len)` applies
+  Caddy reverse-proxy request header operations to the upstream request only,
+  without mutating the live request seen by later response hooks.
+- `zs_caddy_reverse_proxy_rewrite(config_json, config_json_len)` applies a
+  supported Caddy reverse-proxy `rewrite` object to the upstream request only,
+  without mutating the live request seen by later response hooks. It is intended
+  for generated Caddy middleware.
+- `zs_file_server(config_json, config_json_len)` registers a Caddy-compatible
+  file-server response for the current request. It returns `0` when the request
+  is handled, `1` for a `pass_thru` miss, and `2` for a hard file-server error;
+  hard errors populate Caddy `http.error.*` metadata for generated error routes.
+- `zs_req_body_limit(max_size)` lowers the per-request buffered body read limit
+  and returns `1` if `Content-Length` is already larger than `max_size`.
 - `zs_req_body_json()` parses the request body as JSON and returns a handle (-1 on failure).
 - `zs_connection_info()` returns a JSON object handle describing the
-  underlying connection: `{ "tls": bool, "alpn": string|null, "sni": {
+  underlying connection: `{ "tls": bool, "tls_handshake_complete": bool,
+  "alpn": string|null, "sni": {
   "inner": string|null, "outer": string|null }, "ech": null | { "accepted":
   bool }, "fingerprint": { "ja4": string|null } }`. `sni.inner` is the real
   (protected) server name when ECH was accepted, else the cleartext SNI;
@@ -575,9 +865,31 @@ Request inspection:
 
 Request mutation:
 
+- `zs_req_set_method(method, method_len)`
+- `zs_caddy_rewrite_method(method_template, method_template_len)` expands a
+  Caddy `rewrite.method` template, uppercases it, and applies it to the current
+  request.
 - `zs_req_set_uri(uri, uri_len)`
 - `zs_req_set_header(name, name_len, value, value_len)`
   (pass `value_len = 0` to remove the header)
+- `zs_req_append_header(name, name_len, value, value_len)`
+- `zs_req_delete_header(pattern, pattern_len)` where `pattern` may be exact,
+  prefix (`Foo*`), suffix (`*Foo`), contains (`*Foo*`), or `*` to clear all
+  request headers.
+- `zs_req_replace_header(op_json, op_json_len)` applies a supported Caddy
+  header replacement object to request headers. `op_json` contains `name`,
+  `search` or `search_regexp`, and `replace`.
+- `zs_req_rewrite_query(ops_json, ops_json_len)` applies supported Caddy
+  `rewrite.query` operations (`rename`, `set`, `add`, string `replace`, and
+  `delete`) to the current request query string and re-encodes it.
+- `zs_caddy_rewrite_uri(uri_template, uri_template_len)` applies a placeholder
+  aware Caddy `rewrite.uri` template to the current request.
+- `zs_req_rewrite_uri(ops_json, ops_json_len)` applies supported Caddy URI
+  rewrite operations (`strip_path_prefix`, `strip_path_suffix`, and string
+  `uri_substring`, and `path_regexp`) to the current request URI.
+- `zs_caddy_vars_set(vars_json, vars_json_len)` stores supported Caddy `vars`
+  handler values in the per-request metadata map, expanding placeholders in
+  variable names and string values.
 
 Metadata:
 
@@ -587,12 +899,62 @@ Metadata:
 Metadata keys prefixed with `zs.response.header.` are applied as HTTP response
 headers for all responses (static files, `zs_respond`, and reverse proxy).
 Example: `zs_meta_set("zs.response.header.cache-control", ..., "no-store", ...)`.
+Response hooks can also set these metadata keys before the final response head is
+written.
+
+Response hooks:
+
+- `zs_res_hook(script, script_len, func, func_len, json_handle)` registers a
+  `ZS_CALL_ENTRY(func, input)` function to run for the current request after
+  response headers exist and before they are written. Pass an empty script name
+  to target the current script.
+- `zs_res_hooks_clear()` removes all response hooks registered so far for the
+  current request. It does not clear a direct response; use
+  `zs_response_clear()` for that.
+- In a response hook, `zs_res_status()` returns the current response status,
+  `zs_res_set_status(status)` changes the status, and `zs_res_header(name,
+  name_len, out, out_len)` reads the current response header value.
+- `zs_response_pending()` returns `1` when the current request script has
+  already produced a direct response.
+- `zs_response_clear()` clears a direct response produced by the current
+  request script.
+- In a response hook, `zs_caddy_res_header_match(name, name_len, value,
+  value_len)` and `zs_caddy_res_header_present(name, name_len)` implement Caddy
+  response-header matcher value and presence semantics across repeated headers.
+  The allowed value is matched literally with Caddy's wildcard rules; response
+  matchers do not expand placeholders.
+- In a response hook, `zs_caddy_copy_response_headers(config_json,
+  config_json_len)` copies headers from the original response header set using a
+  Caddy `copy_response_headers`-style object with optional `include` or
+  `exclude` arrays.
+- In a response hook, `zs_res_replace_header(op_json, op_json_len)` applies a
+  supported Caddy header replacement object to response headers. `op_json`
+  contains `name`, `search` or `search_regexp`, and `replace`.
+- In a response hook, `zs_res_continue_request()` suppresses the current
+  response and asks the server to rerun request middleware with the same
+  per-request metadata and request object. This is used by generated Caddy
+  middleware for non-terminal reverse-proxy `handle_response` flows such as
+  `forward_auth`.
 
 Response/proxy:
 
 - `zs_respond(status, body, body_len)`
 - `zs_json_respond(status, json)` (auto-sets Content-Type to application/json)
 - `zs_reverse_proxy(backend_url, backend_url_len)`
+- `zs_file_server(config_json, config_json_len)` serves a static file response
+  for the current request using supported Caddy file-server config JSON. A
+  relative `root` resolves against the packed site tar; an absolute `root`
+  resolves against the host filesystem only when `--expose-filesystem` is set.
+  When `root` is omitted, `http.vars.root`
+  is used with a packed-site-root fallback. Caddy placeholders are expanded in
+  `fs`, `root`, `hide`, `index_names`, and `status_code` before selecting a file. `hide`
+  entries use Caddy-style case-sensitive component/path glob matching. With
+  `{"pass_thru": true}`, it returns `1` and leaves the request runnable when no
+  file would be served; otherwise it returns `0` after selecting the
+  file-server response. File responses suppress `ETag`/`Last-Modified`
+  validators for Caddy's invalid modification times (Unix seconds `0` and
+  `1`). Browse responses include `Last-Modified`, honor `If-Modified-Since`,
+  and return Caddy's listing item array for `Accept: application/json`.
 
 Helper notes:
 
@@ -662,6 +1024,18 @@ Zeroserve will:
 - Merge the backend query string with the request query string.
 - Forward the request `Host` header unchanged; scripts may change or remove it with
   `zs_req_set_header`.
+- Fill missing `X-Forwarded-For`, `X-Forwarded-Proto`, and `X-Forwarded-Host`
+  headers for proxied requests. Generated Caddy reverse-proxy middleware applies
+  configured reverse-proxy request header operations to the upstream request
+  only, then applies Caddy's server-level and handler `trusted_proxies` rules to
+  either replace untrusted forwarded values or preserve trusted values.
+- Generated Caddy reverse-proxy middleware preserves `TE: trailers` on upstream
+  requests while stripping other hop-by-hop headers, matching Caddy's proxy
+  request preparation.
+- Populate `http.reverse_proxy.status_code`, `http.reverse_proxy.status_text`,
+  `http.reverse_proxy.header.*`, `http.reverse_proxy.upstream.latency`, and
+  `http.reverse_proxy.upstream.latency_ms` placeholders from upstream response
+  headers before response hooks run.
 
 Only `http` and `https` backends are supported.
 
@@ -707,8 +1081,10 @@ ExecStart=/usr/bin/zeroserve --addr fd:3 --tls-addr fd:4 --cert /etc/certs/cert.
 - `--disable-ns-isolation` and `--enable-netns-isolation` are Linux-specific
   isolation controls; leave them default unless you know you need them.
 - Long-running scripts are throttled; keep scripts fast and avoid busy loops.
-- Static file responses include an `ETag` based on a Blake3 hash prefix; matching
-  `If-None-Match` requests receive `304 Not Modified`.
+- Static file responses include an `ETag`; packed-site defaults use a Blake3
+  hash prefix, and Caddy file-server `etag_file_extensions` sidecars use the
+  sidecar file's entity tag value. Matching `If-None-Match` requests receive
+  `304 Not Modified`.
 
 ## Troubleshooting
 

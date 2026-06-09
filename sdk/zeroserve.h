@@ -18,6 +18,9 @@ typedef long ssize_t;
 #define ZS_SECTION(name) __attribute__((section(name)))
 #define ZS_ENTRY ZS_SECTION("zeroserve.request")
 #define ZS_INLINE __attribute__((always_inline))
+/* Marks a definition that a given generated script may legitimately not
+ * reference, suppressing clang's -Wunused-function. */
+#define ZS_MAYBE_UNUSED __attribute__((unused))
 
 /* Define a function callable from other scripts via
  * zs_call(script, ..., "<name>", ..., input). It is placed in the
@@ -125,20 +128,130 @@ extern zs_s64 zs_json_respond(zs_u64 status, zs_u64 json);
  */
 extern zs_s64 zs_call(const char *script, zs_u64 script_len, const char *func,
                       zs_u64 func_len, zs_s64 json_handle);
+/* Register a per-request response hook. The hook is a `ZS_CALL_ENTRY` function
+ * that runs after response headers exist and before they are written to the
+ * client. Pass an empty script name to target the current script. */
+extern zs_s64 zs_res_hook(const char *script, zs_u64 script_len,
+                          const char *func, zs_u64 func_len,
+                          zs_s64 json_handle);
+extern zs_s64 zs_res_hooks_clear(void);
 
 extern zs_s64 zs_req_body_json(void);
 
 extern zs_s64 zs_req_method(char *out, zs_u64 out_len);
+extern zs_s64 zs_req_set_method(const char *method, zs_u64 method_len);
+extern zs_s64 zs_caddy_rewrite_method(const char *method_template,
+                                      zs_u64 method_template_len);
 extern zs_s64 zs_req_path(char *out, zs_u64 out_len);
+extern zs_s64 zs_req_normalized_path(char *out, zs_u64 out_len);
+extern zs_s64 zs_caddy_path_regexp_subject(char *out, zs_u64 out_len);
 extern zs_s64 zs_req_uri(char *out, zs_u64 out_len);
 extern zs_s64 zs_req_set_uri(const char *uri, zs_u64 uri_len);
 extern zs_s64 zs_req_query(char *out, zs_u64 out_len);
+extern zs_s64 zs_caddy_rewrite_uri(const char *uri_template,
+                                   zs_u64 uri_template_len);
+extern zs_s64 zs_req_rewrite_uri(const char *ops_json, zs_u64 ops_json_len);
+extern zs_s64 zs_req_rewrite_query(const char *ops_json, zs_u64 ops_json_len);
 extern zs_s64 zs_req_scheme(char *out, zs_u64 out_len);
+extern zs_s64 zs_req_proto_major(void);
+extern zs_s64 zs_req_proto_minor(void);
 extern zs_s64 zs_req_peer(char *out, zs_u64 out_len);
+extern zs_s64 zs_req_is_tls(void);
+extern zs_s64 zs_req_tls_handshake_complete(void);
+extern zs_s64 zs_req_remote_ip_matches(const char *ranges_json,
+                                       zs_u64 ranges_json_len);
+extern zs_s64 zs_caddy_remote_ip_matches(const char *ranges_json,
+                                         zs_u64 ranges_json_len);
+extern zs_s64 zs_caddy_client_ip_matches(const char *config_json,
+                                         zs_u64 config_json_len);
+extern zs_s64 zs_caddy_vars_set(const char *vars_json, zs_u64 vars_json_len);
+extern zs_s64 zs_caddy_vars_match(const char *vars_json, zs_u64 vars_json_len);
+extern zs_s64 zs_caddy_vars_match_expanded_keys(const char *vars_json,
+                                                zs_u64 vars_json_len);
+extern zs_s64 zs_caddy_vars_regexp_match(const char *vars_json,
+                                         zs_u64 vars_json_len);
+extern zs_s64 zs_caddy_vars_regexp_match_expanded_keys(
+    const char *vars_json, zs_u64 vars_json_len);
+extern zs_s64 zs_caddy_map(const char *config_json, zs_u64 config_json_len);
+extern zs_s64 zs_caddy_response_headers(const char *ops_json,
+                                        zs_u64 ops_json_len);
+/* Enable Caddy-compatible streaming response compression (the `encode`
+ * handler). `config_json` is the normalized encode config (encodings, prefer,
+ * minimum_length, match). The runtime negotiates the encoding from the
+ * request's Accept-Encoding and compresses the response body. */
+extern zs_s64 zs_caddy_encode(const char *config_json, zs_u64 config_json_len);
+extern zs_s64 zs_caddy_path_match(const char *pattern, zs_u64 pattern_len);
+extern zs_s64 zs_caddy_query_match(const char *name_template,
+                                   zs_u64 name_template_len,
+                                   const char *value_template,
+                                   zs_u64 value_template_len);
+extern zs_s64 zs_caddy_query_present(const char *name_template,
+                                     zs_u64 name_template_len);
+extern zs_s64 zs_caddy_query_empty(void);
+extern zs_s64 zs_caddy_header_match(const char *name, zs_u64 name_len,
+                                    const char *value_template,
+                                    zs_u64 value_template_len);
+extern zs_s64 zs_caddy_header_match_expanded(const char *name,
+                                             zs_u64 name_len,
+                                             const char *value_template,
+                                             zs_u64 value_template_len);
+extern zs_s64 zs_caddy_header_present(const char *name, zs_u64 name_len);
+extern zs_s64 zs_caddy_header_present_expanded(const char *name,
+                                               zs_u64 name_len);
+extern zs_s64 zs_caddy_header_regexp_match(const char *name, zs_u64 name_len,
+                                           const char *config_json,
+                                           zs_u64 config_json_len);
+extern zs_s64 zs_caddy_header_regexp_match_expanded(
+    const char *name, zs_u64 name_len, const char *config_json,
+    zs_u64 config_json_len);
+extern zs_s64 zs_caddy_req_header_first_prefix(const char *name,
+                                               zs_u64 name_len,
+                                               const char *prefix,
+                                               zs_u64 prefix_len);
+extern zs_s64 zs_caddy_regex_match(const char *input, zs_u64 input_len,
+                                   const char *config_json,
+                                   zs_u64 config_json_len);
+extern zs_s64 zs_caddy_expr_in(const char *input_template,
+                               zs_u64 input_template_len,
+                               const char *values_json, zs_u64 values_json_len);
+extern zs_s64 zs_caddy_expr_eq(const char *left_template,
+                               zs_u64 left_template_len,
+                               const char *right_template,
+                               zs_u64 right_template_len);
+extern zs_s64 zs_caddy_file_match(const char *config_json,
+                                  zs_u64 config_json_len);
+extern zs_s64 zs_caddy_expand(const char *input, zs_u64 input_len, char *out,
+                              zs_u64 out_len);
+extern zs_s64 zs_caddy_expand_known(const char *input, zs_u64 input_len,
+                                    char *out, zs_u64 out_len);
+extern zs_s64 zs_caddy_respond(const char *status_template,
+                               zs_u64 status_template_len,
+                               const char *body_template,
+                               zs_u64 body_template_len);
+extern zs_s64 zs_caddy_respond_static(const char *status_template,
+                                      zs_u64 status_template_len,
+                                      const char *config_json,
+                                      zs_u64 config_json_len);
+extern zs_s64 zs_caddy_set_error(const char *status_template,
+                                 zs_u64 status_template_len,
+                                 const char *message_template,
+                                 zs_u64 message_template_len);
+extern zs_s64 zs_caddy_basic_auth(const char *config_json,
+                                  zs_u64 config_json_len);
+extern zs_s64 zs_caddy_reverse_proxy_url(const char *url_template,
+                                         zs_u64 url_template_len, char *out,
+                                         zs_u64 out_len);
+extern zs_s64 zs_caddy_reverse_proxy_forwarded(const char *config_json,
+                                               zs_u64 config_json_len);
+extern zs_s64 zs_caddy_reverse_proxy_request_headers(const char *ops_json,
+                                                     zs_u64 ops_json_len);
+extern zs_s64 zs_caddy_reverse_proxy_rewrite(const char *config_json,
+                                             zs_u64 config_json_len);
 
 /* Return a JSON object handle describing the current connection's transport
  * state. Free with zs_object_free. The object has fields:
  *   "tls"     (bool)         - true if served over TLS
+ *   "tls_handshake_complete" (bool) - true if TLS is complete
  *   "alpn"    (string|null)  - negotiated ALPN, e.g. "h2" / "http/1.1"
  *   "sni"     (object)       - { "inner": string|null, "outer": string|null }
  *   "ech"     (object|null)  - null when the server has no ECH keys loaded;
@@ -166,17 +279,45 @@ extern zs_s64 zs_req_header(const char *name, zs_u64 name_len, char *out,
                             zs_u64 out_len);
 extern zs_s64 zs_req_set_header(const char *name, zs_u64 name_len,
                                 const char *value, zs_u64 value_len);
+extern zs_s64 zs_req_append_header(const char *name, zs_u64 name_len,
+                                   const char *value, zs_u64 value_len);
+extern zs_s64 zs_req_delete_header(const char *pattern, zs_u64 pattern_len);
+extern zs_s64 zs_req_replace_header(const char *op_json, zs_u64 op_json_len);
 extern zs_s64 zs_req_query_param(const char *name, zs_u64 name_len, char *out,
                                  zs_u64 out_len);
+extern zs_s64 zs_req_query_param_matches(const char *name, zs_u64 name_len,
+                                         const char *value, zs_u64 value_len);
+extern zs_s64 zs_req_body_limit(zs_u64 max_size);
 
 extern zs_s64 zs_meta_get(const char *key, zs_u64 key_len, char *out,
                           zs_u64 out_len);
 extern zs_s64 zs_meta_set(const char *key, zs_u64 key_len, const char *value,
                           zs_u64 value_len);
+extern zs_s64 zs_res_replace_header(const char *op_json, zs_u64 op_json_len);
+extern zs_s64 zs_res_status(void);
+extern zs_s64 zs_res_set_status(zs_u64 status);
+extern zs_s64 zs_res_header(const char *name, zs_u64 name_len, char *out,
+                            zs_u64 out_len);
+extern zs_s64 zs_res_continue_request(void);
+extern zs_s64 zs_caddy_res_header_match(const char *name, zs_u64 name_len,
+                                        const char *value, zs_u64 value_len);
+extern zs_s64 zs_caddy_res_header_present(const char *name, zs_u64 name_len);
+extern zs_s64 zs_caddy_copy_response_headers(const char *config_json,
+                                             zs_u64 config_json_len);
+extern zs_s64 zs_response_pending(void);
+extern zs_s64 zs_response_clear(void);
 
+/* Close the current request without writing any HTTP response. Terminal. */
+extern zs_s64 zs_abort(void);
 extern zs_s64 zs_respond(zs_u64 status, const void *body, zs_u64 body_len);
 
 extern zs_s64 zs_reverse_proxy(const char *backend_url, zs_u64 backend_url_len);
+/* Caddy-compatible file server helper. Returns:
+ *   0 = handled current request
+ *   1 = pass_thru miss; continue to the next handler
+ *   2 = hard file-server error; Caddy error metadata has been populated
+ */
+extern zs_s64 zs_file_server(const char *config_json, zs_u64 config_json_len);
 
 /* AWS SigV4 signing */
 

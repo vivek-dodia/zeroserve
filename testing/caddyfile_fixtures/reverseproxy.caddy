@@ -1,0 +1,15 @@
+example.com {
+	reverse_proxy localhost:8080 localhost:8081 {
+		header_up Host {host}
+		header_down -Server
+		lb_policy round_robin
+	}
+	forward_auth /private/* auth-gateway:9091 {
+		uri /authenticate?redirect=https://auth.example.com
+		copy_headers Remote-User Remote-Email>X-User
+	}
+	php_fastcgi localhost:9000 {
+		root /srv/app
+		env FOO bar
+	}
+}

@@ -1,0 +1,8 @@
+example.com {
+	root * /var/www
+	fs file
+	file_server {
+		index index.html
+		hide .git
+	}
+}
