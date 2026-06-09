@@ -13,7 +13,10 @@ import {
 
 const decoder = new TextDecoder();
 const canRunScripts = await hasBpfToolchain();
-const canRunCaddy = await hasCommand("caddy");
+// The Caddy binary to compare against. Override with CADDY_BIN to pin a
+// specific build (CI pins a known-good commit; see .github/workflows/ci.yml).
+const caddyBin = Deno.env.get("CADDY_BIN") ?? "caddy";
+const canRunCaddy = await hasCommand(caddyBin);
 
 type Probe = {
   path: string;
@@ -2536,6 +2539,124 @@ http://bar.localhost:${caddyPort} {
         },
       ],
     });
+
+    // Single byte-range and 416 semantics, matched against Go's
+    // net/http.ServeContent (which Caddy's file server delegates to). The ETag
+    // value itself is intentionally not compared: zeroserve derives tarball
+    // ETags from content, while Caddy derives them from mtime+size.
+    {
+      const rangeHeaders = [
+        "content-range",
+        "content-length",
+        "content-type",
+        "accept-ranges",
+        "x-content-type-options",
+      ];
+      await compareGeneratedCaddyfile({
+        name: "Caddy file_server single byte-range semantics",
+        files: {
+          "asset.txt": "0123456789abcdefghijKLMNOPQRST", // 30 bytes
+          "empty.txt": "",
+        },
+        site: `
+  root * .
+  file_server
+`,
+        probes: [
+          { path: "/asset.txt", headers: { Range: "bytes=0-9" }, compareHeaders: rangeHeaders },
+          { path: "/asset.txt", headers: { Range: "bytes=5-" }, compareHeaders: rangeHeaders },
+          { path: "/asset.txt", headers: { Range: "bytes=-5" }, compareHeaders: rangeHeaders },
+          { path: "/asset.txt", headers: { Range: "bytes=-0" }, compareHeaders: rangeHeaders },
+          { path: "/asset.txt", headers: { Range: "bytes=-100" }, compareHeaders: rangeHeaders },
+          { path: "/asset.txt", headers: { Range: "bytes=20-100" }, compareHeaders: rangeHeaders },
+          { path: "/asset.txt", headers: { Range: "bytes=0-0" }, compareHeaders: rangeHeaders },
+          { path: "/asset.txt", headers: { Range: "bytes=0-29" }, compareHeaders: rangeHeaders },
+          // Unsatisfiable: start at/after EOF -> 416 with "bytes */N".
+          { path: "/asset.txt", headers: { Range: "bytes=30-" }, compareHeaders: rangeHeaders },
+          { path: "/asset.txt", headers: { Range: "bytes=40-50" }, compareHeaders: rangeHeaders },
+          // Malformed: 416 "invalid range" with no Content-Range.
+          { path: "/asset.txt", headers: { Range: "bytes=5-3" }, compareHeaders: rangeHeaders },
+          { path: "/asset.txt", headers: { Range: "bytes=abc" }, compareHeaders: rangeHeaders },
+          { path: "/asset.txt", headers: { Range: "items=0-4" }, compareHeaders: rangeHeaders },
+          { path: "/asset.txt", headers: { Range: "bytes=-" }, compareHeaders: rangeHeaders },
+          // Empty spec is ignored -> full 200.
+          { path: "/asset.txt", headers: { Range: "bytes=" }, compareHeaders: rangeHeaders },
+          // Comma lists that reduce to a single satisfiable range.
+          { path: "/asset.txt", headers: { Range: "bytes=0-4," }, compareHeaders: rangeHeaders },
+          { path: "/asset.txt", headers: { Range: "bytes=,0-4" }, compareHeaders: rangeHeaders },
+          { path: "/asset.txt", headers: { Range: "bytes=0-4,40-50" }, compareHeaders: rangeHeaders },
+          // Empty file: explicit range ignored (200), suffix yields empty 206.
+          { path: "/empty.txt", headers: { Range: "bytes=0-9" }, compareHeaders: rangeHeaders },
+          { path: "/empty.txt", headers: { Range: "bytes=-5" }, compareHeaders: rangeHeaders },
+          {
+            path: "/asset.txt",
+            method: "HEAD",
+            headers: { Range: "bytes=0-9" },
+            compareHeaders: rangeHeaders,
+            compareBody: false,
+          },
+        ],
+      });
+
+      // Conditional request semantics (If-Match / If-None-Match /
+      // If-Modified-Since / If-Unmodified-Since / If-Range). Probes avoid
+      // depending on the ETag value (only `*` and a deliberately-wrong tag are
+      // used); date probes deliberately carry an incorrect weekday to confirm
+      // zeroserve, like Go, ignores the weekday rather than rejecting the date.
+      await compareGeneratedCaddyfile({
+        name: "Caddy file_server conditional request semantics",
+        files: {
+          "asset.txt": "0123456789abcdefghijKLMNOPQRST",
+        },
+        site: `
+  root * .
+  file_server
+`,
+        probes: [
+          // 304: no Content-Type/Content-Length, and no Last-Modified (ETag wins).
+          {
+            path: "/asset.txt",
+            headers: { "If-None-Match": "*" },
+            compareHeaders: ["content-type", "content-length", "last-modified"],
+          },
+          { path: "/asset.txt", headers: { "If-None-Match": `"nope"` } },
+          {
+            path: "/asset.txt",
+            headers: { "If-Modified-Since": "Mon, 21 Oct 2099 07:28:00 GMT" },
+            compareHeaders: ["content-type", "content-length", "last-modified"],
+          },
+          { path: "/asset.txt", headers: { "If-Modified-Since": "Mon, 21 Oct 1995 07:28:00 GMT" } },
+          // 412 keeps Content-Type and Last-Modified (Go reaches it via a bare
+          // WriteHeader). The 1995 date carries a wrong weekday on purpose.
+          {
+            path: "/asset.txt",
+            headers: { "If-Unmodified-Since": "Mon, 21 Oct 1995 07:28:00 GMT" },
+            compareHeaders: ["content-type", "last-modified"],
+          },
+          { path: "/asset.txt", headers: { "If-Unmodified-Since": "Mon, 21 Oct 2099 07:28:00 GMT" } },
+          { path: "/asset.txt", headers: { "If-Match": "*" } },
+          {
+            path: "/asset.txt",
+            headers: { "If-Match": `"nope"` },
+            compareHeaders: ["content-type", "last-modified"],
+          },
+          // If-Range mismatch (tag or non-matching date) drops the range -> 200.
+          {
+            path: "/asset.txt",
+            headers: { Range: "bytes=0-9", "If-Range": `"nope"` },
+            compareHeaders: ["content-range", "content-length", "accept-ranges"],
+          },
+          {
+            path: "/asset.txt",
+            headers: {
+              Range: "bytes=0-9",
+              "If-Range": "Mon, 21 Oct 2099 07:28:00 GMT",
+            },
+            compareHeaders: ["content-range", "content-length", "accept-ranges"],
+          },
+        ],
+      });
+    }
   },
 });
 
@@ -2634,7 +2755,7 @@ async function writeCompiledCaddyMiddleware(
 ): Promise<void> {
   const zeroservePath = await getZeroservePath();
   const compiled = await new Deno.Command(zeroservePath, {
-    args: ["--compile-caddy-json", caddyfilePath],
+    args: ["--caddy-compile", caddyfilePath],
     cwd: repoRoot,
     stdout: "piped",
     stderr: "piped",
@@ -2653,7 +2774,7 @@ async function withCaddy(
   caddyfilePath: string,
   port: number,
 ): Promise<{ origin: string; stop: () => Promise<void> }> {
-  const child = new Deno.Command("caddy", {
+  const child = new Deno.Command(caddyBin, {
     args: ["run", "--config", caddyfilePath, "--adapter", "caddyfile"],
     cwd: siteDir,
     stdin: "null",

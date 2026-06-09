@@ -29,7 +29,7 @@ async function compile(config: string, name: string): Promise<string> {
   try {
     const zeroservePath = await getZeroservePath();
     const out = await new Deno.Command(zeroservePath, {
-      args: ["--compile-caddy-json", path],
+      args: ["--caddy-compile", path],
       stdout: "piped",
       stderr: "piped",
     }).output();
@@ -57,7 +57,7 @@ Deno.test("adapt a Caddyfile to Caddy JSON", async () => {
   assertEquals(inner[0].handle[0].status_code, 200);
 });
 
-Deno.test("compile-caddy-json auto-detects a Caddyfile", async () => {
+Deno.test("caddy-compile auto-detects a Caddyfile", async () => {
   const c = await compile(
     `example.com {\n  respond "hi" 200\n}`,
     "Caddyfile",
@@ -66,7 +66,7 @@ Deno.test("compile-caddy-json auto-detects a Caddyfile", async () => {
   assertStringIncludes(c, "zs_caddy_respond_static(\"200\"");
 });
 
-Deno.test("compile-caddy-json still accepts Caddy JSON", async () => {
+Deno.test("caddy-compile still accepts Caddy JSON", async () => {
   const config = JSON.stringify({
     apps: {
       http: {
@@ -88,7 +88,7 @@ Deno.test("compile-caddy-json still accepts Caddy JSON", async () => {
   assertStringIncludes(c, "zs_caddy_respond_static(\"200\"");
 });
 
-Deno.test("compile-caddy-json adapts reverse_proxy handle_response", async () => {
+Deno.test("caddy-compile adapts reverse_proxy handle_response", async () => {
   const c = await compile(
     `example.com {
   reverse_proxy 127.0.0.1:8080 {
@@ -112,7 +112,7 @@ Deno.test("compile-caddy-json adapts reverse_proxy handle_response", async () =>
   assertStringIncludes(c, "zs_caddy_res_header_match(\"X-Origin\"");
 });
 
-Deno.test("compile-caddy-json adapts forward_auth copy_headers", async () => {
+Deno.test("caddy-compile adapts forward_auth copy_headers", async () => {
   const c = await compile(
     `example.com {
   forward_auth /private/* 127.0.0.1:9091 {
@@ -131,7 +131,7 @@ Deno.test("compile-caddy-json adapts forward_auth copy_headers", async () => {
   assertStringIncludes(c, "zs.caddy.reverse_proxy.skip.");
 });
 
-Deno.test("compile-caddy-json adapts try_files", async () => {
+Deno.test("caddy-compile adapts try_files", async () => {
   const c = await compile(
     `example.com {
   try_files {path} /index.php?{query}&p={path} {
@@ -146,7 +146,7 @@ Deno.test("compile-caddy-json adapts try_files", async () => {
   assertStringIncludes(c, "?{http.request.uri.query}&p={http.request.uri.path}");
 });
 
-Deno.test("compile-caddy-json adapts log_append", async () => {
+Deno.test("caddy-compile adapts log_append", async () => {
   const c = await compile(
     `example.com {
   log_append /admin* <route admin
@@ -157,7 +157,7 @@ Deno.test("compile-caddy-json adapts log_append", async () => {
   assertStringIncludes(c, "zs_caddy_respond_static(\"204\"");
 });
 
-Deno.test("compile-caddy-json adapts redir html", async () => {
+Deno.test("caddy-compile adapts redir html", async () => {
   const c = await compile(
     `example.com {
   redir https://example.org/a?b=<tag> html
@@ -171,7 +171,7 @@ Deno.test("compile-caddy-json adapts redir html", async () => {
   assertEquals(c.includes("Location"), false);
 });
 
-Deno.test("compile-caddy-json adapts log vars directives", async () => {
+Deno.test("caddy-compile adapts log vars directives", async () => {
   const c = await compile(
     `example.com {
   log_skip /hidden*
@@ -186,7 +186,7 @@ Deno.test("compile-caddy-json adapts log vars directives", async () => {
   assertStringIncludes(c, "zs_caddy_respond_static(\"204\"");
 });
 
-Deno.test("compile-caddy-json adapts basic_auth", async () => {
+Deno.test("caddy-compile adapts basic_auth", async () => {
   const c = await compile(
     `example.com {
   basic_auth /admin/* bcrypt "Admin Area" {

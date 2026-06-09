@@ -111,6 +111,13 @@ Current generated middleware support includes:
 - file-server options including root, hide, index names, status code,
   pass-thru, browse sort/file limit, sidecar ETags, and selected precompressed
   sidecar behavior
+- conditional requests (`If-Match`, `If-None-Match`, `If-Modified-Since`,
+  `If-Unmodified-Since`, `If-Range`) and single byte-range requests, matching
+  Go's `net/http.ServeContent` semantics that Caddy's file server delegates to:
+  RFC 7232 precondition precedence (`304`/`412`), suffix and open-ended ranges,
+  `416` responses (`invalid range` with no `Content-Range`; `failed to overlap`
+  with `bytes */N`), the empty-file and oversized-range special cases, and
+  HTTP-date parsing that ignores the weekday like Go does
 - error routes and `handle_errors` for supported error status handling
 - reverse proxying to supported static or placeholder-expanded upstreams,
   selected request rewrite/header mutation, response-header hooks, response
@@ -127,6 +134,10 @@ body rewriting/copying or Caddy's full server runtime. In particular:
 - no Caddy response body rewriting, response body copying, or response body
   suppression
 - no `templates`, `encode`, or `copy_response` generated behavior
+- no `multipart/byteranges` responses: a request for multiple byte ranges is
+  not served as a multipart body. Such requests have their `Range` header
+  ignored and receive the full `200 OK` representation (which RFC 7233
+  section 3.1 permits). Single-range requests are fully supported.
 - no `zs_req_set_body`, `zs_res_set_body`, `zs_res_suppress_body`, or
   `zs_res_copy_body` APIs
 - no generic `zs_res_set_header`, `zs_res_append_header`, or
@@ -171,8 +182,9 @@ is mostly in exact edge-case parity:
 - broader Caddyfile parser/provisioning diagnostics
 - long-tail global option/module validation
 - uncommon route sorting and matcher combinations
-- advanced file-server HTTP semantics such as range and conditional request
-  combinations not yet covered by live comparisons
+- multi-range (`multipart/byteranges`) responses, which are intentionally
+  unsupported (see Intentional Exclusions); single-range and conditional
+  request handling is covered by live comparisons
 - placeholder timing and unsupported placeholder diagnostics outside covered
   paths
 - deeper response-hook ordering interactions across proxy, file-server, and

@@ -2804,9 +2804,9 @@ fn if_unmodified_since_condition(headers: &::http::HeaderMap, last_modified: u64
     let value = headers
         .get(::http::header::IF_UNMODIFIED_SINCE)
         .and_then(|value| value.to_str().ok())?;
-    let value = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+    let value = parse_http_date(value)?;
     let last_modified = i64::try_from(last_modified).ok()?;
-    Some(last_modified <= value.timestamp())
+    Some(last_modified <= value)
 }
 
 fn response_etag_string(etag: &str) -> Option<String> {
@@ -2855,13 +2855,13 @@ fn if_modified_since_matches(headers: &::http::HeaderMap, last_modified: u64) ->
     else {
         return false;
     };
-    let Ok(value) = chrono::DateTime::parse_from_rfc2822(value) else {
+    let Some(value) = parse_http_date(value) else {
         return false;
     };
     let Ok(last_modified) = i64::try_from(last_modified) else {
         return false;
     };
-    last_modified <= value.timestamp()
+    last_modified <= value
 }
 
 fn not_modified_headers(etag: &str, last_modified: u64) -> ::http::HeaderMap {
@@ -2873,7 +2873,11 @@ fn not_modified_headers(etag: &str, last_modified: u64) -> ::http::HeaderMap {
     if !etag.is_empty() {
         headers.insert(::http::header::ETAG, etag_header_value(etag));
     }
-    insert_last_modified(&mut headers, last_modified);
+    // RFC 7232 4.1 / Go's writeNotModified: a 304 carries Last-Modified only as
+    // a fallback when there is no ETag. When an ETag is present, omit it.
+    if etag.is_empty() {
+        insert_last_modified(&mut headers, last_modified);
+    }
     headers.insert(
         ::http::header::CONTENT_LENGTH,
         HeaderValue::from_static("0"),
@@ -2912,6 +2916,42 @@ fn http_date(secs: u64) -> String {
         Some(value) => value.format("%a, %d %b %Y %H:%M:%S GMT").to_string(),
         None => "Thu, 01 Jan 1970 00:00:00 GMT".to_string(),
     }
+}
+
+/// Parse an HTTP-date the way Go's `http.ParseTime` (and therefore Caddy) does:
+/// accept IMF-fixdate, RFC 850, and ANSI C asctime, and — crucially — ignore the
+/// leading day-of-week token rather than validating it against the date. Returns
+/// the time as Unix seconds. Using `chrono`'s RFC 2822 parser here would reject
+/// otherwise-valid dates whose weekday name does not match the calendar day,
+/// which Go accepts.
+fn parse_http_date(value: &str) -> Option<i64> {
+    use chrono::{NaiveDateTime, TimeZone, Utc};
+
+    fn to_unix(dt: NaiveDateTime) -> i64 {
+        Utc.from_utc_datetime(&dt).timestamp()
+    }
+
+    let value = value.trim();
+    // IMF-fixdate ("Mon, 02 Jan 2006 15:04:05 GMT") and RFC 850
+    // ("Monday, 02-Jan-06 15:04:05 GMT") both carry the weekday before a
+    // comma; drop it and parse the remainder.
+    if let Some((_, rest)) = value.split_once(", ") {
+        let rest = rest.trim();
+        if let Ok(dt) = NaiveDateTime::parse_from_str(rest, "%d %b %Y %H:%M:%S GMT") {
+            return Some(to_unix(dt));
+        }
+        if let Ok(dt) = NaiveDateTime::parse_from_str(rest, "%d-%b-%y %H:%M:%S GMT") {
+            return Some(to_unix(dt));
+        }
+    }
+    // ANSI C asctime ("Mon Jan _2 15:04:05 2006"): weekday is the first
+    // space-separated token.
+    if let Some((_, rest)) = value.split_once(' ') {
+        if let Ok(dt) = NaiveDateTime::parse_from_str(rest.trim_start(), "%b %e %H:%M:%S %Y") {
+            return Some(to_unix(dt));
+        }
+    }
+    None
 }
 
 fn apply_static_range(
@@ -3002,13 +3042,16 @@ fn if_range_allows_range(headers: &::http::HeaderMap, etag: &str, last_modified:
     if last_modified == 0 {
         return false;
     }
-    let Ok(value) = chrono::DateTime::parse_from_rfc2822(value) else {
+    let Some(value) = parse_http_date(value) else {
         return false;
     };
     let Ok(last_modified) = i64::try_from(last_modified) else {
         return false;
     };
-    last_modified <= value.timestamp()
+    // RFC 7233: the range is served only when the validator is an exact match.
+    // Go's `checkIfRange` compares the dates for equality (not "not modified
+    // since"), so a date that merely post-dates the file still drops the range.
+    last_modified == value
 }
 
 fn unsatisfiable_range(
@@ -3030,6 +3073,200 @@ fn set_unsatisfiable_range(headers: &mut ::http::HeaderMap, total: u64) {
     if let Ok(value) = HeaderValue::from_str(&format!("bytes */{total}")) {
         headers.insert(::http::header::CONTENT_RANGE, value);
     }
+}
+
+/// Outcome of evaluating a `Range` request the way Go's `http.ServeContent`
+/// (and therefore Caddy's file server) does — minus multi-range support.
+enum CaddyRangeOutcome {
+    /// Serve the whole body unchanged (no range, ignored range, empty file, or
+    /// an unsupported multi-range request).
+    Full,
+    /// `206 Partial Content` with a single content range.
+    Single(ByteRange),
+    /// `416 Range Not Satisfiable`; the bytes are the error message body.
+    Unsatisfiable(Vec<u8>),
+}
+
+enum RangeParse {
+    /// Malformed syntax → `416` with no `Content-Range`.
+    Invalid,
+    /// All ranges fell beyond the file → `416` with `Content-Range: bytes */N`.
+    NoOverlap,
+    /// Parsed (possibly empty) set of satisfiable `(start, len)` ranges.
+    Ranges(Vec<(u64, u64)>),
+}
+
+/// Parse the portion of a `Range` header after `bytes=`, replicating Go's
+/// `net/http.parseRange` byte-for-byte (including its handling of suffix ranges,
+/// out-of-range starts, and clamping).
+fn parse_byte_range_spec(spec: &str, size: u64) -> RangeParse {
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
+    let mut no_overlap = false;
+    for raw in spec.split(',') {
+        let ra = raw.trim();
+        if ra.is_empty() {
+            continue;
+        }
+        let Some((start, end)) = ra.split_once('-') else {
+            return RangeParse::Invalid;
+        };
+        let (start, end) = (start.trim(), end.trim());
+        if start.is_empty() {
+            // suffix-length form: bytes=-N
+            if end.is_empty() || end.starts_with('-') {
+                return RangeParse::Invalid;
+            }
+            let Ok(mut i) = end.parse::<u64>() else {
+                return RangeParse::Invalid;
+            };
+            if i > size {
+                i = size;
+            }
+            let r_start = size - i;
+            ranges.push((r_start, size - r_start));
+        } else {
+            let Ok(i) = start.parse::<u64>() else {
+                return RangeParse::Invalid;
+            };
+            if i >= size {
+                // Begins at or beyond the end of the content: does not overlap.
+                no_overlap = true;
+                continue;
+            }
+            let r_len = if end.is_empty() {
+                size - i
+            } else {
+                let Ok(mut j) = end.parse::<u64>() else {
+                    return RangeParse::Invalid;
+                };
+                if i > j {
+                    return RangeParse::Invalid;
+                }
+                if j >= size {
+                    j = size - 1;
+                }
+                j - i + 1
+            };
+            ranges.push((i, r_len));
+        }
+    }
+    if no_overlap && ranges.is_empty() {
+        return RangeParse::NoOverlap;
+    }
+    RangeParse::Ranges(ranges)
+}
+
+/// Apply Caddy/Go `http.ServeContent` range semantics for a single byte range,
+/// mutating `headers` to match the chosen outcome. `etag`/`last_modified` gate
+/// `If-Range` (pass `""`/`0` for a file without useful validators).
+///
+/// Multi-range requests are intentionally unsupported: rather than emitting a
+/// `multipart/byteranges` body (see CADDY_COMPAT.md), the `Range` header is
+/// ignored and the full representation is served with `200 OK`, which RFC 7233
+/// section 3.1 explicitly permits.
+fn apply_caddy_range(
+    head: &RequestHead,
+    headers: &mut ::http::HeaderMap,
+    size: u64,
+    etag: &str,
+    last_modified: u64,
+) -> CaddyRangeOutcome {
+    let Some(range) = head.headers.get(::http::header::RANGE) else {
+        return CaddyRangeOutcome::Full;
+    };
+    // Go only honors Range/If-Range for GET and HEAD.
+    if !matches!(head.method, Method::GET | Method::HEAD) {
+        return CaddyRangeOutcome::Full;
+    }
+    if !if_range_allows_range(&head.headers, etag, last_modified) {
+        return CaddyRangeOutcome::Full;
+    }
+    let Ok(range) = range.to_str() else {
+        return make_unsatisfiable(headers, b"invalid range\n".to_vec(), None);
+    };
+    let Some(spec) = range.trim().strip_prefix("bytes=") else {
+        return make_unsatisfiable(headers, b"invalid range\n".to_vec(), None);
+    };
+    match parse_byte_range_spec(spec, size) {
+        RangeParse::Invalid => make_unsatisfiable(headers, b"invalid range\n".to_vec(), None),
+        RangeParse::NoOverlap => {
+            if size == 0 {
+                // Some clients add a Range to every request; for an empty file
+                // ignore it and serve 200 rather than 416 (matches Go).
+                CaddyRangeOutcome::Full
+            } else {
+                make_unsatisfiable(
+                    headers,
+                    b"invalid range: failed to overlap\n".to_vec(),
+                    Some(size),
+                )
+            }
+        }
+        RangeParse::Ranges(ranges) => {
+            if ranges.is_empty() {
+                return CaddyRangeOutcome::Full;
+            }
+            let sum: u64 = ranges.iter().map(|(_, len)| *len).sum();
+            if sum > size {
+                // The ranges total more than the file: likely an attack or a
+                // confused client. Ignore the range and serve the whole body.
+                return CaddyRangeOutcome::Full;
+            }
+            if ranges.len() == 1 {
+                let (start, len) = ranges[0];
+                let end = start as i64 + len as i64 - 1;
+                if let Ok(value) = HeaderValue::from_str(&len.to_string()) {
+                    headers.insert(::http::header::CONTENT_LENGTH, value);
+                }
+                if let Ok(value) = HeaderValue::from_str(&format!("bytes {start}-{end}/{size}")) {
+                    headers.insert(::http::header::CONTENT_RANGE, value);
+                }
+                CaddyRangeOutcome::Single(ByteRange { start, len })
+            } else {
+                // Multiple ranges would require a multipart/byteranges body,
+                // which zeroserve does not generate. Ignore the Range header
+                // and serve the full representation (RFC 7233 section 3.1).
+                CaddyRangeOutcome::Full
+            }
+        }
+    }
+}
+
+/// Rewrite `headers` for a `416` error body the way Go's `serveError`/`Error` do:
+/// drop validators, encoding, and cache headers; force the `text/plain` content
+/// type plus `nosniff`; and set or clear `Content-Range`.
+fn make_unsatisfiable(
+    headers: &mut ::http::HeaderMap,
+    body: Vec<u8>,
+    content_range_total: Option<u64>,
+) -> CaddyRangeOutcome {
+    headers.remove(::http::header::ETAG);
+    headers.remove(::http::header::LAST_MODIFIED);
+    headers.remove(::http::header::ACCEPT_RANGES);
+    headers.remove(::http::header::CONTENT_ENCODING);
+    headers.remove(::http::header::CACHE_CONTROL);
+    headers.insert(
+        ::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    headers.insert(
+        ::http::header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    match content_range_total {
+        Some(total) => {
+            if let Ok(value) = HeaderValue::from_str(&format!("bytes */{total}")) {
+                headers.insert(::http::header::CONTENT_RANGE, value);
+            }
+        }
+        None => {
+            headers.remove(::http::header::CONTENT_RANGE);
+        }
+    }
+    if let Ok(value) = HeaderValue::from_str(&body.len().to_string()) {
+        headers.insert(::http::header::CONTENT_LENGTH, value);
+    }
+    CaddyRangeOutcome::Unsatisfiable(body)
 }
 
 fn etag_header_value(etag: &str) -> HeaderValue {

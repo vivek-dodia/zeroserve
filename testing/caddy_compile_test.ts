@@ -865,7 +865,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -1291,7 +1291,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -1492,7 +1492,7 @@ zs_u64 entry(void) {
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -1652,7 +1652,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -1777,7 +1777,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -1984,7 +1984,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -2147,7 +2147,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -2237,7 +2237,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -2382,7 +2382,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -2523,7 +2523,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -2668,7 +2668,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -2815,7 +2815,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -2911,7 +2911,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -2995,7 +2995,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -3091,7 +3091,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -3177,7 +3177,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -3287,7 +3287,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -3394,7 +3394,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -3506,7 +3506,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -3582,7 +3582,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -3657,7 +3657,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -3743,7 +3743,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -3823,7 +3823,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -3914,7 +3914,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -3999,7 +3999,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -4128,7 +4128,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -4282,7 +4282,7 @@ zs_u64 entry(void) {
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -4532,7 +4532,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -4684,7 +4684,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -4793,7 +4793,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -4970,7 +4970,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -5161,7 +5161,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -5365,7 +5365,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -5519,7 +5519,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -5655,7 +5655,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -5751,7 +5751,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -5826,7 +5826,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -5926,7 +5926,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -6010,7 +6010,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -6097,7 +6097,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -6320,7 +6320,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -6438,7 +6438,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -6546,7 +6546,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -6626,7 +6626,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -6713,7 +6713,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -6886,7 +6886,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -7286,7 +7286,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -7358,7 +7358,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -7441,7 +7441,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -7518,7 +7518,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -7594,7 +7594,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -7699,7 +7699,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -7875,7 +7875,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -8032,7 +8032,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -8222,7 +8222,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -8343,7 +8343,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -8541,7 +8541,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -8782,7 +8782,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -8995,7 +8995,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -9252,7 +9252,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -9387,7 +9387,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -9723,7 +9723,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -9914,7 +9914,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -10012,7 +10012,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -10101,7 +10101,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -10143,7 +10143,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -10202,7 +10202,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -10260,7 +10260,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -10328,7 +10328,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -10400,7 +10400,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -10503,7 +10503,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -10601,7 +10601,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -10662,7 +10662,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -10755,7 +10755,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -10837,7 +10837,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -10909,7 +10909,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -10974,7 +10974,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -11061,7 +11061,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -11192,7 +11192,7 @@ Deno.test({
 
       const zeroservePath = await getZeroservePath();
       const compiled = await new Deno.Command(zeroservePath, {
-        args: ["--compile-caddy-json", caddyConfigPath],
+        args: ["--caddy-compile", caddyConfigPath],
         cwd: repoRoot,
         stdout: "piped",
         stderr: "piped",
@@ -11230,7 +11230,7 @@ Deno.test({
   },
 });
 
-Deno.test("compile-caddy-json adapts Caddyfile file logging", async () => {
+Deno.test("caddy-compile adapts Caddyfile file logging", async () => {
   const logPath = "/tmp/zeroserve-caddy-access-compile.log";
   const c = await compileCaddyfileForLogging(`
 :8080 {
@@ -11385,7 +11385,7 @@ async function compileCaddyfileForLogging(caddyfile: string): Promise<string> {
     await Deno.writeTextFile(caddyfilePath, caddyfile);
     const zeroservePath = await getZeroservePath();
     const compiled = await new Deno.Command(zeroservePath, {
-      args: ["--compile-caddy-json", caddyfilePath],
+      args: ["--caddy-compile", caddyfilePath],
       cwd: repoRoot,
       stdout: "piped",
       stderr: "piped",
@@ -11468,7 +11468,7 @@ async function withCompiledLoggingJson(
     await Deno.writeTextFile(caddyJsonPath, JSON.stringify(caddyJson));
     const zeroservePath = await getZeroservePath();
     const compiled = await new Deno.Command(zeroservePath, {
-      args: ["--compile-caddy-json", caddyJsonPath],
+      args: ["--caddy-compile", caddyJsonPath],
       cwd: repoRoot,
       stdout: "piped",
       stderr: "piped",

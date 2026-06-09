@@ -1583,6 +1583,7 @@ async fn prepare_static_entry_response(
     {
         replace_caddy_validator_etag(&mut headers, &etag);
         insert_caddy_file_vary_header(&mut headers);
+        insert_precondition_content_type(&mut headers, precondition_status, mime);
         let status = caddy_status_override(status, precondition_status, &mut headers);
         return Some(CaddyStaticResponse::preserve_static_validators(
             StaticResponse {
@@ -1613,13 +1614,33 @@ async fn prepare_static_entry_response(
     } else {
         ("", 0)
     };
-    let (range_status, range) = apply_static_range(
+    let outcome = super::apply_caddy_range(
         head,
         &mut headers,
         body_entry.size,
         range_etag,
         range_last_modified,
     );
+    let (range_status, body) = match outcome {
+        super::CaddyRangeOutcome::Full => (
+            StatusCode::OK,
+            StaticBody::File {
+                entry: body_entry,
+                range: None,
+            },
+        ),
+        super::CaddyRangeOutcome::Single(range) => (
+            StatusCode::PARTIAL_CONTENT,
+            StaticBody::File {
+                entry: body_entry,
+                range: Some(range),
+            },
+        ),
+        super::CaddyRangeOutcome::Unsatisfiable(message) => (
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            StaticBody::Bytes(message),
+        ),
+    };
     let status = if status != StatusCode::OK {
         status
     } else if range_status != StatusCode::OK {
@@ -1631,10 +1652,7 @@ async fn prepare_static_entry_response(
         StaticResponse {
             status,
             headers,
-            body: StaticBody::File {
-                entry: body_entry,
-                range,
-            },
+            body,
             head_only,
             site,
         },
@@ -1678,6 +1696,7 @@ async fn prepare_fs_entry_response(
     {
         replace_caddy_validator_etag(&mut headers, &etag);
         insert_caddy_file_vary_header(&mut headers);
+        insert_precondition_content_type(&mut headers, precondition_status, mime);
         let status = caddy_status_override(status, precondition_status, &mut headers);
         return Some(CaddyStaticResponse::preserve_static_validators(
             StaticResponse {
@@ -1708,8 +1727,30 @@ async fn prepare_fs_entry_response(
     } else {
         ("", 0)
     };
-    let (range_status, range) =
-        apply_static_range(head, &mut headers, size, range_etag, range_last_modified);
+    let outcome =
+        super::apply_caddy_range(head, &mut headers, size, range_etag, range_last_modified);
+    let (range_status, body) = match outcome {
+        super::CaddyRangeOutcome::Full => (
+            StatusCode::OK,
+            StaticBody::FsFile {
+                path: body_path,
+                size,
+                range: None,
+            },
+        ),
+        super::CaddyRangeOutcome::Single(range) => (
+            StatusCode::PARTIAL_CONTENT,
+            StaticBody::FsFile {
+                path: body_path,
+                size,
+                range: Some(range),
+            },
+        ),
+        super::CaddyRangeOutcome::Unsatisfiable(message) => (
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            StaticBody::Bytes(message),
+        ),
+    };
     let status = if status != StatusCode::OK {
         status
     } else if range_status != StatusCode::OK {
@@ -1721,11 +1762,7 @@ async fn prepare_fs_entry_response(
         StaticResponse {
             status,
             headers,
-            body: StaticBody::FsFile {
-                path: body_path,
-                size,
-                range,
-            },
+            body,
             head_only,
             site,
         },
@@ -2933,6 +2970,24 @@ fn insert_caddy_validator_headers(
 fn replace_caddy_validator_etag(headers: &mut ::http::HeaderMap, etag: &CaddyEtag) {
     if !etag.value.is_empty() && headers.contains_key(::http::header::ETAG) {
         headers.insert(::http::header::ETAG, etag.header_value());
+    }
+}
+
+/// A `412 Precondition Failed` keeps the file's Content-Type (Go reaches the
+/// failure via a bare `WriteHeader`, leaving the already-set header in place),
+/// whereas a `304 Not Modified` drops it (Go's `writeNotModified` deletes it).
+fn insert_precondition_content_type(
+    headers: &mut ::http::HeaderMap,
+    precondition_status: StatusCode,
+    mime: Option<&str>,
+) {
+    if precondition_status != StatusCode::PRECONDITION_FAILED {
+        return;
+    }
+    if let Some(mime) = mime
+        && let Ok(value) = ::http::HeaderValue::from_str(mime)
+    {
+        headers.insert(::http::header::CONTENT_TYPE, value);
     }
 }
 

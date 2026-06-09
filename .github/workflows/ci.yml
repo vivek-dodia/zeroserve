@@ -53,6 +53,21 @@ jobs:
         with:
           deno-version: v2.x
 
+      # The end-to-end suite compares zeroserve against stock Caddy. Pin a known
+      # Caddy commit so behavioral comparisons stay stable across Caddy releases
+      # (e.g. precompressed serving changed status via caddyserver/caddy#7040 /
+      # #7250). Without this the comparison tests silently skip (no caddy on PATH).
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Install pinned Caddy (for the e2e comparison suite)
+        env:
+          CADDY_COMMIT: d3986f824d2e82310405d5ca520d61f3e2e701c9
+        run: |
+          go install "github.com/caddyserver/caddy/v2/cmd/caddy@${CADDY_COMMIT}"
+          echo "CADDY_BIN=$(go env GOPATH)/bin/caddy" >> "$GITHUB_ENV"
+
       # The server isolates itself with unprivileged user namespaces by default.
       # Ubuntu 24.04 runners restrict these via AppArmor; relax it so the server
       # can start during the e2e tests (otherwise `--disable-ns-isolation` would
