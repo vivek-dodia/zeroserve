@@ -10182,7 +10182,8 @@ Deno.test({
 });
 
 Deno.test({
-  name: "Caddy reverse_proxy response-only handle_response routes compile",
+  name:
+    "Caddy reverse_proxy response-only handle_response routes are rejected",
   ignore: !canRunScripts,
   sanitizeResources: false,
   sanitizeOps: false,
@@ -10233,12 +10234,16 @@ Deno.test({
         stdout: "piped",
         stderr: "piped",
       }).output();
-      // Response-only handle_response routes leave the upstream body untouched,
-      // so they compile to a response hook that continues the proxied response.
-      assertEquals(compiled.success, true);
-      const generated = new TextDecoder().decode(compiled.stdout);
-      assert(generated.includes("zs_caddy_copy_response_headers("));
-      assert(generated.includes("zs_res_continue_request();"));
+      // Caddy response-only handle_response routes suppress the upstream body.
+      // zeroserve does not implement response body suppression, so compilation
+      // must fail instead of passing through the upstream body.
+      assertEquals(compiled.success, false);
+      assertEquals(
+        new TextDecoder().decode(compiled.stderr).includes(
+          "reverse_proxy.handle_response routes suppress upstream response bodies",
+        ),
+        true,
+      );
     } finally {
       await Deno.remove(siteDir, { recursive: true }).catch(() => {});
     }

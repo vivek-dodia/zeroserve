@@ -136,6 +136,13 @@ struct Route {
 
 type MatcherSet = Map<String, Value>;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MatcherEvalPhase {
+    Captures,
+    Plain,
+    SetsError,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct Handler {
     handler: String,
@@ -293,6 +300,10 @@ pub fn compile_caddy_json_collecting(source: &str) -> Result<(String, Vec<String
             c_comment(&compiled.server_name),
             compiled.route_index
         ));
+        if !generator.error_routes.is_empty() {
+            generator.line("zs_meta_set(ZS_STR(\"zs.caddy.has_error_routes\"), ZS_STR(\"1\"));");
+            generator.emit_pending_matcher_error()?;
+        }
         let matched = generator.emit_route_match(&compiled.route)?;
         if route_match_can_set_error(&compiled.route) {
             let match_id = generator.next_id();
@@ -442,21 +453,16 @@ impl Generator {
             return Ok("1".to_string());
         }
         let mut exprs = Vec::new();
-        if matcher_set_can_set_error(set) {
+        for phase in [
+            MatcherEvalPhase::Captures,
+            MatcherEvalPhase::Plain,
+            MatcherEvalPhase::SetsError,
+        ] {
             for (name, value) in set {
-                if !matcher_can_set_error(name, value) {
+                if matcher_eval_phase(name, value) == phase {
                     exprs.push(self.emit_matcher(name, value)?);
                 }
             }
-            for (name, value) in set {
-                if matcher_can_set_error(name, value) {
-                    exprs.push(self.emit_matcher(name, value)?);
-                }
-            }
-            return Ok(format!("({})", exprs.join(" && ")));
-        }
-        for (name, value) in set {
-            exprs.push(self.emit_matcher(name, value)?);
         }
         Ok(format!("({})", exprs.join(" && ")))
     }
@@ -773,6 +779,9 @@ impl Generator {
             ExpressionAst::Ne(left, right) => {
                 self.emit_expression_string_compare(left, right, false)
             }
+            ExpressionAst::Matches(left, pattern) => {
+                self.emit_expression_string_matches(left, pattern)
+            }
             ExpressionAst::In(left, values) => self.emit_expression_string_in(left, values),
             ExpressionAst::NumericCompare { left, op, right } => {
                 self.emit_expression_numeric_compare(left, *op, right)
@@ -852,6 +861,28 @@ impl Generator {
             left.len(),
             c_str(&values),
             values.len()
+        ))
+    }
+
+    fn emit_expression_string_matches(&mut self, left: &str, pattern: &str) -> Result<String> {
+        let mut config = Map::new();
+        config.insert("pattern".to_string(), Value::String(pattern.to_string()));
+        let config = regex_match_config(&Value::Object(config), "expression.matches")?;
+        let config_json = serde_json::to_string(&config)?;
+        let id = self.next_id();
+        self.code_line(&format!("char expr_match_left_{id}[512];"));
+        self.code_line(&format!(
+            "zs_s64 expr_match_left_{id}_raw = zs_caddy_expand({}, {}, expr_match_left_{id}, sizeof(expr_match_left_{id}));",
+            c_str(left),
+            left.len()
+        ));
+        self.code_line(&format!(
+            "zs_u64 expr_match_left_{id}_len = zs_caddy_clamp_len(expr_match_left_{id}_raw, sizeof(expr_match_left_{id}));"
+        ));
+        Ok(format!(
+            "(expr_match_left_{id}_raw >= 0 && zs_caddy_regex_match(expr_match_left_{id}, expr_match_left_{id}_len, {}, {}) != 0)",
+            c_str(&config_json),
+            config_json.len()
         ))
     }
 
@@ -2446,6 +2477,11 @@ impl Generator {
             self.emit_reverse_proxy_handle_response(handle_response, &skip_key)?;
         }
         self.line("zs_meta_set(ZS_STR(\"zs.caddy.reverse_proxy\"), ZS_STR(\"1\"));");
+        if reverse_proxy_transport_compression_off(handler.config.get("transport")) {
+            self.line(
+                "zs_meta_set(ZS_STR(\"zs.caddy.reverse_proxy.compression\"), ZS_STR(\"off\"));",
+            );
+        }
         self.emit_caddy_forwarded_headers(handler.config.get("trusted_proxies"))?;
         if transport_host_default {
             self.emit_reverse_proxy_transport_host_header()?;
@@ -2666,22 +2702,28 @@ impl Generator {
                 }
             } else if let Some(routes) = obj.get("routes") {
                 let routes = route_vec_from_value(routes, "invalid handle_response routes")?;
-                // The upstream body streams through untouched, so a handle_response
-                // route is supported as long as it only adjusts the response
-                // (headers, copied response headers, status) or mutates the
-                // request (forward_auth style) — i.e. it does not try to replace
-                // the body. Routes that replace the body are rejected here; the
-                // rest continue the proxied response.
                 let replaces_body =
                     !routes.is_empty() && self.response_routes_replace_body(&routes)?;
-                let should_continue = continue_skip_key.is_some() && !replaces_body;
                 if continue_skip_key.is_some() && replaces_body {
                     bail!(
                         "{label}.handle_response routes replace response bodies and are not supported by generated Caddy middleware"
                     );
                 }
+                if continue_skip_key.is_some()
+                    && !self.response_routes_are_request_continuation_only(&routes)?
+                {
+                    bail!(
+                        "{label}.handle_response routes suppress upstream response bodies and are not supported by generated Caddy middleware"
+                    );
+                }
                 self.emit_response_routes(&routes, label, None)?;
-                if let (Some(skip_key), true) = (continue_skip_key, should_continue) {
+                if let Some(skip_key) = continue_skip_key {
+                    let original_uri = "{http.request.orig_uri}";
+                    self.response_line(&format!(
+                        "  zs_caddy_rewrite_uri({}, {});",
+                        c_str(original_uri),
+                        original_uri.len()
+                    ));
                     self.response_line(&format!(
                         "  zs_meta_set({}, {}, ZS_STR(\"1\"));",
                         c_str(skip_key),
@@ -2690,6 +2732,12 @@ impl Generator {
                     self.response_line("  zs_res_continue_request();");
                 }
             } else if let Some(skip_key) = continue_skip_key {
+                let original_uri = "{http.request.orig_uri}";
+                self.response_line(&format!(
+                    "  zs_caddy_rewrite_uri({}, {});",
+                    c_str(original_uri),
+                    original_uri.len()
+                ));
                 self.response_line(&format!(
                     "  zs_meta_set({}, {}, ZS_STR(\"1\"));",
                     c_str(skip_key),
@@ -2768,6 +2816,80 @@ impl Generator {
             }
         }
         Ok(false)
+    }
+
+    /// Whether these reverse_proxy handle_response routes only mutate request
+    /// state before continuing the outer route, as Caddy's forward_auth shortcut
+    /// does. Response-header/copy/status-only response routes in this position
+    /// still suppress the upstream response body in Caddy, which zeroserve
+    /// intentionally does not reproduce.
+    fn response_routes_are_request_continuation_only(&self, routes: &[Route]) -> Result<bool> {
+        self.response_routes_are_request_continuation_only_inner(routes, &mut HashSet::new())
+    }
+
+    fn response_routes_are_request_continuation_only_inner(
+        &self,
+        routes: &[Route],
+        visited_invokes: &mut HashSet<String>,
+    ) -> Result<bool> {
+        for route in routes {
+            for handler in &route.handlers {
+                match handler.handler.as_str() {
+                    "headers" => {
+                        if handler
+                            .config
+                            .get("response")
+                            .is_some_and(|value| !value.is_null())
+                        {
+                            return Ok(false);
+                        }
+                    }
+                    "copy_response_headers" => {
+                        validate_copy_response_headers_handler(handler)?;
+                        return Ok(false);
+                    }
+                    "vars" | "map" | "log_append" | "tracing" => {}
+                    "subroute" => {
+                        if let Some(routes) = handler.config.get("routes") {
+                            if !routes.is_null() {
+                                let routes: Vec<Route> = serde_json::from_value(routes.clone())
+                                    .context("invalid handle_response subroute")?;
+                                if !self.response_routes_are_request_continuation_only_inner(
+                                    &routes,
+                                    visited_invokes,
+                                )? {
+                                    return Ok(false);
+                                }
+                            }
+                        }
+                    }
+                    "invoke" => {
+                        let name = handler
+                            .config
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        if visited_invokes.insert(name.to_string()) {
+                            let continuation_only = if let Some(route) = self.named_routes.get(name)
+                            {
+                                self.response_routes_are_request_continuation_only_inner(
+                                    std::slice::from_ref(route),
+                                    visited_invokes,
+                                )?
+                            } else {
+                                true
+                            };
+                            visited_invokes.remove(name);
+                            if !continuation_only {
+                                return Ok(false);
+                            }
+                        }
+                    }
+                    _ => return Ok(false),
+                }
+            }
+        }
+        Ok(true)
     }
 
     fn emit_response_routes(
@@ -3860,6 +3982,20 @@ fn matcher_set_can_set_error(set: &MatcherSet) -> bool {
     false
 }
 
+fn matcher_eval_phase(name: &str, value: &Value) -> MatcherEvalPhase {
+    if matcher_can_set_error(name, value) {
+        MatcherEvalPhase::SetsError
+    } else if matcher_sets_captures(name) {
+        MatcherEvalPhase::Captures
+    } else {
+        MatcherEvalPhase::Plain
+    }
+}
+
+fn matcher_sets_captures(name: &str) -> bool {
+    matches!(name, "path_regexp" | "header_regexp" | "vars_regexp")
+}
+
 fn matcher_can_set_error(name: &str, value: &Value) -> bool {
     match name {
         "file" => file_matcher_has_status_fallback(value),
@@ -3935,6 +4071,7 @@ fn expression_ast_can_set_error(ast: &ExpressionAst) -> bool {
         ExpressionAst::Bool(_)
         | ExpressionAst::Eq(_, _)
         | ExpressionAst::Ne(_, _)
+        | ExpressionAst::Matches(_, _)
         | ExpressionAst::In(_, _)
         | ExpressionAst::NumericCompare { .. }
         | ExpressionAst::Call { .. } => false,
@@ -4000,6 +4137,7 @@ enum ExpressionAst {
     Not(Box<ExpressionAst>),
     Eq(String, String),
     Ne(String, String),
+    Matches(String, String),
     In(String, Vec<String>),
     NumericCompare {
         left: String,
@@ -4038,6 +4176,7 @@ enum ExpressionToken {
     RBracket,
     Colon,
     Comma,
+    Dot,
     Plus,
     Eq,
     Ne,
@@ -4103,6 +4242,18 @@ impl ExpressionParser {
             if self.consume(&ExpressionToken::Ne) {
                 return Ok(ExpressionAst::Ne(left, self.parse_numeric_expr()?));
             }
+            if self.consume(&ExpressionToken::Dot) {
+                let Some(ExpressionToken::Ident(method)) = self.next() else {
+                    bail!("expression string method requires method name");
+                };
+                if method != "matches" {
+                    bail!("unsupported expression string method {method:?}");
+                }
+                self.expect(ExpressionToken::LParen)?;
+                let pattern = self.parse_string_expr()?;
+                self.expect(ExpressionToken::RParen)?;
+                return Ok(ExpressionAst::Matches(left, pattern));
+            }
             if self.consume(&ExpressionToken::In) {
                 return Ok(ExpressionAst::In(left, self.parse_numeric_list()?));
             }
@@ -4141,7 +4292,7 @@ impl ExpressionParser {
 
     fn parse_not(&mut self) -> Result<ExpressionAst> {
         if self.consume(&ExpressionToken::Not) {
-            return Ok(ExpressionAst::Not(Box::new(self.parse_not()?)));
+            return Ok(ExpressionAst::Not(Box::new(self.parse_compare()?)));
         }
         self.parse_primary()
     }
@@ -4320,6 +4471,7 @@ fn tokenize_expression(expr: &str) -> Result<Vec<ExpressionToken>> {
             ']' => tokens.push(ExpressionToken::RBracket),
             ':' => tokens.push(ExpressionToken::Colon),
             ',' => tokens.push(ExpressionToken::Comma),
+            '.' => tokens.push(ExpressionToken::Dot),
             '+' => tokens.push(ExpressionToken::Plus),
             '=' => {
                 if chars.next().is_some_and(|(_, next)| next == '=') {
@@ -6250,7 +6402,7 @@ fn validate_reverse_proxy_fields(
         bail!("unsupported reverse_proxy field {key:?}");
     }
     if let Some(transport) = config.get("transport") {
-        validate_reverse_proxy_transport(transport)?;
+        validate_reverse_proxy_transport(transport, warnings)?;
     }
     if let Some(upstreams) = config.get("upstreams") {
         validate_reverse_proxy_upstreams(upstreams)?;
@@ -6492,7 +6644,7 @@ fn validate_reverse_proxy_upstreams(value: &Value) -> Result<()> {
     Ok(())
 }
 
-fn validate_reverse_proxy_transport(value: &Value) -> Result<()> {
+fn validate_reverse_proxy_transport(value: &Value, warnings: &mut Vec<String>) -> Result<()> {
     let obj = value
         .as_object()
         .ok_or_else(|| anyhow!("reverse_proxy.transport must be an object"))?;
@@ -6509,6 +6661,15 @@ fn validate_reverse_proxy_transport(value: &Value) -> Result<()> {
             "protocol" | "tls" => {}
             other
                 if unsupported_reverse_proxy_http_transport_field(other) && obj[key].is_null() => {}
+            "compression" if obj[key] == Value::Bool(false) => {}
+            other if ignorable_reverse_proxy_http_transport_field(other) => {
+                let warning = format!(
+                    "ignoring reverse_proxy.transport.{other}: transport tuning cannot be represented by generated eBPF middleware"
+                );
+                if !warnings.contains(&warning) {
+                    warnings.push(warning);
+                }
+            }
             other => bail!("unsupported reverse_proxy.transport field {other:?}"),
         }
     }
@@ -6526,6 +6687,23 @@ fn validate_reverse_proxy_transport(value: &Value) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn ignorable_reverse_proxy_http_transport_field(key: &str) -> bool {
+    matches!(
+        key,
+        "keep_alive"
+            | "max_conns_per_host"
+            | "dial_timeout"
+            | "dial_fallback_delay"
+            | "response_header_timeout"
+            | "expect_continue_timeout"
+            | "max_response_header_size"
+            | "write_buffer_size"
+            | "read_buffer_size"
+            | "read_timeout"
+            | "write_timeout"
+    )
 }
 
 fn unsupported_reverse_proxy_http_transport_field(key: &str) -> bool {
@@ -6550,6 +6728,13 @@ fn unsupported_reverse_proxy_http_transport_field(key: &str) -> bool {
             | "local_address"
             | "network_proxy"
     )
+}
+
+fn reverse_proxy_transport_compression_off(transport: Option<&Value>) -> bool {
+    transport
+        .and_then(Value::as_object)
+        .and_then(|obj| obj.get("compression"))
+        .is_some_and(|compression| compression == &Value::Bool(false))
 }
 
 fn private_ranges_cidr() -> [&'static str; 6] {
@@ -7122,7 +7307,7 @@ mod tests {
     }
 
     #[test]
-    fn compiles_nonterminal_reverse_proxy_handle_response_routes() {
+    fn rejects_nonterminal_reverse_proxy_handle_response_routes_that_suppress_body() {
         let source = r#"{
           "apps": {"http": {"servers": {"srv0": {"routes": [{
             "handle": [{
@@ -7138,12 +7323,15 @@ mod tests {
           }]}}}}
         }"#;
 
-        let c = compile_caddy_json(source).unwrap();
-        assert!(c.contains("zs_res_continue_request();"), "{c}");
+        let err = compile_caddy_json(source).unwrap_err().to_string();
+        assert!(
+            err.contains("reverse_proxy.handle_response routes suppress upstream response bodies"),
+            "{err}"
+        );
     }
 
     #[test]
-    fn compiles_grouped_reverse_proxy_handle_response_routes() {
+    fn rejects_grouped_reverse_proxy_handle_response_routes_that_suppress_body() {
         let source = r#"{
           "apps": {"http": {"servers": {"srv0": {"routes": [{
             "handle": [{
@@ -7160,8 +7348,11 @@ mod tests {
           }]}}}}
         }"#;
 
-        let c = compile_caddy_json(source).unwrap();
-        assert!(c.contains("zs_res_continue_request();"), "{c}");
+        let err = compile_caddy_json(source).unwrap_err().to_string();
+        assert!(
+            err.contains("reverse_proxy.handle_response routes suppress upstream response bodies"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -7778,6 +7969,28 @@ mod tests {
     }
 
     #[test]
+    fn compiles_capture_matchers_before_placeholder_consumers() {
+        let source = r#"{
+          "apps": {"http": {"servers": {"srv0": {"routes": [{
+            "match": [{
+              "file": {"try_files": ["{http.regexp.mdpath.1}/index.md"]},
+              "header": {"Accept": ["*text/markdown*"]},
+              "path_regexp": {"name": "mdpath", "pattern": "^(.+?)/?$"}
+            }],
+            "handle": [{"handler": "static_response", "status_code": 204}]
+          }]}}}}
+        }"#;
+
+        let c = compile_caddy_json(source).unwrap();
+        let regex_pos = c.find("zs_caddy_regex_match(").expect("regex matcher");
+        let file_pos = c.find("zs_caddy_file_match(").expect("file matcher");
+        assert!(
+            regex_pos < file_pos,
+            "capture-producing matcher must run before file matcher:\n{c}"
+        );
+    }
+
+    #[test]
     fn compiles_regex_matcher_quantifiers_with_braces() {
         let source = r#"{
           "apps": {"http": {"servers": {"srv0": {"routes": [{
@@ -7841,7 +8054,7 @@ mod tests {
         let source = r#"{
           "apps": {"http": {"servers": {"srv0": {"routes": [{
             "match": [{"expression": {
-              "expr": "(path('/api/' + {http.request.uri.query.suffix}) && method('GET', 'POST') && query({'de' + {http.request.uri.query.key}: ['de' + {http.request.uri.query.debug}]})) || query({{http.vars.query_key}: '1'}) || (true && {http.request.uri.query.cmp} == 'ok') || ({http.request.uri.query.code} in ['200', '204']) || ({http.request.uri.query.mode} in ['debug', 'trace']) || path_regexp('^/named/(.+)$') || protocol('HTTPs') || (host('example.test') && protocol('http') && header({'X-' + {http.request.uri.query.header}: ['debug', 'trace']}) && vars({'mo' + {http.request.uri.query.var_key}: 'debug'})) || vars({'\\{http.vars.mode}': 'debug'}) || (path_regexp('slug', '^/expr/(.+)$') && header_regexp('tok', 'X-Token', '^Bearer (.+)$') && vars_regexp('mode', '{http.vars.mode}', '^debug$') && remote_ip('127.0.0.1') && client_ip('127.0.0.1') && file({http.request.uri.path}) && file({'try_files': ['/index.html'], 'try_policy': 'first_exist'}))",
+              "expr": "(path('/api/' + {http.request.uri.query.suffix}) && method('GET', 'POST') && query({'de' + {http.request.uri.query.key}: ['de' + {http.request.uri.query.debug}]})) || query({{http.vars.query_key}: '1'}) || (true && {http.request.uri.query.cmp} == 'ok') || ({http.request.uri.query.code} in ['200', '204']) || ({http.request.uri.query.mode} in ['debug', 'trace']) || {http.request.header.X-Request-Id}.matches('^[0-9A-F-]+$') || !{http.request.header.X-Request-Id}.matches('^blocked$') || path_regexp('^/named/(.+)$') || protocol('HTTPs') || (host('example.test') && protocol('http') && header({'X-' + {http.request.uri.query.header}: ['debug', 'trace']}) && vars({'mo' + {http.request.uri.query.var_key}: 'debug'})) || vars({'\\{http.vars.mode}': 'debug'}) || (path_regexp('slug', '^/expr/(.+)$') && header_regexp('tok', 'X-Token', '^Bearer (.+)$') && vars_regexp('mode', '{http.vars.mode}', '^debug$') && remote_ip('127.0.0.1') && client_ip('127.0.0.1') && file({http.request.uri.path}) && file({'try_files': ['/index.html'], 'try_policy': 'first_exist'}))",
               "name": "api"
             }}],
             "handle": [{"handler": "static_response", "status_code": 204}]
@@ -7861,6 +8074,9 @@ mod tests {
         assert!(c.contains("zs_caddy_expr_in("), "{c}");
         assert!(c.contains("{http.request.uri.query.code}"), "{c}");
         assert!(c.contains("{http.request.uri.query.mode}"), "{c}");
+        assert!(c.contains("expr_match_left_"), "{c}");
+        assert!(c.contains("{http.request.header.X-Request-Id}"), "{c}");
+        assert!(c.contains("blocked"), "{c}");
         assert!(c.contains("zs_caddy_host_match("), "{c}");
         assert!(c.contains("zs_req_is_tls() != 0"), "{c}");
         assert!(c.contains("zs_req_is_tls() == 0"), "{c}");
@@ -8802,8 +9018,8 @@ mod tests {
 
         let c = compile_caddy_json(source).unwrap();
         let outer_hook = c.find("zs_res_hook(").unwrap();
-        let clear = c.find("zs_res_hooks_clear();").unwrap();
-        let error_response = c.find("handled").unwrap();
+        let clear = outer_hook + c[outer_hook..].find("zs_res_hooks_clear();").unwrap();
+        let error_response = clear + c[clear..].find("handled").unwrap();
         assert!(outer_hook < clear, "{c}");
         assert!(clear < error_response, "{c}");
     }
@@ -9051,10 +9267,10 @@ mod tests {
     }
 
     #[test]
-    fn compiles_reverse_proxy_handle_response_header_routes() {
-        // Header-only handle_response routes leave the upstream body untouched,
-        // so they are supported: emit the response hook and continue the proxied
-        // response.
+    fn rejects_reverse_proxy_handle_response_header_routes() {
+        // Caddy header-only handle_response routes suppress the upstream body.
+        // zeroserve intentionally does not reproduce response body suppression,
+        // so reject these routes instead of streaming the upstream body through.
         let source = r#"{
           "apps": {"http": {"servers": {"srv0": {"routes": [{
             "handle": [{
@@ -9069,9 +9285,11 @@ mod tests {
           }]}}}}
         }"#;
 
-        let c = compile_caddy_json(source).unwrap();
-        assert!(c.contains("zs_caddy_copy_response_headers("), "{c}");
-        assert!(c.contains("zs_res_continue_request();"), "{c}");
+        let err = compile_caddy_json(source).unwrap_err().to_string();
+        assert!(
+            err.contains("reverse_proxy.handle_response routes suppress upstream response bodies"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -9123,9 +9341,11 @@ mod tests {
     }
 
     #[test]
-    fn compiles_copy_response_headers_null_lists_like_caddy_json() {
-        // include/exclude both null means "copy all upstream headers"; the body
-        // is untouched, so this is supported.
+    fn rejects_copy_response_headers_null_lists_without_body_copy() {
+        // include/exclude both null means "copy all upstream headers", but a
+        // Caddy handle_response route still suppresses the upstream body unless
+        // copy_response is used. zeroserve does not implement either body
+        // suppression or body copying.
         let source = r#"{
           "apps": {"http": {"servers": {"srv0": {"routes": [{
             "handle": [{
@@ -9138,13 +9358,15 @@ mod tests {
           }]}}}}
         }"#;
 
-        let c = compile_caddy_json(source).unwrap();
-        assert!(c.contains("zs_caddy_copy_response_headers("), "{c}");
-        assert!(c.contains("zs_res_continue_request();"), "{c}");
+        let err = compile_caddy_json(source).unwrap_err().to_string();
+        assert!(
+            err.contains("reverse_proxy.handle_response routes suppress upstream response bodies"),
+            "{err}"
+        );
     }
 
     #[test]
-    fn compiles_response_route_subroutes() {
+    fn rejects_reverse_proxy_response_route_subroutes_that_suppress_body() {
         let source = r#"{
           "apps": {"http": {"servers": {"srv0": {"routes": [{
             "handle": [{
@@ -9161,8 +9383,11 @@ mod tests {
           }]}}}}
         }"#;
 
-        let c = compile_caddy_json(source).unwrap();
-        assert!(c.contains("zs_res_continue_request();"), "{c}");
+        let err = compile_caddy_json(source).unwrap_err().to_string();
+        assert!(
+            err.contains("reverse_proxy.handle_response routes suppress upstream response bodies"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -9190,7 +9415,7 @@ mod tests {
     }
 
     #[test]
-    fn compiles_response_route_invoke() {
+    fn rejects_reverse_proxy_response_route_invoke_that_suppresses_body() {
         let source = r#"{
           "apps": {"http": {"servers": {"srv0": {
             "named_routes": {"mark": {
@@ -9211,8 +9436,11 @@ mod tests {
           }}}}
         }"#;
 
-        let c = compile_caddy_json(source).unwrap();
-        assert!(c.contains("zs_res_continue_request();"), "{c}");
+        let err = compile_caddy_json(source).unwrap_err().to_string();
+        assert!(
+            err.contains("reverse_proxy.handle_response routes suppress upstream response bodies"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -9566,7 +9794,7 @@ mod tests {
     }
 
     #[test]
-    fn compiles_reverse_proxy_handle_response_with_upstream_placeholders() {
+    fn rejects_reverse_proxy_handle_response_upstream_placeholders_that_suppress_body() {
         let source = r#"{
           "apps": {"http": {"servers": {"srv0": {"routes": [{
             "handle": [{
@@ -9583,9 +9811,11 @@ mod tests {
           }]}}}}
         }"#;
 
-        let c = compile_caddy_json(source).unwrap();
-        assert!(c.contains("zs_caddy_response_headers("), "{c}");
-        assert!(c.contains("zs_res_continue_request();"), "{c}");
+        let err = compile_caddy_json(source).unwrap_err().to_string();
+        assert!(
+            err.contains("reverse_proxy.handle_response routes suppress upstream response bodies"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -11195,15 +11425,108 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_reverse_proxy_transport_fields() {
+    fn warns_on_ignorable_reverse_proxy_transport_tuning_fields() {
         let source = r#"{
           "apps": {"http": {"servers": {"srv0": {"routes": [{
-            "handle": [{"handler": "reverse_proxy", "transport": {"protocol": "http", "read_timeout": 1000000000}, "upstreams": [{"dial": "127.0.0.1:8080"}]}]
+            "handle": [{"handler": "reverse_proxy",
+              "transport": {
+                "protocol": "http",
+                "read_timeout": 1000000000,
+                "write_timeout": 2000000000,
+                "dial_timeout": 3000000000,
+                "keep_alive": {"max_idle_conns": 10},
+                "max_conns_per_host": 32
+              },
+              "upstreams": [{"dial": "127.0.0.1:8080"}]}]
           }]}}}}
         }"#;
 
-        let err = compile_caddy_json(source).unwrap_err().to_string();
-        assert!(err.contains("unsupported reverse_proxy.transport field \"read_timeout\""));
+        let (code, warnings) = compile_caddy_json_collecting(source).unwrap();
+        assert!(code.contains("zs_reverse_proxy(\"http://127.0.0.1:8080\""));
+        for field in [
+            "read_timeout",
+            "write_timeout",
+            "dial_timeout",
+            "keep_alive",
+            "max_conns_per_host",
+        ] {
+            assert!(
+                warnings
+                    .iter()
+                    .any(|w| { w.contains(&format!("ignoring reverse_proxy.transport.{field}")) }),
+                "{warnings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn warns_on_caddyfile_reverse_proxy_transport_timeout_and_keepalive_aliases() {
+        let (json, adapter_warnings) = crate::caddyfile::adapt(
+            r#"example.com {
+  reverse_proxy 127.0.0.1:8080 {
+    transport http {
+      read_timeout 300s
+      write_timeout 300s
+      dial_timeout 30s
+      keepalive 90s
+      keepalive_idle_conns 10
+      keepalive_idle_conns_per_host 5
+      max_conns_per_host 0
+    }
+  }
+}"#,
+            "Caddyfile",
+        )
+        .unwrap();
+        assert!(adapter_warnings.is_empty(), "{adapter_warnings:?}");
+
+        let (code, compiler_warnings) = compile_caddy_json_collecting(&json.to_string()).unwrap();
+        assert!(code.contains("zs_reverse_proxy(\"http://127.0.0.1:8080\""));
+        for field in [
+            "read_timeout",
+            "write_timeout",
+            "dial_timeout",
+            "keep_alive",
+            "max_conns_per_host",
+        ] {
+            assert!(
+                compiler_warnings
+                    .iter()
+                    .any(|w| w.contains(&format!("ignoring reverse_proxy.transport.{field}"))),
+                "{field}: {compiler_warnings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compiles_caddyfile_reverse_proxy_transport_compression_off() {
+        let (json, adapter_warnings) = crate::caddyfile::adapt(
+            r#"example.com {
+  reverse_proxy 127.0.0.1:8080 {
+    transport http {
+      compression off
+    }
+  }
+}"#,
+            "Caddyfile",
+        )
+        .unwrap();
+        assert!(adapter_warnings.is_empty(), "{adapter_warnings:?}");
+
+        let (code, compiler_warnings) = compile_caddy_json_collecting(&json.to_string()).unwrap();
+        assert!(
+            !compiler_warnings
+                .iter()
+                .any(|warning| warning.contains("compression")),
+            "{compiler_warnings:?}"
+        );
+        assert!(
+            code.contains(
+                "zs_meta_set(ZS_STR(\"zs.caddy.reverse_proxy.compression\"), ZS_STR(\"off\"));"
+            ),
+            "{code}"
+        );
+        assert!(code.contains("zs_reverse_proxy(\"http://127.0.0.1:8080\""));
     }
 
     #[test]

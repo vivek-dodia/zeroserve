@@ -512,6 +512,19 @@ impl ScriptRequest {
         self.proxy_headers = None;
     }
 
+    pub(crate) fn restore_original_uri(&mut self) {
+        self.uri = self.original_uri.clone();
+        self.path = self.original_path.clone();
+        self.query = self.original_query.clone();
+        self.query_params = parse_query_params(&self.query);
+        self.query_param_values = parse_query_param_values(&self.query);
+        let (caddy_query_params, caddy_query_valid) = parse_caddy_query_params(&self.query);
+        self.caddy_query_params = caddy_query_params;
+        self.caddy_query_valid = caddy_query_valid;
+        self.uri_changed = true;
+        self.clear_proxy_overrides();
+    }
+
     pub fn set_uri(&mut self, uri: &str) -> Result<(), ()> {
         let uri = uri.trim();
         if uri.is_empty() {

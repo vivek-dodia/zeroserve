@@ -20,10 +20,6 @@ example.com {
 			header Content-Type text/*
 		}
 	}
-	templates {
-		mime text/html text/plain
-		delimiters [[ ]]
-	}
 	metrics /metrics {
 		disable_openmetrics
 	}

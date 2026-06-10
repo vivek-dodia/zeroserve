@@ -225,6 +225,10 @@ impl<IO> H1Connection<IO> {
         self.io.as_mut().ok_or(HttpError::MissingIo)
     }
 
+    pub fn io_ref(&self) -> Option<&IO> {
+        self.io.as_ref()
+    }
+
     pub fn take_io(&mut self) -> Option<(IO, Vec<u8>)> {
         let io = self.io.take()?;
         if self.pos > 0 {

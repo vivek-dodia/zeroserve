@@ -42,6 +42,26 @@ async function compile(config: string, name: string): Promise<string> {
   }
 }
 
+async function compileErr(config: string, name: string): Promise<string> {
+  const dir = await Deno.makeTempDir();
+  const path = join(dir, name);
+  await Deno.writeTextFile(path, config);
+  try {
+    const zeroservePath = await getZeroservePath();
+    const out = await new Deno.Command(zeroservePath, {
+      args: ["--caddy-compile", path],
+      stdout: "piped",
+      stderr: "piped",
+    }).output();
+    if (out.success) {
+      throw new Error("expected caddy-compile to fail");
+    }
+    return new TextDecoder().decode(out.stderr);
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+}
+
 Deno.test("adapt a Caddyfile to Caddy JSON", async () => {
   const json = JSON.parse(await adapt(`example.com {
   respond /api/* "api" 200
@@ -88,8 +108,8 @@ Deno.test("caddy-compile still accepts Caddy JSON", async () => {
   assertStringIncludes(c, "zs_caddy_respond_static(\"200\"");
 });
 
-Deno.test("caddy-compile adapts reverse_proxy handle_response", async () => {
-  const c = await compile(
+Deno.test("caddy-compile rejects response-only reverse_proxy handle_response", async () => {
+  const err = await compileErr(
     `example.com {
   reverse_proxy 127.0.0.1:8080 {
     @ok {
@@ -107,9 +127,10 @@ Deno.test("caddy-compile adapts reverse_proxy handle_response", async () => {
 }`,
     "Caddyfile",
   );
-  assertStringIncludes(c, "zs_caddy_copy_response_headers(");
-  assertStringIncludes(c, "zs_caddy_set_response_status(\"299\"");
-  assertStringIncludes(c, "zs_caddy_res_header_match(\"X-Origin\"");
+  assertStringIncludes(
+    err,
+    "reverse_proxy.handle_response routes suppress upstream response bodies",
+  );
 });
 
 Deno.test("caddy-compile adapts forward_auth copy_headers", async () => {

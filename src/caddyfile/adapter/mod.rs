@@ -4,11 +4,11 @@
 //! directive order, wrapped in a terminal subroute under the block's host/path
 //! matchers, and assembled into `apps.http.servers.srvN.routes`.
 //!
-//! Scope note: TLS/PKI/auto-HTTPS apps and exact per-listener server splitting
-//! are not reproduced (they fall outside zeroserve's eBPF request-processing
-//! surface, which is what the downstream `caddy_compile` consumes). Site blocks
-//! are grouped into servers by their derived listen port, and the substantive
-//! `apps.http` route tree is produced faithfully.
+//! Scope note: TLS/PKI/auto-HTTPS apps are not reproduced (they fall outside
+//! zeroserve's eBPF request-processing surface, which is what the downstream
+//! `caddy_compile` consumes). Site blocks are paired into servers by derived
+//! listener addresses, and the substantive `apps.http` route tree is produced
+//! faithfully.
 
 pub mod handlers;
 pub mod matchers;
@@ -21,7 +21,7 @@ use std::rc::Rc;
 use anyhow::{Result, bail};
 use serde_json::{Map, Value, json};
 
-use super::address::{Address, specificity};
+use super::address::{Address, join_host_port, specificity};
 use super::dispenser::Dispenser;
 use super::parser::ServerBlock;
 use super::token::Token;
@@ -277,6 +277,7 @@ pub fn adapt(blocks: Vec<ServerBlock>) -> Result<(Value, Vec<String>)> {
 
         compiled.push(CompiledBlock {
             key_texts: block.keys_text(),
+            bind_hosts: site_bind_hosts(&block),
             parsed_keys,
             routes,
             error_routes,
@@ -457,15 +458,23 @@ fn build_named_routes(
 
 struct CompiledBlock {
     key_texts: Vec<String>,
+    bind_hosts: Vec<String>,
     parsed_keys: Vec<Address>,
     routes: Vec<ConfigValue>,
     error_routes: Vec<Subroute>,
 }
 
+#[derive(Debug, Clone)]
+struct BlockPlacement {
+    block_idx: usize,
+    listen: Vec<String>,
+    matcher_keys: Vec<Address>,
+}
+
 /// Groups site blocks into servers by their derived listen port and builds each
 /// server's route list. Mirrors the substantive part of `serversFromPairings`.
 fn build_servers(
-    mut blocks: Vec<CompiledBlock>,
+    blocks: Vec<CompiledBlock>,
     options: &Options,
     counter: &Rc<RefCell<Counter>>,
     warnings: &Rc<RefCell<Vec<String>>>,
@@ -474,35 +483,36 @@ fn build_servers(
     let http_port = options.http_port.unwrap_or(DEFAULT_HTTP_PORT);
     let https_port = options.https_port.unwrap_or(DEFAULT_HTTPS_PORT);
 
-    // Determine listen addresses per block and group by the set of ports.
-    // Group key is the sorted, comma-joined list of `:port` addresses.
+    // Determine listen addresses per key and group placements by listener set.
     let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-    let mut listen_for: Vec<Vec<String>> = Vec::with_capacity(blocks.len());
+    let mut placements = Vec::<BlockPlacement>::new();
     for (idx, block) in blocks.iter().enumerate() {
-        let listen = listen_addrs(&block.parsed_keys, http_port, https_port);
-        let key = listen.join(",");
-        groups.entry(key).or_default().push(idx);
-        listen_for.push(listen);
+        for placement in block_placements(idx, block, http_port, https_port) {
+            let key = placement.listen.join(",");
+            groups.entry(key).or_default().push(placements.len());
+            placements.push(placement);
+        }
     }
 
-    detect_ambiguous_site_definitions(&blocks, &listen_for)?;
+    detect_ambiguous_site_definitions(&blocks, &placements)?;
 
     // Sort blocks within each group by host/path specificity (most specific
     // first; catch-all last), mirroring serversFromPairings' stable sort.
     let mut servers = Map::new();
-    for (srv_index, (_, mut idxs)) in groups.into_iter().enumerate() {
-        idxs.sort_by(|&a, &b| {
-            block_specificity_cmp(&blocks[a].parsed_keys, &blocks[b].parsed_keys)
+    for (srv_index, (_, mut placement_idxs)) in groups.into_iter().enumerate() {
+        placement_idxs.sort_by(|&a, &b| {
+            block_specificity_cmp(&placements[a].matcher_keys, &placements[b].matcher_keys)
         });
 
-        let listen = listen_for[*idxs.first().unwrap()].clone();
+        let listen = placements[*placement_idxs.first().unwrap()].listen.clone();
         let mut routes: Vec<Value> = Vec::new();
         let mut error_routes: Vec<Value> = Vec::new();
 
-        for &i in &idxs {
-            let block = std::mem::take(&mut blocks[i].routes);
-            let err_subs = std::mem::take(&mut blocks[i].error_routes);
-            let matcher_sets = compile_encoded_matcher_sets(&blocks[i].parsed_keys)?;
+        for &placement_idx in &placement_idxs {
+            let placement = &placements[placement_idx];
+            let block = blocks[placement.block_idx].routes.clone();
+            let err_subs = blocks[placement.block_idx].error_routes.clone();
+            let matcher_sets = compile_encoded_matcher_sets(&placement.matcher_keys)?;
 
             let site_subroute =
                 handlers::build_subroute(block, counter, true, &options.directive_order)?;
@@ -510,7 +520,7 @@ fn build_servers(
                 &mut routes,
                 &site_subroute,
                 &matcher_sets,
-                idxs.len() == 1,
+                placement_idxs.len() == 1,
             );
 
             if !err_subs.is_empty() {
@@ -527,7 +537,9 @@ fn build_servers(
         if !listen.is_empty() {
             srv.insert("listen".into(), json!(listen));
         }
-        srv.insert("routes".into(), Value::Array(routes));
+        if !routes.is_empty() {
+            srv.insert("routes".into(), Value::Array(routes));
+        }
         if !error_routes.is_empty() {
             srv.insert("errors".into(), json!({ "routes": error_routes }));
         }
@@ -535,7 +547,12 @@ fn build_servers(
             srv.insert("named_routes".into(), Value::Object(named_routes.clone()));
         }
         options.apply_to_server(&mut srv, &mut warnings.borrow_mut());
-        servers.insert(format!("srv{srv_index}"), Value::Object(srv));
+        let name = listen
+            .iter()
+            .find_map(|addr| options.server_names.get(addr))
+            .cloned()
+            .unwrap_or_else(|| format!("srv{srv_index}"));
+        servers.insert(name, Value::Object(srv));
     }
 
     Ok(servers)
@@ -543,24 +560,76 @@ fn build_servers(
 
 fn detect_ambiguous_site_definitions(
     blocks: &[CompiledBlock],
-    listen_for: &[Vec<String>],
+    placements: &[BlockPlacement],
 ) -> Result<()> {
-    for i in 0..blocks.len() {
-        for j in (i + 1)..blocks.len() {
-            if !listen_for[i]
+    for i in 0..placements.len() {
+        for j in (i + 1)..placements.len() {
+            if placements[i].block_idx == placements[j].block_idx {
+                continue;
+            }
+            if !placements[i]
+                .listen
                 .iter()
-                .any(|listen| listen_for[j].contains(listen))
+                .any(|listen| placements[j].listen.contains(listen))
             {
                 continue;
             }
-            for key in &blocks[i].key_texts {
-                if blocks[j].key_texts.contains(key) {
+            for key in &blocks[placements[i].block_idx].key_texts {
+                if blocks[placements[j].block_idx].key_texts.contains(key) {
                     bail!("ambiguous site definition: {key}");
                 }
             }
         }
     }
     Ok(())
+}
+
+fn block_placements(
+    block_idx: usize,
+    block: &CompiledBlock,
+    http_port: i64,
+    https_port: i64,
+) -> Vec<BlockPlacement> {
+    let mut by_listener = BTreeMap::<String, BlockPlacement>::new();
+    for addr in &block.parsed_keys {
+        let listen = listen_addrs_for_key(addr, &block.bind_hosts, http_port, https_port);
+        let key = listen.join(",");
+        let placement = by_listener.entry(key).or_insert_with(|| BlockPlacement {
+            block_idx,
+            listen,
+            matcher_keys: Vec::new(),
+        });
+        placement.matcher_keys.push(addr.clone());
+    }
+    if by_listener.is_empty() {
+        by_listener.insert(
+            format!(":{https_port}"),
+            BlockPlacement {
+                block_idx,
+                listen: vec![format!(":{https_port}")],
+                matcher_keys: Vec::new(),
+            },
+        );
+    }
+    by_listener.into_values().collect()
+}
+
+fn site_bind_hosts(block: &ServerBlock) -> Vec<String> {
+    let mut hosts = Vec::new();
+    for segment in &block.segments {
+        if segment.first().is_none_or(|token| token.text != "bind") {
+            continue;
+        }
+        for token in segment.iter().skip(1) {
+            if token.text == "{" {
+                break;
+            }
+            if !hosts.contains(&token.text) {
+                hosts.push(token.text.clone());
+            }
+        }
+    }
+    hosts
 }
 
 fn sort_error_subroutes(subroutes: Vec<Subroute>) -> Vec<Subroute> {
@@ -577,35 +646,37 @@ fn sort_error_subroutes(subroutes: Vec<Subroute>) -> Vec<Subroute> {
             matched.push(subroute);
         }
     }
+    matched.reverse();
     matched.extend(fallback);
     matched
 }
 
-/// Derives the listen addresses (`:port`) for a block's keys.
-fn listen_addrs(keys: &[Address], http_port: i64, https_port: i64) -> Vec<String> {
-    let mut ports: Vec<String> = Vec::new();
-    for addr in keys {
-        let port = if !addr.port.is_empty() {
-            addr.port.clone()
-        } else if addr.scheme == "http" {
-            http_port.to_string()
-        } else if addr.scheme == "https" {
-            https_port.to_string()
-        } else if !addr.host.is_empty() {
-            https_port.to_string()
-        } else {
-            https_port.to_string()
-        };
-        let listen = format!(":{port}");
-        if !ports.contains(&listen) {
-            ports.push(listen);
-        }
-    }
-    if ports.is_empty() {
-        ports.push(format!(":{https_port}"));
-    }
-    ports.sort();
-    ports
+fn listen_addrs_for_key(
+    addr: &Address,
+    bind_hosts: &[String],
+    http_port: i64,
+    https_port: i64,
+) -> Vec<String> {
+    let port = if !addr.port.is_empty() {
+        addr.port.clone()
+    } else if addr.scheme == "http" {
+        http_port.to_string()
+    } else if addr.scheme == "https" {
+        https_port.to_string()
+    } else {
+        https_port.to_string()
+    };
+    let mut listen = if bind_hosts.is_empty() {
+        vec![format!(":{port}")]
+    } else {
+        bind_hosts
+            .iter()
+            .map(|host| join_host_port(host, &port))
+            .collect()
+    };
+    listen.sort();
+    listen.dedup();
+    listen
 }
 
 /// Comparison used to sort server blocks: most specific host (then path) first,
@@ -1741,6 +1812,9 @@ example.com {
   handle_errors {
     respond "fallback"
   }
+  handle_errors 5xx {
+    respond "5xx"
+  }
   handle_errors 4xx {
     respond "4xx"
   }
@@ -1755,9 +1829,17 @@ example.com {
             site_error_routes[0]["handle"][0]["routes"][0]["handle"][0]["body"],
             "4xx"
         );
-        assert!(site_error_routes[1].get("match").is_none());
+        assert_eq!(
+            site_error_routes[1]["match"][0]["expression"],
+            "{http.error.status_code} >= 500 && {http.error.status_code} <= 599"
+        );
         assert_eq!(
             site_error_routes[1]["handle"][0]["routes"][0]["handle"][0]["body"],
+            "5xx"
+        );
+        assert!(site_error_routes[2].get("match").is_none());
+        assert_eq!(
+            site_error_routes[2]["handle"][0]["routes"][0]["handle"][0]["body"],
             "fallback"
         );
     }
@@ -1899,7 +1981,7 @@ example.com {
 }"#,
         );
 
-        let srv = &v["apps"]["http"]["servers"]["srv0"];
+        let srv = &v["apps"]["http"]["servers"]["app"];
         assert_eq!(srv["keepalive_interval"], 30_000_000_000_i64);
         assert_eq!(srv["keepalive_idle"], 120_000_000_000_i64);
         assert_eq!(srv["keepalive_count"], 3);
@@ -2507,6 +2589,7 @@ unix.example.com {
       a api.example.com 8443 {
         refresh 1m
         versions ipv4 ipv6
+        dial_fallback_delay -1s
       }
     }
   }
@@ -2536,6 +2619,10 @@ unix.example.com {
         assert_eq!(
             dynamic["sources"][1]["versions"],
             json!({"ipv4": true, "ipv6": true})
+        );
+        assert_eq!(
+            dynamic["sources"][1]["dial_fallback_delay"],
+            -1_000_000_000_i64
         );
     }
 
@@ -2928,6 +3015,7 @@ unix.example.com {
       proxy_protocol v2
       forward_proxy_url http://proxy.example:8080
       max_conns_per_host 32
+      resolvers 1.1.1.1 8.8.8.8
       keepalive 2m
       keepalive_interval 30s
       keepalive_idle_conns 100
@@ -2947,6 +3035,10 @@ unix.example.com {
             json!({"from": "url", "url": "http://proxy.example:8080"})
         );
         assert_eq!(h["transport"]["max_conns_per_host"], 32);
+        assert_eq!(
+            h["transport"]["resolver"],
+            json!({"addresses": ["1.1.1.1", "8.8.8.8"]})
+        );
         assert_eq!(
             h["transport"]["keep_alive"],
             json!({
@@ -3208,6 +3300,24 @@ unix.example.com {
         );
         let h = &r[0]["handle"][0]["routes"][0]["handle"][0];
         assert_eq!(h["transport"], json!({"protocol": "fastcgi"}));
+    }
+
+    #[test]
+    fn reverse_proxy_fastcgi_transport_adapts_split_path() {
+        let r = routes(
+            r#"example.com {
+  reverse_proxy *.php 127.0.0.1:9000 {
+    transport fastcgi {
+      split .php .php5
+    }
+  }
+}"#,
+        );
+        let h = &r[0]["handle"][0]["routes"][0]["handle"][0];
+        assert_eq!(
+            h["transport"],
+            json!({"protocol": "fastcgi", "split_path": [".php", ".php5"]})
+        );
     }
 
     #[test]
@@ -3970,6 +4080,33 @@ example.com {
     }
 
     #[test]
+    fn php_fastcgi_split_extensions_match_caddy_fallback_policy() {
+        let r = routes(
+            r#"example.com {
+  php_fastcgi localhost:9000 {
+    split .php .php5
+    index index.php5
+  }
+}"#,
+        );
+        let routes = r[0]["handle"][0]["routes"].as_array().unwrap();
+        assert_eq!(
+            routes[1]["match"][0]["file"]["try_files"],
+            json!([
+                "{http.request.uri.path}",
+                "{http.request.uri.path}/index.php5",
+                "index.php5"
+            ])
+        );
+        assert_eq!(
+            routes[1]["match"][0]["file"]["try_policy"],
+            "first_exist_fallback"
+        );
+        let proxy = &routes[2]["handle"][0];
+        assert_eq!(proxy["transport"]["split_path"], json!([".php", ".php5"]));
+    }
+
+    #[test]
     fn php_fastcgi_passes_trusted_proxies_to_reverse_proxy() {
         let r = routes(
             r#"example.com {
@@ -4372,6 +4509,32 @@ example.com {
       first 5
       thereafter 100
     }
+  }
+  respond ok
+}"#,
+        );
+        assert!(warnings.iter().any(|w| w.contains("site log directive")));
+        let h = &v["apps"]["http"]["servers"]["srv0"]["routes"][0]["handle"][0]["routes"][0]["handle"]
+            [0];
+        assert_eq!(h["handler"], "static_response");
+    }
+
+    #[test]
+    fn site_log_accepts_nested_format_append_outside_ebpf_surface() {
+        let (v, warnings) = adapt_full(
+            r#"example.com {
+  log {
+    output stdout
+    format append {
+      fields {
+        svc peekaping:gateway
+      }
+      wrap json {
+        time_format iso8601
+        message_key msg
+      }
+    }
+    level info
   }
   respond ok
 }"#,
@@ -4885,6 +5048,79 @@ https://example.com {
         .0;
         let servers = v["apps"]["http"]["servers"].as_object().unwrap();
         assert_eq!(servers.len(), 2);
+    }
+
+    #[test]
+    fn mixed_scheme_site_block_pairs_each_listener_like_caddy() {
+        let v = adapt_full(
+            r#"abcdef {
+  respond "abcdef"
+}
+abcdefg {
+  respond "abcdefg"
+}
+abc {
+  respond "abc"
+}
+abcde, http://abcde {
+  respond "abcde"
+}"#,
+        )
+        .0;
+
+        let servers = v["apps"]["http"]["servers"].as_object().unwrap();
+        assert_eq!(servers["srv0"]["listen"], json!([":443"]));
+        assert_eq!(
+            servers["srv0"]["routes"][2]["match"][0]["host"],
+            json!(["abcde"])
+        );
+        assert_eq!(servers["srv1"]["listen"], json!([":80"]));
+        assert_eq!(
+            servers["srv1"]["routes"][0]["match"][0]["host"],
+            json!(["abcde"])
+        );
+    }
+
+    #[test]
+    fn server_names_and_site_bind_shape_listeners_like_caddy() {
+        let v = adapt_full(
+            r#"{
+  servers :443 {
+    name https
+  }
+  servers :8000 {
+    name app1
+  }
+  servers :8001 {
+    name app2
+  }
+  servers 123.123.123.123:8002 {
+    name bind-server
+  }
+}
+
+example.com {
+}
+:8000 {
+}
+:8001, :8002 {
+}
+:8002 {
+  bind 123.123.123.123 222.222.222.222
+}"#,
+        )
+        .0;
+
+        let servers = v["apps"]["http"]["servers"].as_object().unwrap();
+        assert_eq!(servers["https"]["listen"], json!([":443"]));
+        assert_eq!(servers["app1"]["listen"], json!([":8000"]));
+        assert_eq!(servers["app2"]["listen"], json!([":8001"]));
+        assert_eq!(
+            servers["bind-server"]["listen"],
+            json!(["123.123.123.123:8002", "222.222.222.222:8002"])
+        );
+        assert_eq!(servers["srv4"]["listen"], json!([":8002"]));
+        assert!(servers["app1"].get("routes").is_none());
     }
 
     #[test]

@@ -31,8 +31,52 @@ def strip_config_hide(node):
     return node
 
 
+def strip_zeroserve_access_log(node):
+    """Drop zeroserve's synthetic access-log handlers from route comparisons.
+
+    Caddy keeps access-log config outside the request route tree, while
+    zeroserve lowers supported file access logs to internal `caddy_access_log`
+    handlers so the runtime can write them from generated middleware. They are
+    tested separately by Deno runtime tests; the golden route-tree comparator
+    should not count those internal shims as adapter mismatches.
+    """
+    if isinstance(node, list):
+        out = []
+        for item in node:
+            stripped = strip_zeroserve_access_log(item)
+            if stripped is not None:
+                out.append(stripped)
+        return out
+    if not isinstance(node, dict):
+        return node
+    if node.get("handler") == "caddy_access_log":
+        return None
+
+    out = {}
+    for key, value in node.items():
+        stripped = strip_zeroserve_access_log(value)
+        if key == "handle" and stripped == []:
+            continue
+        if key == "routes":
+            stripped = [route for route in stripped if route_has_effect(route)]
+            if not stripped:
+                continue
+        out[key] = stripped
+
+    if out.get("handler") == "subroute" and "routes" not in out and "errors" not in out:
+        return None
+    return out
+
+
+def route_has_effect(route):
+    if not isinstance(route, dict):
+        return True
+    return any(key in route for key in ("match", "handle", "errors", "terminal", "group"))
+
+
 def http_servers(doc):
     strip_config_hide(doc)
+    doc = strip_zeroserve_access_log(doc)
     return ((doc or {}).get("apps", {}).get("http", {}) or {}).get("servers", {}) or {}
 
 

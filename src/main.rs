@@ -377,6 +377,7 @@ fn run_worker(
 
             // Per-worker hangup watcher (spawns its task on this runtime).
             let hup = HupWatcher::new();
+            pool::install_hup_watcher(hup.clone());
 
             let sites = shared.collect_sites();
             let scripts = match script_runtime.load_scripts_from_sites(&sites).await {

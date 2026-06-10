@@ -43,9 +43,17 @@ impl HupWatcher {
                 u64: fd as _,
             };
             self.hooks.lock().insert(fd, tx);
-            let ret = libc::epoll_ctl(self.efd, libc::EPOLL_CTL_ADD, fd, &mut ev);
+            let mut ret = libc::epoll_ctl(self.efd, libc::EPOLL_CTL_ADD, fd, &mut ev);
+            if ret < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EEXIST) {
+                // The fd is still in the interest list from an earlier one-shot
+                // registration that was abandoned without firing (e.g. a proxy
+                // connection taken from the pool and later pooled again); re-arm it.
+                ret = libc::epoll_ctl(self.efd, libc::EPOLL_CTL_MOD, fd, &mut ev);
+            }
             if ret < 0 {
-                return Err(std::io::Error::last_os_error());
+                let err = std::io::Error::last_os_error();
+                self.hooks.lock().remove(&fd);
+                return Err(err);
             }
         }
 

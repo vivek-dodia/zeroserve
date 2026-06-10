@@ -484,6 +484,7 @@ fn parse_log(h: &mut Helper) -> Result<Vec<ConfigValue>> {
                 {
                     output_file = Some(filename.clone());
                 }
+                consume_nested_block(&mut h.d);
             }
             "format" => {
                 if !h.d.next_arg() {
@@ -491,12 +492,14 @@ fn parse_log(h: &mut Helper) -> Result<Vec<ConfigValue>> {
                 }
                 format = Some(h.d.val());
                 h.d.remaining_args();
+                consume_nested_block(&mut h.d);
             }
             "core" => {
                 if !h.d.next_arg() {
                     return Err(h.d.arg_err());
                 }
                 h.d.remaining_args();
+                consume_nested_block(&mut h.d);
             }
             "sampling" => parse_log_sampling(h.d.new_from_next_segment())?,
             "level" => {
@@ -1731,6 +1734,7 @@ fn parse_php_fastcgi(h: &mut Helper) -> Result<Vec<ConfigValue>> {
                 if extensions.is_empty() {
                     return Err(h.d.arg_err());
                 }
+                transport.insert("split_path".into(), json!(extensions.clone()));
             }
             "env" => {
                 let args = h.d.remaining_args();
@@ -2125,7 +2129,9 @@ fn parse_php_fastcgi(h: &mut Helper) -> Result<Vec<ConfigValue>> {
     if upstreams.is_empty() && dynamic_upstreams.is_none() {
         bail!("php_fastcgi requires at least one upstream");
     }
-    transport.insert("split_path".into(), json!(extensions));
+    transport
+        .entry("split_path")
+        .or_insert_with(|| json!(extensions.clone()));
 
     let mut routes = Vec::<Route>::new();
     if index_file != "off" {
@@ -2137,10 +2143,11 @@ fn parse_php_fastcgi(h: &mut Helper) -> Result<Vec<ConfigValue>> {
                 index_file.clone(),
             ]
         });
-        let try_policy = if selected_try_files
-            .last()
-            .is_some_and(|last| last.ends_with(".php"))
-        {
+        let try_policy = if selected_try_files.last().is_some_and(|last| {
+            extensions
+                .iter()
+                .any(|extension| last.ends_with(extension.as_str()))
+        }) {
             "first_exist_fallback"
         } else {
             ""
@@ -3151,6 +3158,7 @@ fn parse_reverse_proxy_transport(d: &mut Dispenser) -> Result<Value> {
     let protocol = d.val();
     match protocol.as_str() {
         "http" => parse_reverse_proxy_http_transport(d),
+        "fastcgi" => parse_reverse_proxy_fastcgi_transport(d),
         other => {
             let args = d.remaining_args();
             if !args.is_empty() {
@@ -3162,6 +3170,32 @@ fn parse_reverse_proxy_transport(d: &mut Dispenser) -> Result<Value> {
             Ok(Value::Object(m))
         }
     }
+}
+
+fn parse_reverse_proxy_fastcgi_transport(d: &mut Dispenser) -> Result<Value> {
+    let args = d.remaining_args();
+    if !args.is_empty() {
+        return Err(d.arg_err());
+    }
+    let mut m = Map::new();
+    m.insert("protocol".into(), json!("fastcgi"));
+    let nesting = d.nesting();
+    while d.next_block(nesting) {
+        match d.val().as_str() {
+            "split" => {
+                let split_path = d.remaining_args();
+                if split_path.is_empty() {
+                    return Err(d.arg_err());
+                }
+                m.insert("split_path".into(), json!(split_path));
+            }
+            _ => {
+                let _ = d.remaining_args();
+                consume_nested_block(d);
+            }
+        }
+    }
+    Ok(Value::Object(m))
 }
 
 fn parse_reverse_proxy_http_transport(d: &mut Dispenser) -> Result<Value> {
@@ -3239,7 +3273,9 @@ fn parse_reverse_proxy_http_transport(d: &mut Dispenser) -> Result<Value> {
                 if values.is_empty() {
                     return Err(d.arg_err());
                 }
-                if key == "versions" || key == "resolvers" {
+                if key == "resolvers" {
+                    m.insert("resolver".into(), json!({ "addresses": values }));
+                } else if key == "versions" {
                     m.insert(key.into(), json!(values));
                 } else {
                     tls.insert(key.into(), json!(values));
@@ -3585,7 +3621,7 @@ fn insert_dynamic_duration(
         return Err(d.arg_err());
     }
     let raw = d.val();
-    let value = parse_duration_ns(&raw).map_err(|e| d.errf(format!("{label}: {e}")))?;
+    let value = parse_go_duration_ns(&raw).map_err(|e| d.errf(format!("{label}: {e}")))?;
     m.insert(key.into(), json!(value));
     Ok(())
 }

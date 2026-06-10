@@ -4,7 +4,7 @@
 //! logging automation) are accepted and reported as warnings rather than
 //! failing the adaptation.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use anyhow::{Result, bail};
 use serde_json::{Map, Value, json};
@@ -21,6 +21,8 @@ pub struct Options {
     pub tls_dns_provider_configured: bool,
     /// Fields merged into every server object (e.g. from the `servers` block).
     pub server_fields: Map<String, Value>,
+    /// Global `servers <listener> { name <name> }` mappings.
+    pub server_names: BTreeMap<String, String>,
     /// Extra top-level apps produced by global options.
     pub extra_apps: Map<String, Value>,
 }
@@ -36,6 +38,7 @@ impl Default for Options {
                 .collect(),
             tls_dns_provider_configured: false,
             server_fields: Map::new(),
+            server_names: BTreeMap::new(),
             extra_apps: Map::new(),
         }
     }
@@ -73,7 +76,12 @@ pub fn evaluate_global_options(
                 opts.https_port = Some(parse_port_option(&mut d, "https_port")?);
             }
             "order" => parse_order(&mut d, &mut opts.directive_order)?,
-            "servers" => parse_servers(&mut d, &mut opts.server_fields, warnings)?,
+            "servers" => parse_servers(
+                &mut d,
+                &mut opts.server_fields,
+                &mut opts.server_names,
+                warnings,
+            )?,
             "filesystem" => parse_filesystem(&mut d, &mut opts.extra_apps, warnings)?,
             // Options outside zeroserve's eBPF request-processing surface.
             "debug" | "local_certs" | "skip_install_trust" => {
@@ -732,6 +740,7 @@ fn parse_filesystem(
 fn parse_servers(
     d: &mut Dispenser,
     fields: &mut Map<String, Value>,
+    names: &mut BTreeMap<String, String>,
     warnings: &mut Vec<String>,
 ) -> Result<()> {
     let listener_address = if d.next_arg() {
@@ -754,6 +763,7 @@ fn parse_servers(
                 if !d.next_arg() {
                     bail!("missing server name");
                 }
+                names.insert(listener_address.clone().unwrap(), d.val());
                 reject_extra_args(d)?;
                 warnings.push(
                     "servers.name is accepted but configured outside zeroserve's eBPF request-processing surface"

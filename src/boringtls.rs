@@ -602,6 +602,12 @@ pub struct BoringStream<IO> {
     outer_sni: Option<String>,
 }
 
+impl<IO: std::os::fd::AsRawFd> std::os::fd::AsRawFd for BoringStream<IO> {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.io.as_raw_fd()
+    }
+}
+
 impl<IO> BoringStream<IO> {
     /// Negotiated ALPN protocol, if any (e.g. `b"h2"`).
     pub fn alpn_protocol(&self) -> Option<Vec<u8>> {

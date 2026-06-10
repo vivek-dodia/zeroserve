@@ -1068,7 +1068,243 @@ async fn handle_request<R: AsyncReadRent + 'static>(
                     format!("[handle] {}: reverse proxy: {:?}\n", request_id, err).into_bytes(),
                 )
                 .await;
-                return (false, reader);
+                if !caddy::has_error_routes(&script_outcome) {
+                    let send_outcome = send_fixed(
+                        w,
+                        bad_gateway(),
+                        Some(&script_outcome.early_response_headers),
+                        &script_outcome.metadata,
+                        Some(&hook_state),
+                    )
+                    .await;
+                    log_caddy_access(
+                        shared,
+                        &head,
+                        peer,
+                        scheme,
+                        send_outcome.status,
+                        &script_outcome.metadata,
+                    )
+                    .await;
+                    return (send_outcome.keep_client, reader);
+                }
+                caddy::set_proxy_error_metadata(&script_outcome, &err.to_string());
+                let (continued, mut reader, mut body) = caddy::continue_h1_request(
+                    request_id,
+                    script_runtime,
+                    shared,
+                    &hook_state,
+                    &script_outcome,
+                    &body_state,
+                    &body_source,
+                    reader,
+                    None,
+                )
+                .await;
+                if let Err(err) = apply_script_request(&mut head, &continued.request) {
+                    async_log(
+                        format!(
+                            "[handle] {}: proxy error script request update: {:?}\n",
+                            request_id, err
+                        )
+                        .into_bytes(),
+                    )
+                    .await;
+                }
+                let normalized_path = match normalized_script_request_path(&continued.request) {
+                    Some(path) => path,
+                    None => {
+                        let send_outcome =
+                            send_fixed(w, bad_request(), None, &continued.metadata, None).await;
+                        log_caddy_access(
+                            shared,
+                            &head,
+                            peer,
+                            scheme,
+                            send_outcome.status,
+                            &continued.metadata,
+                        )
+                        .await;
+                        return (send_outcome.keep_client, reader);
+                    }
+                };
+                let continued_hook_state =
+                    ResponseHookState::from_outcome(script_runtime, shared, &continued);
+                if continued.abort {
+                    return (false, reader);
+                }
+                if let Some(proxy_url) = continued.reverse_proxy.as_deref() {
+                    let continued_encode_state = continued.encode.clone().map(|config| {
+                        crate::helpers::compress::EncodeState::from_request_headers(
+                            config,
+                            &head.headers,
+                        )
+                    });
+                    let res = reverse_proxy_request(
+                        proxy_url,
+                        head.clone(),
+                        body,
+                        &mut reader,
+                        w,
+                        head_only,
+                        peer,
+                        scheme,
+                        Some(&continued.early_response_headers),
+                        &continued.metadata,
+                        Some(&continued_hook_state),
+                        continued.request.proxy_method(),
+                        continued.request.proxy_uri(),
+                        continued.request.proxy_headers(),
+                        continued.request_body_limit,
+                        continued_encode_state.as_ref(),
+                    )
+                    .await;
+                    return match res {
+                        Ok(outcome) => {
+                            if !outcome.continue_request {
+                                log_caddy_access(
+                                    shared,
+                                    &head,
+                                    peer,
+                                    scheme,
+                                    outcome.send.status,
+                                    &continued.metadata,
+                                )
+                                .await;
+                            }
+                            (outcome.send.keep_client, reader)
+                        }
+                        Err(err) => {
+                            async_log(
+                                format!(
+                                    "[handle] {}: proxy error continued reverse proxy: {:?}\n",
+                                    request_id, err
+                                )
+                                .into_bytes(),
+                            )
+                            .await;
+                            (false, reader)
+                        }
+                    };
+                }
+                if let Some(send_outcome) = caddy::try_serve_file_server_response_h1(
+                    &head,
+                    shared,
+                    head_only,
+                    peer,
+                    &mut reader,
+                    &mut body,
+                    w,
+                    &continued,
+                    &continued_hook_state,
+                    &normalized_path,
+                )
+                .await
+                {
+                    log_caddy_access(
+                        shared,
+                        &head,
+                        peer,
+                        scheme,
+                        send_outcome.status,
+                        &continued.metadata,
+                    )
+                    .await;
+                    return (send_outcome.keep_client, reader);
+                }
+                if let Some(response) = continued.response.clone() {
+                    let continued_encode_state = continued.encode.clone().map(|config| {
+                        crate::helpers::compress::EncodeState::from_request_headers(
+                            config,
+                            &head.headers,
+                        )
+                    });
+                    let send_outcome = send_script_response(
+                        w,
+                        response,
+                        head_only,
+                        &continued.metadata,
+                        Some(&continued_hook_state),
+                        continued_encode_state.as_ref(),
+                    )
+                    .await;
+                    log_caddy_access(
+                        shared,
+                        &head,
+                        peer,
+                        scheme,
+                        send_outcome.status,
+                        &continued.metadata,
+                    )
+                    .await;
+                    return (send_outcome.keep_client, reader);
+                }
+                match head.method {
+                    Method::GET | Method::HEAD => {
+                        if let Some(send_outcome) = serve_static(
+                            &head,
+                            shared,
+                            head_only,
+                            peer,
+                            w,
+                            Some(&continued.early_response_headers),
+                            &continued.metadata,
+                            Some(&continued_hook_state),
+                            &normalized_path,
+                        )
+                        .await
+                        {
+                            log_caddy_access(
+                                shared,
+                                &head,
+                                peer,
+                                scheme,
+                                send_outcome.status,
+                                &continued.metadata,
+                            )
+                            .await;
+                            return (send_outcome.keep_client, reader);
+                        }
+                        let send_outcome = send_fixed(
+                            w,
+                            bad_gateway(),
+                            Some(&continued.early_response_headers),
+                            &continued.metadata,
+                            Some(&continued_hook_state),
+                        )
+                        .await;
+                        log_caddy_access(
+                            shared,
+                            &head,
+                            peer,
+                            scheme,
+                            send_outcome.status,
+                            &continued.metadata,
+                        )
+                        .await;
+                        return (send_outcome.keep_client, reader);
+                    }
+                    _ => {
+                        let send_outcome = send_fixed(
+                            w,
+                            bad_gateway(),
+                            Some(&continued.early_response_headers),
+                            &continued.metadata,
+                            Some(&continued_hook_state),
+                        )
+                        .await;
+                        log_caddy_access(
+                            shared,
+                            &head,
+                            peer,
+                            scheme,
+                            send_outcome.status,
+                            &continued.metadata,
+                        )
+                        .await;
+                        return (send_outcome.keep_client, reader);
+                    }
+                }
             }
         }
     }
@@ -4989,6 +5225,15 @@ fn bad_request() -> ::http::Response<Bytes> {
 
 fn payload_too_large() -> ::http::Response<Bytes> {
     text_response(StatusCode::PAYLOAD_TOO_LARGE, "Request Entity Too Large")
+}
+
+fn bad_gateway() -> ::http::Response<Bytes> {
+    ::http::Response::builder()
+        .status(StatusCode::BAD_GATEWAY)
+        .header(::http::header::SERVER, crate::SERVER_HEADER)
+        .header(::http::header::CONTENT_LENGTH, "0")
+        .body(Bytes::new())
+        .unwrap()
 }
 
 fn method_not_allowed() -> ::http::Response<Bytes> {

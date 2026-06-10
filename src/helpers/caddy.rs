@@ -283,11 +283,15 @@ fn escape_caddy_rewrite_path_placeholders(
     if path.contains("{http.matchers.file.relative}") {
         if let Some(relative) = resolve_caddy_placeholder_value(ctx, "http.matchers.file.relative")
         {
-            let escaped = caddy_path_escape_preserving_slashes(&relative);
+            let escaped = caddy_rewrite_path_file_relative_placeholder(&relative);
             path = path.replace("{http.matchers.file.relative}", &escaped);
         }
     }
     Ok(path)
+}
+
+fn caddy_rewrite_path_file_relative_placeholder(relative: &str) -> String {
+    caddy_path_escape_preserving_slashes(&slash_path_with_leading(relative))
 }
 
 fn caddy_build_rewrite_query(
@@ -4563,6 +4567,22 @@ mod tests {
         assert_eq!(
             rewrite_caddy_query_without_placeholders("target=aa&other=baaa", &ops),
             "other=bx&target=x"
+        );
+    }
+
+    #[test]
+    fn caddy_rewrite_path_file_relative_placeholder_is_origin_form() {
+        assert_eq!(
+            caddy_rewrite_path_file_relative_placeholder("test.php"),
+            "/test.php"
+        );
+        assert_eq!(
+            caddy_rewrite_path_file_relative_placeholder("/test.php"),
+            "/test.php"
+        );
+        assert_eq!(
+            caddy_rewrite_path_file_relative_placeholder("dir/has space.php"),
+            "/dir/has%20space.php"
         );
     }
 

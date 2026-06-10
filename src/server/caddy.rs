@@ -193,6 +193,26 @@ impl<'a> ResponseHookState<'a> {
     }
 }
 
+pub(super) fn set_proxy_error_metadata(outcome: &ScriptOutcome, message: &str) {
+    outcome.request_shared.borrow_mut().restore_original_uri();
+    let mut metadata = outcome.metadata_shared.borrow_mut();
+    metadata.insert("http.error.status_code".to_string(), "502".to_string());
+    metadata.insert(
+        "http.error.status_text".to_string(),
+        "Bad Gateway".to_string(),
+    );
+    metadata.insert("http.error.message".to_string(), message.to_string());
+    metadata.insert("http.error".to_string(), message.to_string());
+}
+
+pub(super) fn has_error_routes(outcome: &ScriptOutcome) -> bool {
+    outcome
+        .metadata_shared
+        .borrow()
+        .get("zs.caddy.has_error_routes")
+        .is_some_and(|value| value == "1")
+}
+
 pub(super) async fn continue_h1_request<R: AsyncReadRent + 'static>(
     request_id: Ulid,
     script_runtime: &Rc<ScriptRuntime>,
@@ -568,14 +588,12 @@ pub(super) fn tls_connection_info<IO>(
     }
 }
 
-pub(super) fn apply_reverse_proxy_response_headers(
+pub(super) fn populate_reverse_proxy_response_state(
     hook_state: Option<&ResponseHookState<'_>>,
     status: StatusCode,
     raw_status_text: Option<&str>,
     headers: &mut ::http::HeaderMap,
     upstream_latency: Duration,
-    early_response_headers: Option<&::http::HeaderMap>,
-    metadata: &HashMap<String, String>,
 ) {
     populate_reverse_proxy_response_metadata(
         hook_state,
@@ -583,12 +601,6 @@ pub(super) fn apply_reverse_proxy_response_headers(
         raw_status_text,
         headers,
         upstream_latency,
-    );
-    apply_response_headers_with_mode(
-        headers,
-        early_response_headers,
-        metadata,
-        EarlyHeaderMerge::Prepend,
     );
 }
 
@@ -601,16 +613,21 @@ pub(super) async fn prepare_reverse_proxy_raw_h1_response_headers(
     early_response_headers: Option<&::http::HeaderMap>,
     metadata: &HashMap<String, String>,
 ) -> RawResponseHookOutcome {
-    apply_reverse_proxy_response_headers(
+    populate_reverse_proxy_response_state(
         hook_state,
         status,
         raw_status_text,
         headers,
         upstream_latency,
+    );
+    let outcome = run_raw_h1_response_hooks(status.as_u16(), headers, hook_state).await;
+    apply_response_headers_with_mode(
+        headers,
         early_response_headers,
         metadata,
+        EarlyHeaderMerge::Prepend,
     );
-    run_raw_h1_response_hooks(status.as_u16(), headers, hook_state).await
+    outcome
 }
 
 pub(super) async fn prepare_reverse_proxy_response_headers(
@@ -622,16 +639,21 @@ pub(super) async fn prepare_reverse_proxy_response_headers(
     early_response_headers: Option<&::http::HeaderMap>,
     metadata: &HashMap<String, String>,
 ) -> ResponseHookOutcome {
-    apply_reverse_proxy_response_headers(
+    populate_reverse_proxy_response_state(
         hook_state,
         status,
         raw_status_text,
         headers,
         upstream_latency,
+    );
+    let outcome = run_response_hooks(status, headers, hook_state).await;
+    apply_response_headers_with_mode(
+        headers,
         early_response_headers,
         metadata,
+        EarlyHeaderMerge::Prepend,
     );
-    run_response_hooks(status, headers, hook_state).await
+    outcome
 }
 
 pub(super) async fn prepare_script_response_raw_h1_headers(
@@ -884,7 +906,7 @@ fn finish_reverse_proxy_request_headers(
     metadata: &HashMap<String, String>,
     hook_state: Option<&ResponseHookState<'_>>,
 ) {
-    apply_reverse_proxy_request_defaults(headers);
+    apply_reverse_proxy_request_defaults(headers, metadata, hook_state);
     apply_reverse_proxy_forwarded_headers(headers, peer, scheme, metadata, hook_state);
 }
 
@@ -900,11 +922,25 @@ fn apply_reverse_proxy_forwarded_headers(
     }
 }
 
-fn apply_reverse_proxy_request_defaults(headers: &mut ::http::HeaderMap) {
+fn apply_reverse_proxy_request_defaults(
+    headers: &mut ::http::HeaderMap,
+    metadata: &HashMap<String, String>,
+    hook_state: Option<&ResponseHookState<'_>>,
+) {
     if !headers.contains_key(::http::header::USER_AGENT) {
         headers.insert(
             ::http::header::USER_AGENT,
             ::http::HeaderValue::from_static(""),
+        );
+    }
+    let compression_off =
+        caddy_proxy_metadata_value(metadata, hook_state, "zs.caddy.reverse_proxy.compression")
+            .as_deref()
+            == Some("off");
+    if !compression_off && !headers.contains_key(::http::header::ACCEPT_ENCODING) {
+        headers.insert(
+            ::http::header::ACCEPT_ENCODING,
+            ::http::HeaderValue::from_static("gzip"),
         );
     }
 }
@@ -1040,15 +1076,21 @@ async fn serve_caddy_file_server_h1(
     )
     .await
     else {
-        let response = caddy_file_server_not_found_static_response(shared.site.load_full());
+        let mut response = caddy_file_server_not_found_static_response(shared.site.load_full());
+        apply_response_headers_with_mode(
+            &mut response.headers,
+            early_response_headers,
+            metadata,
+            EarlyHeaderMerge::Overlay,
+        );
+        super::ensure_static_content_length(&mut response);
+        let status = response.status.as_u16();
+        let send_body = raw_status_allows_body(status);
+        if !send_body {
+            strip_no_body_headers(&mut response.headers);
+        }
         return send_prepared_static_response_h1(
-            w,
-            shared,
-            peer,
-            response,
-            StatusCode::NOT_FOUND.as_u16(),
-            true,
-            None,
+            w, shared, peer, response, status, send_body, None,
         )
         .await;
     };
@@ -1184,9 +1226,21 @@ async fn serve_caddy_file_server_h2(
     )
     .await
     else {
-        let response = caddy_file_server_not_found_static_response(shared.site.load_full());
-        send_prepared_static_response_h2(respond, shared, response, true, None).await?;
-        return Ok(StatusCode::NOT_FOUND.as_u16());
+        let mut response = caddy_file_server_not_found_static_response(shared.site.load_full());
+        apply_response_headers_with_mode(
+            &mut response.headers,
+            early_response_headers,
+            metadata,
+            EarlyHeaderMerge::Overlay,
+        );
+        super::ensure_static_content_length(&mut response);
+        let send_body = status_allows_body(response.status);
+        if !send_body {
+            strip_no_body_headers(&mut response.headers);
+        }
+        let status = response.status.as_u16();
+        send_prepared_static_response_h2(respond, shared, response, send_body, None).await?;
+        return Ok(status);
     };
     if matches!(
         caddy_response.header_merge,
