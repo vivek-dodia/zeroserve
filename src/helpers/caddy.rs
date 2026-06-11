@@ -27,8 +27,8 @@ use crate::caddy_file::{
 };
 use crate::json::JsonRef;
 use crate::script::{
-    CaddyFileServer, ScriptResponse, deref_and_write_cstr, header_pattern_matches, read_utf8,
-    split_relative_request_target, with_ectx,
+    CaddyFileServer, ScriptResponse, deref_and_write_cstr, header_pattern_matches,
+    parse_json_cached, read_utf8, split_relative_request_target, with_ectx,
 };
 
 #[derive(Default, serde::Deserialize)]
@@ -103,8 +103,7 @@ pub fn h_caddy_tls_client_auth(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let config = read_utf8(scope, config_ptr, config_len)?;
-    let config: CaddyTlsClientAuthConfig = serde_json::from_str(config).map_err(|_| ())?;
+    let config = parse_json_cached::<CaddyTlsClientAuthConfig>(scope, config_ptr, config_len)?;
     with_ectx(scope, |ctx| {
         // During the pre-handshake TLS section run the client certificate has
         // not been received yet; enforcement happens on the request-phase run.
@@ -195,8 +194,7 @@ pub fn h_req_rewrite_uri(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let ops = read_utf8(scope, ops_ptr, ops_len)?;
-    let ops: CaddyUriRewriteOps = serde_json::from_str(ops).map_err(|_| ())?;
+    let ops = parse_json_cached::<CaddyUriRewriteOps>(scope, ops_ptr, ops_len)?;
     with_ectx(scope, |ctx| {
         let mut request = ctx.request.borrow().clone();
         apply_caddy_uri_ops(ctx, &mut request, &ops)?;
@@ -611,8 +609,7 @@ pub fn h_req_rewrite_query(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let ops = read_utf8(scope, ops_ptr, ops_len)?;
-    let ops: CaddyQueryOps = serde_json::from_str(ops).map_err(|_| ())?;
+    let ops = parse_json_cached::<CaddyQueryOps>(scope, ops_ptr, ops_len)?;
     with_ectx(scope, |ctx| {
         let mut request = ctx.request.borrow().clone();
         apply_caddy_query_ops(ctx, &mut request, &ops)?;
@@ -776,12 +773,11 @@ pub fn h_req_remote_ip_matches(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let ranges = read_utf8(scope, ranges_ptr, ranges_len)?;
-    let ranges: Vec<String> = serde_json::from_str(ranges).map_err(|_| ())?;
+    let ranges = parse_json_cached::<Vec<String>>(scope, ranges_ptr, ranges_len)?;
     with_ectx(scope, |ctx| {
         let peer = ctx.request.borrow().peer.clone();
         let (peer_ip, peer_zone) = parse_caddy_ip_zone(&peer).ok_or(())?;
-        for range in &ranges {
+        for range in ranges.iter() {
             if caddy_ip_range_matches(peer_ip, &peer_zone, range)? {
                 return Ok(1);
             }
@@ -798,12 +794,11 @@ pub fn h_caddy_remote_ip_matches(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let ranges = read_utf8(scope, ranges_ptr, ranges_len)?;
-    let ranges: Vec<String> = serde_json::from_str(ranges).map_err(|_| ())?;
+    let ranges = parse_json_cached::<Vec<String>>(scope, ranges_ptr, ranges_len)?;
     with_ectx(scope, |ctx| {
         let peer = ctx.request.borrow().peer.clone();
         let (peer_ip, peer_zone) = parse_caddy_ip_zone(&peer).ok_or(())?;
-        for range in &ranges {
+        for range in ranges.iter() {
             let range = expand_caddy_placeholders(ctx, range)?;
             if caddy_ip_range_matches(peer_ip, &peer_zone, &range).unwrap_or(false) {
                 return Ok(1);
@@ -845,8 +840,7 @@ pub fn h_caddy_client_ip_matches(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let config = read_utf8(scope, config_ptr, config_len)?;
-    let config: CaddyClientIpMatchConfig = serde_json::from_str(config).map_err(|_| ())?;
+    let config = parse_json_cached::<CaddyClientIpMatchConfig>(scope, config_ptr, config_len)?;
     with_ectx(scope, |ctx| {
         let client_ip = {
             let request = ctx.request.borrow();
@@ -962,8 +956,8 @@ pub fn h_caddy_reverse_proxy_forwarded(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let config = read_utf8(scope, config_ptr, config_len)?;
-    let config: CaddyReverseProxyForwardedConfig = serde_json::from_str(config).map_err(|_| ())?;
+    let config =
+        parse_json_cached::<CaddyReverseProxyForwardedConfig>(scope, config_ptr, config_len)?;
     with_ectx(scope, |ctx| {
         let mut headers = caddy_proxy_headers(ctx);
         let host = caddy_header_map_last_value(&headers, "host").unwrap_or_default();
@@ -1020,8 +1014,7 @@ pub fn h_caddy_reverse_proxy_request_headers(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let ops = read_utf8(scope, ops_ptr, ops_len)?;
-    let ops: serde_json::Value = serde_json::from_str(ops).map_err(|_| ())?;
+    let ops = parse_json_cached::<serde_json::Value>(scope, ops_ptr, ops_len)?;
     with_ectx(scope, |ctx| {
         let mut headers = caddy_proxy_headers(ctx);
         apply_caddy_header_ops_value(ctx, &mut headers, &ops)?;
@@ -1189,15 +1182,14 @@ pub fn h_caddy_vars_set(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let vars = read_utf8(scope, vars_ptr, vars_len)?;
-    let vars: BTreeMap<String, serde_json::Value> = serde_json::from_str(vars).map_err(|_| ())?;
+    let vars = parse_json_cached::<BTreeMap<String, serde_json::Value>>(scope, vars_ptr, vars_len)?;
     with_ectx(scope, |ctx| {
         let mut expanded_vars = Vec::new();
-        for (key, value) in vars {
-            let key = expand_caddy_placeholders(ctx, &key)?;
+        for (key, value) in vars.iter() {
+            let key = expand_caddy_placeholders(ctx, key)?;
             let value = match value {
-                serde_json::Value::String(value) => expand_caddy_placeholders(ctx, &value)?,
-                other => caddy_var_value_to_string(&other),
+                serde_json::Value::String(value) => expand_caddy_placeholders(ctx, value)?,
+                other => caddy_var_value_to_string(other),
             };
             expanded_vars.push((key, value));
         }
@@ -1232,12 +1224,11 @@ pub fn h_caddy_vars_match(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let vars = read_utf8(scope, vars_ptr, vars_len)?;
-    let vars: BTreeMap<String, Vec<String>> = serde_json::from_str(vars).map_err(|_| ())?;
+    let vars = parse_json_cached::<BTreeMap<String, Vec<String>>>(scope, vars_ptr, vars_len)?;
     if vars.is_empty() {
         return Ok(1);
     }
-    with_ectx(scope, |ctx| caddy_vars_match(ctx, vars, false))
+    with_ectx(scope, |ctx| caddy_vars_match(ctx, &vars, false))
 }
 
 pub fn h_caddy_vars_match_expanded_keys(
@@ -1248,28 +1239,27 @@ pub fn h_caddy_vars_match_expanded_keys(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let vars = read_utf8(scope, vars_ptr, vars_len)?;
-    let vars: BTreeMap<String, Vec<String>> = serde_json::from_str(vars).map_err(|_| ())?;
+    let vars = parse_json_cached::<BTreeMap<String, Vec<String>>>(scope, vars_ptr, vars_len)?;
     if vars.is_empty() {
         return Ok(1);
     }
-    with_ectx(scope, |ctx| caddy_vars_match(ctx, vars, true))
+    with_ectx(scope, |ctx| caddy_vars_match(ctx, &vars, true))
 }
 
 fn caddy_vars_match(
     ctx: &mut crate::script::ScriptExecutionContext,
-    vars: BTreeMap<String, Vec<String>>,
+    vars: &BTreeMap<String, Vec<String>>,
     expand_keys: bool,
 ) -> Result<u64, ()> {
     for (key, values) in vars {
         let key = if expand_keys {
-            expand_caddy_placeholders(ctx, &key)?
+            expand_caddy_placeholders(ctx, key)?
         } else {
-            key
+            key.clone()
         };
         let actual = caddy_vars_value(ctx, &key);
         for value in values {
-            let value = expand_caddy_placeholders(ctx, &value)?;
+            let value = expand_caddy_placeholders(ctx, value)?;
             if value == actual {
                 return Ok(1);
             }
@@ -1286,9 +1276,8 @@ pub fn h_caddy_vars_regexp_match(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let vars = read_utf8(scope, vars_ptr, vars_len)?;
-    let vars: BTreeMap<String, CaddyRegexMatch> = serde_json::from_str(vars).map_err(|_| ())?;
-    with_ectx(scope, |ctx| caddy_vars_regexp_match(ctx, vars, false))
+    let vars = parse_json_cached::<BTreeMap<String, CaddyRegexMatch>>(scope, vars_ptr, vars_len)?;
+    with_ectx(scope, |ctx| caddy_vars_regexp_match(ctx, &vars, false))
 }
 
 pub fn h_caddy_vars_regexp_match_expanded_keys(
@@ -1299,24 +1288,23 @@ pub fn h_caddy_vars_regexp_match_expanded_keys(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let vars = read_utf8(scope, vars_ptr, vars_len)?;
-    let vars: BTreeMap<String, CaddyRegexMatch> = serde_json::from_str(vars).map_err(|_| ())?;
-    with_ectx(scope, |ctx| caddy_vars_regexp_match(ctx, vars, true))
+    let vars = parse_json_cached::<BTreeMap<String, CaddyRegexMatch>>(scope, vars_ptr, vars_len)?;
+    with_ectx(scope, |ctx| caddy_vars_regexp_match(ctx, &vars, true))
 }
 
 fn caddy_vars_regexp_match(
     ctx: &mut crate::script::ScriptExecutionContext,
-    vars: BTreeMap<String, CaddyRegexMatch>,
+    vars: &BTreeMap<String, CaddyRegexMatch>,
     expand_keys: bool,
 ) -> Result<u64, ()> {
     for (key, config) in vars {
         let key = if expand_keys {
-            expand_caddy_placeholders(ctx, &key)?
+            expand_caddy_placeholders(ctx, key)?
         } else {
-            key
+            key.clone()
         };
         let value = caddy_vars_value(ctx, &key);
-        if caddy_regex_match_and_store(ctx, &value, &config)? {
+        if caddy_regex_match_and_store(ctx, &value, config)? {
             return Ok(1);
         }
     }
@@ -1348,8 +1336,10 @@ pub fn h_caddy_map(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let config = read_utf8(scope, config_ptr, config_len)?;
-    let mut config: crate::script::CaddyMapConfig = serde_json::from_str(config).map_err(|_| ())?;
+    let config = parse_json_cached::<crate::script::CaddyMapConfig>(scope, config_ptr, config_len)?;
+    // The per-request map list owns its config, so clone out of the cache;
+    // normalization is validation plus destination trimming on that copy.
+    let mut config = (*config).clone();
     normalize_caddy_map_config(&mut config)?;
     with_ectx(scope, |ctx| {
         ctx.caddy_maps.borrow_mut().push(config);
@@ -1578,9 +1568,8 @@ pub fn h_caddy_header_regexp_match(
     config_len: u64,
     _: u64,
 ) -> Result<u64, ()> {
+    let config = parse_json_cached::<CaddyRegexMatch>(scope, config_ptr, config_len)?;
     let name = read_utf8(scope, name_ptr, name_len)?;
-    let config = read_utf8(scope, config_ptr, config_len)?;
-    let config = parse_caddy_regex_config(config)?;
     with_ectx(scope, |ctx| {
         let values = caddy_request_header_values(ctx, &name);
         for value in values {
@@ -1600,9 +1589,8 @@ pub fn h_caddy_header_regexp_match_expanded(
     config_len: u64,
     _: u64,
 ) -> Result<u64, ()> {
+    let config = parse_json_cached::<CaddyRegexMatch>(scope, config_ptr, config_len)?;
     let name_template = read_utf8(scope, name_ptr, name_len)?;
-    let config = read_utf8(scope, config_ptr, config_len)?;
-    let config = parse_caddy_regex_config(config)?;
     with_ectx(scope, |ctx| {
         let name = expand_caddy_placeholders(ctx, name_template)?;
         let values = caddy_request_header_values(ctx, &name);
@@ -1875,9 +1863,8 @@ pub fn h_caddy_regex_match(
     config_len: u64,
     _: u64,
 ) -> Result<u64, ()> {
+    let config = parse_json_cached::<CaddyRegexMatch>(scope, config_ptr, config_len)?;
     let input = read_utf8(scope, input_ptr, input_len)?;
-    let config = read_utf8(scope, config_ptr, config_len)?;
-    let config = parse_caddy_regex_config(config)?;
     with_ectx(scope, |ctx| {
         Ok(caddy_regex_match_and_store(ctx, input, &config)? as u64)
     })
@@ -1891,13 +1878,12 @@ pub fn h_caddy_expr_in(
     values_len: u64,
     _: u64,
 ) -> Result<u64, ()> {
+    let values = parse_json_cached::<Vec<String>>(scope, values_ptr, values_len)?;
     let input = read_utf8(scope, input_ptr, input_len)?;
-    let values = read_utf8(scope, values_ptr, values_len)?;
-    let values: Vec<String> = serde_json::from_str(values).map_err(|_| ())?;
     with_ectx(scope, |ctx| {
         let input = expand_caddy_placeholders(ctx, input)?;
-        for value in values {
-            if input == expand_caddy_placeholders(ctx, &value)? {
+        for value in values.iter() {
+            if input == expand_caddy_placeholders(ctx, value)? {
                 return Ok(1);
             }
         }
@@ -1930,8 +1916,7 @@ pub fn h_caddy_file_match(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let config = read_utf8(scope, config_ptr, config_len)?;
-    let config: CaddyFileMatcher = serde_json::from_str(config).map_err(|_| ())?;
+    let config = parse_json_cached::<CaddyFileMatcher>(scope, config_ptr, config_len)?;
     with_ectx(scope, |ctx| Ok(caddy_file_match(ctx, &config)? as u64))
 }
 
@@ -2625,29 +2610,6 @@ struct CaddyRegexMatch {
     name: String,
     #[serde(default)]
     pattern: String,
-}
-
-/// Parse a `CaddyRegexMatch` config JSON, caching the result keyed by the raw
-/// config string. Configs are compile-time constants embedded in the script,
-/// so the set is small and stable.
-fn parse_caddy_regex_config(config: &str) -> Result<std::rc::Rc<CaddyRegexMatch>, ()> {
-    thread_local! {
-        static CACHE: std::cell::RefCell<HashMap<String, std::rc::Rc<CaddyRegexMatch>>> =
-            std::cell::RefCell::new(HashMap::new());
-    }
-    CACHE.with(|cache| {
-        if let Some(config) = cache.borrow().get(config) {
-            return Ok(config.clone());
-        }
-        let parsed: CaddyRegexMatch = serde_json::from_str(config).map_err(|_| ())?;
-        let parsed = std::rc::Rc::new(parsed);
-        let mut cache = cache.borrow_mut();
-        if cache.len() >= 1024 {
-            cache.clear();
-        }
-        cache.insert(config.to_string(), parsed.clone());
-        Ok(parsed)
-    })
 }
 
 fn is_caddy_regex_name(name: &str) -> bool {
@@ -3360,8 +3322,7 @@ pub fn h_req_replace_header(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let op = read_utf8(scope, op_ptr, op_len)?;
-    let op: CaddyHeaderReplacement = serde_json::from_str(op).map_err(|_| ())?;
+    let op = parse_json_cached::<CaddyHeaderReplacement>(scope, op_ptr, op_len)?;
     with_ectx(scope, |ctx| {
         let op = expand_caddy_header_replacement(ctx, &op)?;
         if !op.search_regexp.is_empty() {
@@ -3412,8 +3373,7 @@ pub fn h_res_replace_header(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let op = read_utf8(scope, op_ptr, op_len)?;
-    let op: CaddyHeaderReplacement = serde_json::from_str(op).map_err(|_| ())?;
+    let op = parse_json_cached::<CaddyHeaderReplacement>(scope, op_ptr, op_len)?;
     with_ectx(scope, |ctx| {
         let op = expand_caddy_header_replacement(ctx, &op)?;
         let name = op.name.as_str();
@@ -3478,8 +3438,7 @@ pub fn h_caddy_response_headers(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let ops = read_utf8(scope, ops_ptr, ops_len)?;
-    let ops: serde_json::Value = serde_json::from_str(ops).map_err(|_| ())?;
+    let ops = parse_json_cached::<serde_json::Value>(scope, ops_ptr, ops_len)?;
     with_ectx(scope, |ctx| {
         if let Some(response_context) = ctx.response_context.clone() {
             let mut headers = {
@@ -3508,9 +3467,9 @@ pub fn h_caddy_encode(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let config = read_utf8(scope, config_ptr, config_len)?;
-    let raw: crate::helpers::compress::EncodeConfigRaw =
-        serde_json::from_str(config).map_err(|_| ())?;
+    let raw = parse_json_cached::<crate::helpers::compress::EncodeConfigRaw>(
+        scope, config_ptr, config_len,
+    )?;
     with_ectx(scope, |ctx| {
         // resolve() yields None only if no usable encoder is configured; in
         // that case leave any existing config untouched.
@@ -3750,8 +3709,7 @@ pub fn h_caddy_copy_response_headers(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let config = read_utf8(scope, config_ptr, config_len)?;
-    let config: CaddyCopyResponseHeaders = serde_json::from_str(config).map_err(|_| ())?;
+    let config = parse_json_cached::<CaddyCopyResponseHeaders>(scope, config_ptr, config_len)?;
     if !config.include.is_empty() && !config.exclude.is_empty() {
         return Err(());
     }
@@ -3882,9 +3840,8 @@ pub fn h_caddy_respond_static(
     config_len: u64,
     _: u64,
 ) -> Result<u64, ()> {
+    let config = parse_json_cached::<CaddyStaticResponseConfig>(scope, config_ptr, config_len)?;
     let status_template = read_utf8(scope, status_ptr, status_len)?;
-    let config = read_utf8(scope, config_ptr, config_len)?;
-    let config: CaddyStaticResponseConfig = serde_json::from_str(config).map_err(|_| ())?;
     with_ectx(scope, |ctx| {
         if ctx.response_context.is_some() {
             ctx.error =
@@ -4271,8 +4228,7 @@ pub fn h_caddy_basic_auth(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let config = read_utf8(scope, config_ptr, config_len)?;
-    let config: CaddyBasicAuthConfig = serde_json::from_str(config).map_err(|_| ())?;
+    let config = parse_json_cached::<CaddyBasicAuthConfig>(scope, config_ptr, config_len)?;
     with_ectx(scope, |ctx| {
         let credentials = ctx
             .request
@@ -4440,8 +4396,7 @@ pub fn h_caddy_reverse_proxy_rewrite(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let config = read_utf8(scope, config_ptr, config_len)?;
-    let config: CaddyReverseProxyRewrite = serde_json::from_str(config).map_err(|_| ())?;
+    let config = parse_json_cached::<CaddyReverseProxyRewrite>(scope, config_ptr, config_len)?;
     with_ectx(scope, |ctx| {
         let mut proxy_request = ctx.request.borrow().clone();
         if !config.method.is_empty() {
@@ -4541,13 +4496,14 @@ pub fn h_file_server(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let config = read_utf8(scope, config_ptr, config_len)?;
-    let config: CaddyFileServer = serde_json::from_str(config).map_err(|_| ())?;
+    let config = parse_json_cached::<CaddyFileServer>(scope, config_ptr, config_len)?;
     with_ectx(scope, |ctx| {
         if ctx.response.is_some() || ctx.reverse_proxy.is_some() || ctx.file_server.is_some() {
             return Err(());
         }
-        let Some(config) = expand_caddy_file_server_config(ctx, config)? else {
+        // Expansion rewrites the config with per-request placeholder values,
+        // so it works on a copy of the cached parse.
+        let Some(config) = expand_caddy_file_server_config(ctx, (*config).clone())? else {
             return Ok(0);
         };
         if caddy_file_server_unsupported_fs(&config.fs) {

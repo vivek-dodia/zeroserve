@@ -1,5 +1,5 @@
 use std::{
-    any::Any,
+    any::{Any, TypeId},
     cell::{Cell, RefCell},
     collections::HashMap,
     pin::Pin,
@@ -1972,6 +1972,66 @@ pub fn read_utf8<'a>(
     }
     let data = scope.user_memory(ptr, len)?;
     std::str::from_utf8(&data).map_err(|_| ())
+}
+
+/// Cache key: the parsed type plus the script-side data pointer and length.
+type JsonParseCacheKey = (TypeId, u64, u64);
+
+/// Per-program cache of host-side parsed JSON, keyed by
+/// `(target type, data pointer, data length)`. Stored via `Program::data`, so
+/// the program identity is implicit in the map and the cache is dropped with
+/// the program when a hot reload installs fresh scripts. Only pointers into
+/// the program's frozen data region are cached: that memory is read-only for
+/// the program's lifetime, so the raw `(ptr, len)` key uniquely identifies
+/// the JSON text without comparing bytes.
+#[derive(Default)]
+pub(crate) struct JsonParseCache {
+    entries: RefCell<HashMap<JsonParseCacheKey, Rc<dyn Any>>>,
+}
+
+/// Generous bound on distinct cached configs per program; generated Caddy
+/// middleware passes well under this many static JSON arguments. Beyond it,
+/// parses stay correct but uncached.
+const MAX_JSON_PARSE_CACHE_ENTRIES: usize = 4096;
+
+/// Parse JSON passed by a script, caching the parsed value when the bytes
+/// live in the program's immutable data region — the common case: generated
+/// middleware passes `.rodata` string literals, re-parsed on every request
+/// without this cache. Writable (stack) data parses fresh on every call.
+///
+/// Immutability is detected with the scope's own memory validation: memory
+/// that dereferences for read but not for write can only be the data region,
+/// which is frozen read-only when the program is loaded. The write probe must
+/// be the first dereference of `ptr` in the calling helper — an earlier read
+/// of an overlapping range would fail the probe by overlap and misclassify
+/// stack bytes as immutable.
+pub(crate) fn parse_json_cached<T>(
+    scope: &async_ebpf::program::HelperScope,
+    ptr: u64,
+    len: u64,
+) -> Result<Rc<T>, ()>
+where
+    T: serde::de::DeserializeOwned + 'static,
+{
+    if let Ok(data) = scope.user_memory_mut(ptr, len) {
+        // Writable memory is the script stack: its contents change between
+        // runs, so parse without caching (the view doubles as the source).
+        let text = std::str::from_utf8(&data).map_err(|_| ())?;
+        return serde_json::from_str(text).map(Rc::new).map_err(|_| ());
+    }
+
+    let text = read_utf8(scope, ptr, len)?;
+    let cache = scope.program.data::<JsonParseCache>();
+    let key = (TypeId::of::<T>(), ptr, len);
+    if let Some(hit) = cache.entries.borrow().get(&key) {
+        return hit.clone().downcast::<T>().map_err(|_| ());
+    }
+    let parsed = Rc::new(serde_json::from_str::<T>(text).map_err(|_| ())?);
+    let mut entries = cache.entries.borrow_mut();
+    if entries.len() < MAX_JSON_PARSE_CACHE_ENTRIES {
+        entries.insert(key, parsed.clone() as Rc<dyn Any>);
+    }
+    Ok(parsed)
 }
 
 pub fn deref_and_write_cstr(
