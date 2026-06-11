@@ -45,6 +45,7 @@ use crate::{
     config::StaticConfig,
     hupwatch::HupWatcher,
     logging::spawn_file_logger,
+    pack::USER_MANUAL,
     pack::ZEROSERVE_H,
     reload::{ReloadRequest, spawn_coordinator, worker_reload_loop},
     script::{ScriptRuntime, ScriptRuntimeConfig},
@@ -82,6 +83,12 @@ fn main() -> Result<()> {
     if args.dump_sdk {
         let mut out = std::io::stdout().lock();
         out.write_all(ZEROSERVE_H)?;
+        out.flush()?;
+        return Ok(());
+    }
+    if args.manual {
+        let mut out = std::io::stdout().lock();
+        out.write_all(USER_MANUAL.as_bytes())?;
         out.flush()?;
         return Ok(());
     }

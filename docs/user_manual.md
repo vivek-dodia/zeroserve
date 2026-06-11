@@ -49,6 +49,12 @@ If you want the SDK header without packing:
 zeroserve --dump-sdk > zeroserve.h
 ```
 
+To print this manual from the binary:
+
+```bash
+zeroserve --manual
+```
+
 ## Compiling Caddy configs to a script
 
 Zeroserve can compile the HTTP routing portion of a Caddy config into a
@@ -239,7 +245,7 @@ push side effects rather than modifying the eventual response.
 Command synopsis:
 
 ```bash
-zeroserve [OPTIONS] SITE_TAR
+zeroserve [OPTIONS] [SITE_TAR]
 ```
 
 Key options:
@@ -269,6 +275,8 @@ Key options:
   (memfd). Used in place of the `SITE_TAR` argument.
 - `--adapt-caddyfile <CADDYFILE>`: Adapt a Caddyfile to Caddy JSON and print it
   to stdout (without compiling), for inspecting the adapter output.
+- `--manual`: Print the embedded user manual to stdout.
+- `--dump-sdk`: Dump the embedded SDK header to stdout.
 - `--ech-public-name <NAME>`: Public DNS name to embed in a generated
   ECHConfig (used only with `--gen-ech-key`).
 - `--index <NAME>`: Default document for directories (default `index.html`).

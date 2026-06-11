@@ -11,6 +11,7 @@ use ulid::Ulid;
 
 pub const ZEROSERVE_H: &[u8] = include_bytes!("../sdk/zeroserve.h");
 pub const ZEROSERVE_CADDY_H: &[u8] = include_bytes!("../sdk/zeroserve_caddy.h");
+pub const USER_MANUAL: &str = include_str!("../docs/user_manual.md");
 
 pub fn pack_site(root: &Path) -> Result<()> {
     let meta = fs::metadata(root)

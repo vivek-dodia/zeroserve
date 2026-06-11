@@ -105,10 +105,9 @@ impl TryFrom<Cli> for StaticConfig {
         // In the `--caddy` flow there is no SITE_TAR; the source Caddyfile path
         // stands in for `tar_path` diagnostics. The in-memory tarball itself is
         // attached by the caller via `caddy_tarball`.
-        let tar_path = cli
-            .tarball
-            .or_else(|| cli.caddy.clone())
-            .ok_or_else(|| anyhow!("SITE_TAR is required unless --pack or --dump-sdk is used"))?;
+        let tar_path = cli.tarball.or_else(|| cli.caddy.clone()).ok_or_else(|| {
+            anyhow!("SITE_TAR is required unless a standalone output mode is used")
+        })?;
 
         Ok(Self {
             http_addr,

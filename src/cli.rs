@@ -100,7 +100,7 @@ pub struct Cli {
         long,
         value_name = "PLUGIN_TAR",
         value_delimiter = ',',
-        conflicts_with_all = ["pack", "dump_sdk", "gen_ech_key"]
+        conflicts_with_all = ["pack", "dump_sdk", "manual", "gen_ech_key"]
     )]
     pub plugin: Vec<PathBuf>,
 
@@ -109,29 +109,33 @@ pub struct Cli {
     pub pack: Option<PathBuf>,
 
     /// Dump the embedded SDK header to stdout.
-    #[arg(long, conflicts_with_all = ["pack", "tarball"])]
+    #[arg(long, conflicts_with_all = ["pack", "tarball", "manual"])]
     pub dump_sdk: bool,
+
+    /// Print the embedded user manual to stdout.
+    #[arg(long, conflicts_with_all = ["pack", "tarball", "dump_sdk"])]
+    pub manual: bool,
 
     /// Compile a Caddy config into a zeroserve eBPF C request script on stdout.
     /// Accepts either Caddy JSON or a native Caddyfile (auto-detected by content).
-    #[arg(long, value_name = "CONFIG", conflicts_with_all = ["pack", "tarball", "dump_sdk", "gen_ech_key", "caddy"])]
+    #[arg(long, value_name = "CONFIG", conflicts_with_all = ["pack", "tarball", "dump_sdk", "manual", "gen_ech_key", "caddy"])]
     pub caddy_compile: Option<PathBuf>,
 
     /// Run a Caddyfile (or Caddy JSON) directly: adapt -> compile -> in-memory
     /// site tarball -> serve, with the generated middleware C and tarball kept
     /// entirely in memory (memfd). Used in place of a SITE_TAR argument.
-    #[arg(long, value_name = "CADDYFILE", conflicts_with_all = ["pack", "tarball", "dump_sdk", "gen_ech_key", "caddy_compile", "adapt_caddyfile"])]
+    #[arg(long, value_name = "CADDYFILE", conflicts_with_all = ["pack", "tarball", "dump_sdk", "manual", "gen_ech_key", "caddy_compile", "adapt_caddyfile"])]
     pub caddy: Option<PathBuf>,
 
     /// Adapt a Caddyfile into Caddy JSON and print it to stdout (does not
     /// compile). Useful for inspecting the adapter output.
-    #[arg(long, value_name = "CADDYFILE", conflicts_with_all = ["pack", "tarball", "dump_sdk", "gen_ech_key", "caddy_compile"])]
+    #[arg(long, value_name = "CADDYFILE", conflicts_with_all = ["pack", "tarball", "dump_sdk", "manual", "gen_ech_key", "caddy_compile"])]
     pub adapt_caddyfile: Option<PathBuf>,
 
     /// Generate a new ECH (Encrypted Client Hello) keypair and ECHConfig and
     /// print them to stdout (PEM bundle) and stderr (DNS guidance).
     /// Requires --ech-public-name.
-    #[arg(long, conflicts_with_all = ["pack", "tarball", "dump_sdk"])]
+    #[arg(long, conflicts_with_all = ["pack", "tarball", "dump_sdk", "manual"])]
     pub gen_ech_key: bool,
 
     /// Public name to embed in the generated ECHConfig. The TLS cert served
@@ -148,7 +152,7 @@ pub struct Cli {
     /// Path to the site tarball.
     #[arg(
         value_name = "SITE_TAR",
-        required_unless_present_any = ["pack", "dump_sdk", "gen_ech_key", "caddy_compile", "adapt_caddyfile", "caddy"],
+        required_unless_present_any = ["pack", "dump_sdk", "manual", "gen_ech_key", "caddy_compile", "adapt_caddyfile", "caddy"],
         conflicts_with = "pack"
     )]
     pub tarball: Option<PathBuf>,
@@ -238,5 +242,20 @@ mod tests {
         let err = Cli::try_parse_from(["zeroserve", "--threads", "0", "site.tar"]).unwrap_err();
 
         assert!(err.to_string().contains("value must be greater than zero"));
+    }
+
+    #[test]
+    fn manual_does_not_require_tarball() {
+        let cli = Cli::try_parse_from(["zeroserve", "--manual"]).unwrap();
+
+        assert!(cli.manual);
+        assert!(cli.tarball.is_none());
+    }
+
+    #[test]
+    fn manual_conflicts_with_tarball() {
+        let err = Cli::try_parse_from(["zeroserve", "--manual", "site.tar"]).unwrap_err();
+
+        assert!(err.to_string().contains("cannot be used with"));
     }
 }
