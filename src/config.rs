@@ -1,6 +1,6 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 
 use crate::cli::{Cli, ListenAddr};
 
@@ -33,6 +33,7 @@ pub struct StaticConfig {
     pub max_buffered_body_size: usize,
     pub max_request_external_memory_footprint: u64,
     pub max_rate_limit_buckets: usize,
+    pub script_code_size_limit: usize,
     pub validate_hostnames: Vec<String>,
 }
 
@@ -40,6 +41,17 @@ impl TryFrom<Cli> for StaticConfig {
     type Error = anyhow::Error;
 
     fn try_from(cli: Cli) -> Result<Self> {
+        // async-ebpf requires the JIT code zone to be a non-zero multiple of
+        // 64 KiB that fits in u32; validate here so it fails as a CLI error
+        // instead of a loader panic.
+        if cli.script_code_size_limit_kb % 64 != 0 {
+            bail!("--script-code-size-limit-kb must be a multiple of 64");
+        }
+        let script_code_size_limit = cli
+            .script_code_size_limit_kb
+            .checked_mul(1024)
+            .filter(|limit| u32::try_from(*limit).is_ok())
+            .ok_or_else(|| anyhow!("--script-code-size-limit-kb is too large"))?;
         let http_addr = cli.addr;
         let tls_requested = cli.tls_addr.is_some()
             || cli.cert.is_some()
@@ -123,6 +135,7 @@ impl TryFrom<Cli> for StaticConfig {
             max_request_external_memory_footprint: (cli.max_request_external_memory_footprint_kb
                 * 1024) as u64,
             max_rate_limit_buckets: cli.max_rate_limit_buckets,
+            script_code_size_limit,
             validate_hostnames: cli.validate_hostnames,
         })
     }

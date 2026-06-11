@@ -1231,6 +1231,7 @@ pub struct ScriptRuntime {
     scripts: RefCell<Rc<Vec<(String, Program)>>>,
     max_memory_footprint: u64,
     expose_filesystem: bool,
+    code_size_limit: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -1238,6 +1239,9 @@ pub struct ScriptRuntimeConfig {
     pub preempt_timer_interval: Duration,
     pub max_memory_footprint: u64,
     pub expose_filesystem: bool,
+    /// JIT code zone size per loaded program, in bytes (a non-zero multiple
+    /// of 64 KiB that fits in u32).
+    pub code_size_limit: usize,
 }
 
 impl ScriptRuntime {
@@ -1250,15 +1254,19 @@ impl ScriptRuntime {
             scripts,
             max_memory_footprint: config.max_memory_footprint,
             expose_filesystem: config.expose_filesystem,
+            code_size_limit: config.code_size_limit,
         }
     }
 
     async fn load_site_scripts(&self, site: Arc<Site>) -> anyhow::Result<Vec<(String, Program)>> {
-        let pl = Arc::new(ProgramLoader::new(
-            &mut rand::thread_rng(),
-            Arc::new(EventListener),
-            HELPER_TABLES,
-        ));
+        let pl = Arc::new(
+            ProgramLoader::new(
+                &mut rand::thread_rng(),
+                Arc::new(EventListener),
+                HELPER_TABLES,
+            )
+            .with_code_size_limit(self.code_size_limit),
+        );
         let file = site
             .tar_file
             .try_clone()

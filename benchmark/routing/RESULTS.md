@@ -64,6 +64,16 @@ N=256 (see limits below).
 - N=512 also exceeds BPF's 16-bit branch range under `-mcpu=v3`; `-mcpu=v4`
   (long jumps) compiles it, if the VM gains v4 support.
 
+### With the local async-ebpf checkout (1 MiB default code zone)
+
+Switching Cargo.toml to `async-ebpf = { path = "../async-ebpf" }` lifts the
+load ceiling: N=64/128/256 all load. At N=256 (phase4-256-localebpf):
+first 298k / last 193k / last-re 166k / miss 211k req/s — 2.1-2.4× stock
+Caddy on last/regexp/miss with p99 ≤ 0.7ms vs 4.4-4.9ms. The remaining
+positional fall-off (298k → 193k) is the per-non-matching-route
+`else if (zs_response_pending() != 0)` host call; the generator could skip
+that clause for routes whose matchers cannot leave a response pending.
+
 ## What each phase changed
 
 1. **phase1** (src/helpers/caddy.rs): cache compiled regexes and parsed

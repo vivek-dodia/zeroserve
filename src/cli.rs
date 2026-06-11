@@ -203,6 +203,12 @@ pub struct Cli {
     #[arg(long, default_value_t = 10000, value_parser = must_be_positive)]
     pub max_rate_limit_buckets: usize,
 
+    /// JIT code zone size in kibibytes for loaded eBPF scripts, per worker
+    /// thread. Must be a multiple of 64. Large compiled middleware (e.g.
+    /// Caddy configs with hundreds of sites) needs more than the default.
+    #[arg(long, default_value_t = 1024, value_parser = must_be_positive)]
+    pub script_code_size_limit_kb: usize,
+
     /// Comma-separated list of allowed hostnames. Requests with non-matching hostnames receive a 421 error.
     #[arg(long, value_delimiter = ',')]
     pub validate_hostnames: Vec<String>,

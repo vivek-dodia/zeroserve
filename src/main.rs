@@ -371,6 +371,7 @@ fn run_worker(
                     preempt_timer_interval: config.preempt_timer_interval,
                     max_memory_footprint: config.max_request_external_memory_footprint,
                     expose_filesystem: config.expose_filesystem,
+                    code_size_limit: config.script_code_size_limit,
                 })
             };
             let script_runtime = Rc::new(script_runtime);
