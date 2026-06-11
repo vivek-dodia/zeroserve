@@ -32,6 +32,189 @@ proxy behavior, response hooks, variables, maps, and basic authentication.
 - The metadata map is shared between request and response phases. Existing
   response-header-in-metadata-map behavior continues to work.
 
+## Custom eBPF Middleware Interop Design
+
+zeroserve has two distinct middleware worlds:
+
+- Caddy-compatible middleware generated from Caddy JSON/Caddyfile input.
+- Native zeroserve eBPF scripts loaded from plugin/site tarballs.
+
+The compatibility goal is to make those worlds compose without pretending that
+native eBPF scripts are Caddy modules. Caddy semantics should remain
+predictable where Caddy owns routing, while custom scripts keep access to the
+normal zeroserve SDK.
+
+### Level 0: outer-chain interop, already supported
+
+The current loader is already useful for coarse interop:
+
+- `--plugin a.tar,b.tar --caddy Caddyfile` runs plugin scripts before generated
+  `caddy.o`.
+- `--caddy-compile Caddyfile > .zeroserve/scripts/50-caddy.c` lets a normal
+  site tarball include native scripts around the generated Caddy script by
+  filename order.
+- Request mutation and metadata set by earlier scripts are visible to generated
+  Caddy middleware.
+- Response hooks registered by earlier scripts run on the eventual response.
+
+This is intentionally an outer-chain model. It is appropriate for global auth,
+request normalization, telemetry, response-header policy, and other behavior
+that should happen before Caddy route matching. It is not sufficient when a
+custom middleware must be placed inside Caddy route order, for example between a
+path matcher and a `reverse_proxy` handler.
+
+### Level 1: route-scoped bridge, implemented
+
+The zeroserve-only Caddy handler extension invokes a native eBPF
+callable through the existing `zs_call` mechanism at the exact point where the
+handler appears in the generated Caddy route:
+
+```json
+{
+  "handler": "zeroserve_call",
+  "script": "auth.o",
+  "function": "authorize",
+  "config": { "scope": "admin" }
+}
+```
+
+The Caddyfile adapter exposes this as a zeroserve directive:
+
+```caddyfile
+route /admin/* {
+  zeroserve_call auth authorize {
+    scope admin
+  }
+  reverse_proxy http://127.0.0.1:9000
+}
+```
+
+This handler is not part of stock Caddy. It is a zeroserve extension that is
+accepted only by zeroserve's adapter/compiler. The JSON compiler should reject
+unknown fields and invalid types the same way it does for supported Caddy
+handlers.
+
+### Callable contract
+
+The target script exports a normal `ZS_CALL_ENTRY(name, input)` callable, and
+generated Caddy middleware calls it with `zs_call(script, script_len, function,
+function_len, input)`. The bridge passes a JSON object:
+
+```json
+{
+  "version": 1,
+  "config": {},
+  "route": {
+    "handler": "zeroserve_call"
+  }
+}
+```
+
+The callable may use the regular SDK to inspect or mutate the live request, set
+metadata, register response hooks, and read request bodies within the configured
+body limits. Request and metadata mutations are already shared by reference
+across `zs_call`, so they naturally continue through later Caddy handlers.
+
+The callable returns a JSON object with one of these actions:
+
+- `{ "action": "continue" }`: continue to the next Caddy handler.
+- `{ "action": "respond", "status": 403, "body": "forbidden\n",
+  "headers": { "content-type": ["text/plain; charset=utf-8"] } }`: produce a
+  terminal response and stop the current route chain.
+- `{ "action": "proxy", "url": "http://127.0.0.1:9000" }`: terminal
+  reverse-proxy response using zeroserve's normal proxy path.
+- `{ "action": "abort" }`: close the request without a response.
+- `{ "action": "error", "status": 401, "message": "unauthorized" }`: set
+  Caddy error metadata and enter generated Caddy error-route handling.
+
+Unknown actions, malformed return JSON, a missing target script/function, or a
+callee trap should be treated as handler failure. If the server has Caddy error
+routes, the bridge should set `http.error.status_code=500` and continue through
+the generated error flow; otherwise it should emit a direct `500` response. This
+matches the existing principle that unsupported or failed generated behavior is
+not silently ignored.
+
+The bridge should not change `zs_call`'s call isolation rules. Today a callee's
+response/reverse-proxy slot is intentionally local to that call, while request
+mutation, metadata, and response-hook registration are shared by reference. The
+route bridge should preserve that behavior: generated Caddy middleware uses
+`zs_call` to get the callee's JSON result, then adopts only the explicit action
+encoded in that JSON result.
+
+The action can be adopted in one of two ways:
+
+- interpret the JSON action in generated C and call existing helpers such as
+  `zs_respond`, `zs_reverse_proxy`, and `zs_abort`, or
+- add a dedicated helper such as `zs_caddy_adopt_call_result(...)` that
+  validates the `zs_call` return object and applies the requested terminal
+  action.
+
+The dedicated adoption helper is preferable for implementation because it
+centralizes JSON validation, header application, Caddy error fallback, and
+logging in Rust instead of generating bulky C for every bridge handler. It
+should not perform script lookup or invocation itself; `zs_call` remains the
+only cross-script invocation path.
+
+### Ordering and naming
+
+Script lookup should use the existing `zs_call` naming rules: `auth` and
+`auth.o` both match `.zeroserve/scripts/auth.o`. If multiple loaded sites
+provide the same script name, the first loaded script wins, matching the visible
+script chain order: plugin tarballs in CLI order, then the main site tarball.
+
+Generated `caddy.o` should remain just another script in the loaded script list.
+Native scripts can still run before it through plugins or lexical filename
+ordering. Route-scoped calls are for finer placement inside the Caddy route
+graph, not a replacement for the outer-chain model.
+
+### Response hooks
+
+Custom middleware should prefer response hooks for response-phase work:
+
+```c
+ZS_CALL_ENTRY(authorize, input) {
+  zs_res_hook(ZS_STR("auth"), ZS_STR("audit_response"), input);
+  zs_s64 out = zs_json_new_object();
+  zs_s64 action = zs_json_new_object();
+  zs_json_set_string(action, ZS_STR("continue"));
+  zs_json_set(out, ZS_STR("action"), action);
+  zs_object_free(action);
+  return out;
+}
+```
+
+Hooks registered by custom scripts share the same metadata map as generated
+Caddy hooks and run before response headers are written. Hook ordering remains
+registration order. The adoption helper does not special-case hook
+registration; it uses the same shared hook list the rest of the runtime uses.
+
+### Non-goals
+
+- Do not load Go/Caddy modules or claim stock Caddy can run
+  `zeroserve_call`.
+- Do not support response body replacement, body copying, or body suppression
+  through the bridge; those remain outside zeroserve's Caddy-compatible surface.
+- Do not let custom eBPF handlers bypass explicit Caddy compile validation for
+  surrounding Caddy JSON.
+- Do not make scripts after generated `caddy.o` part of Caddy route fallthrough;
+  generated Caddy middleware intentionally has Caddy's empty-handler behavior
+  for unrouted requests.
+
+### Implementation status
+
+- `zeroserve_call` is validated and emitted by the Caddy JSON compiler.
+- The Caddyfile adapter supports `zeroserve_call <script> <function>` and a
+  block whose lines are passed as string/array/bool config fields.
+- Generated code builds the input JSON and invokes the target callable via
+  `zs_call`.
+- `zs_caddy_adopt_call_result(handle)` validates the returned action object and
+  adopts terminal actions. This helper does not invoke scripts directly.
+- Current tests cover compile-time validation, Caddyfile lowering, and generated
+  `zs_call`/adoption code. Runtime interop coverage should be expanded with
+  plugin lookup, route placement before/after Caddy handlers, response-hook
+  ordering, error-route fallback, hot reload failure retention, and malformed
+  callee return handling.
+
 ## Caddyfile Adapter
 
 The adapter implements the supported directive set needed by the compiler and
@@ -56,8 +239,9 @@ areas include:
   `not`, and supported expression forms
 - directives including `respond`, `redir`, `map`, `vars`, `root`, `rewrite`,
   `uri`, `try_files`, `file_server`, `request_header`, `header`,
-  `request_body`, `basic_auth`, `reverse_proxy`, `forward_auth`, `intercept`,
-  `log`, `log_skip`, `bind`, `tls`, `metrics`, `acme_server`, and
+  `request_body`, `zeroserve_call`, `basic_auth`, `reverse_proxy`,
+  `forward_auth`, `intercept`, `log`, `log_skip`, `bind`, `tls`, `metrics`,
+  `acme_server`, and
   observability directives where relevant to validation, including nested
   access-log output/format option blocks accepted outside the generated
   request middleware surface
@@ -112,6 +296,8 @@ middleware:
 - `map`
 - `invoke`
 - `subroute`
+- `zeroserve_call` for zeroserve-specific route-scoped calls to native eBPF
+  scripts through `zs_call`
 - `authentication` with HTTP basic auth
 - `encode` for gzip/zstd response compression
 - `log_append` and `tracing` as validated no-op/ignored observability surfaces

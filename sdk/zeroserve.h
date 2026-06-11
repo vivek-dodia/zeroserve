@@ -239,6 +239,7 @@ extern zs_s64 zs_caddy_set_error(const char *status_template,
                                  zs_u64 status_template_len,
                                  const char *message_template,
                                  zs_u64 message_template_len);
+extern zs_s64 zs_caddy_adopt_call_result(zs_u64 result_json);
 extern zs_s64 zs_caddy_basic_auth(const char *config_json,
                                   zs_u64 config_json_len);
 extern zs_s64 zs_caddy_reverse_proxy_url(const char *url_template,

@@ -84,8 +84,8 @@ placeholder shorthands (e.g. `{path}`, `{header.X}`).
 Supported directives map to the same handlers the JSON path supports: `respond`,
 `error`, `abort`, `redir`, `header`/`request_header`, `rewrite`/`uri`/`method`,
 `handle`/`handle_path`/`route`/`handle_errors`, `root`/`fs`/`vars`/`map`,
-`basic_auth`/`basicauth`, `request_body`, `file_server`, and `reverse_proxy`
-(common options). Directives
+`basic_auth`/`basicauth`, `request_body`, `zeroserve_call`, `file_server`, and
+`reverse_proxy` (common options). Directives
 are ordered by Caddy's canonical directive order and wrapped in terminal
 subroutes under each site's host/path matchers, exactly as Caddy does.
 
@@ -181,6 +181,27 @@ the server is started with `--expose-filesystem`. Without that flag, Caddy file
 logging is a no-op.
 Unsupported HTTP features fail compilation instead of silently generating
 different behavior.
+
+### Calling custom eBPF middleware from Caddy routes
+
+`zeroserve_call` is a zeroserve-specific Caddy handler that calls a native eBPF
+`ZS_CALL_ENTRY` through the existing `zs_call` mechanism at that point in the
+generated Caddy route:
+
+```caddyfile
+route /admin/* {
+  zeroserve_call auth authorize {
+    scope admin
+  }
+  reverse_proxy http://127.0.0.1:9000
+}
+```
+
+The generated middleware passes `{ "version": 1, "config": ..., "route": ... }`
+to the callee. The callee returns an action object: `continue`, `respond`,
+`proxy`, `abort`, or `error`. Request mutation, metadata updates, and response
+hooks registered by the callee are shared with later generated Caddy handlers,
+matching normal `zs_call` behavior.
 
 Configuration that lives entirely outside the eBPF request-processing surface —
 HTTP app listener defaults/shutdown timing (`http_port`, `https_port`,

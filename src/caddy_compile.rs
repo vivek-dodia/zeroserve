@@ -1471,6 +1471,7 @@ impl Generator {
             "file_server" => self.emit_file_server(handler),
             "vars" => self.emit_vars(handler),
             "map" => self.emit_map(handler),
+            "zeroserve_call" => self.emit_zeroserve_call(handler),
             "invoke" => self.emit_invoke(handler),
             "caddy_access_log" => self.emit_caddy_access_log(handler),
             "log_append" => self.emit_ignored_observability_handler(
@@ -1761,6 +1762,85 @@ impl Generator {
             self.indent -= 1;
             self.line("}");
         }
+        Ok(false)
+    }
+
+    fn emit_zeroserve_call(&mut self, handler: &Handler) -> Result<bool> {
+        let config = normalize_zeroserve_call_handler(handler)?;
+        let id = self.next_id();
+        let input = format!("zeroserve_call_input_{id}");
+        let version = format!("zeroserve_call_version_{id}");
+        let config_handle = format!("zeroserve_call_config_{id}");
+        let route = format!("zeroserve_call_route_{id}");
+        let reply = format!("zeroserve_call_reply_{id}");
+        let result = format!("zeroserve_call_result_{id}");
+
+        self.line(&format!("zs_s64 {input} = zs_json_new_object();"));
+        self.line(&format!("zs_s64 {version} = zs_json_new_object();"));
+        self.line(&format!("zs_json_set_i64({version}, 1);"));
+        self.line(&format!(
+            "zs_json_set({input}, ZS_STR(\"version\"), {version});"
+        ));
+        self.line(&format!("zs_object_free({version});"));
+        self.line(&format!(
+            "zs_s64 {config_handle} = zs_json_parse({}, {});",
+            c_str(&config.config_json),
+            config.config_json.len()
+        ));
+        self.line(&format!(
+            "zs_json_set({input}, ZS_STR(\"config\"), {config_handle});"
+        ));
+        self.line(&format!("zs_object_free({config_handle});"));
+        self.line(&format!(
+            "zs_s64 {route} = zs_json_parse({}, {});",
+            c_str("{\"handler\":\"zeroserve_call\"}"),
+            "{\"handler\":\"zeroserve_call\"}".len()
+        ));
+        self.line(&format!(
+            "zs_json_set({input}, ZS_STR(\"route\"), {route});"
+        ));
+        self.line(&format!("zs_object_free({route});"));
+        self.line(&format!(
+            "zs_s64 {reply} = zs_call({}, {}, {}, {}, {input});",
+            c_str(&config.script),
+            config.script.len(),
+            c_str(&config.function),
+            config.function.len()
+        ));
+        self.line(&format!("zs_object_free({input});"));
+        self.line(&format!("zs_s64 {result};"));
+        self.line(&format!("if ({reply} < 0) {{"));
+        self.indent += 1;
+        self.line("zs_caddy_set_error(\"500\", 3, \"zeroserve_call target failed\", 28);");
+        self.line(&format!("{result} = 2;"));
+        self.indent -= 1;
+        self.line("} else {");
+        self.indent += 1;
+        self.line(&format!("{result} = zs_caddy_adopt_call_result({reply});"));
+        self.line(&format!("zs_object_free({reply});"));
+        self.indent -= 1;
+        self.line("}");
+        self.line(&format!("if ({result} == 2) {{"));
+        self.indent += 1;
+        if !self.error_routes.is_empty() {
+            self.emit_error_routes()?;
+            if self.error_routes_fallthrough {
+                self.line("if (zs_response_pending() != 0) return 0;");
+            } else {
+                self.line("if (zs_response_pending() == 0) {");
+                self.indent += 1;
+                self.line("zs_caddy_respond(\"{http.error.status_code}\", 24, \"\", 0);");
+                self.indent -= 1;
+                self.line("}");
+                self.line("return 0;");
+            }
+        } else {
+            self.line("zs_caddy_respond(\"{http.error.status_code}\", 24, \"\", 0);");
+            self.line("return 0;");
+        }
+        self.indent -= 1;
+        self.line("}");
+        self.line(&format!("if ({result} == 1) return 0;"));
         Ok(false)
     }
 
@@ -6062,6 +6142,49 @@ fn validate_headers_handler(handler: &Handler) -> Result<()> {
         validate_header_ops_fields(response, HeaderTarget::Response)?;
     }
     Ok(())
+}
+
+struct ZeroserveCallConfig {
+    script: String,
+    function: String,
+    config_json: String,
+}
+
+fn normalize_zeroserve_call_handler(handler: &Handler) -> Result<ZeroserveCallConfig> {
+    validate_object_fields(
+        &handler.config,
+        &["script", "function", "config"],
+        "zeroserve_call",
+    )?;
+    let script = handler
+        .config
+        .get("script")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("zeroserve_call.script must be a string"))?;
+    if script.trim().is_empty() {
+        bail!("zeroserve_call.script must not be empty");
+    }
+    let function = handler
+        .config
+        .get("function")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("zeroserve_call.function must be a string"))?;
+    if function.trim().is_empty() {
+        bail!("zeroserve_call.function must not be empty");
+    }
+    let config = handler
+        .config
+        .get("config")
+        .cloned()
+        .unwrap_or_else(|| Value::Object(Map::new()));
+    if !config.is_object() {
+        bail!("zeroserve_call.config must be an object");
+    }
+    Ok(ZeroserveCallConfig {
+        script: script.to_string(),
+        function: function.to_string(),
+        config_json: serde_json::to_string(&config)?,
+    })
 }
 
 fn validate_copy_response_headers_handler(handler: &Handler) -> Result<()> {
@@ -12818,5 +12941,23 @@ example.com {
 
         let err = compile_caddy_json(source).unwrap_err().to_string();
         assert!(err.contains("unsupported apps.http.servers.srv0.errors field \"unknown\""));
+    }
+
+    #[test]
+    fn compiles_zeroserve_call_through_zs_call() {
+        let source = r#"{
+          "apps": {"http": {"servers": {"srv0": {"routes": [{
+            "handle": [
+              {"handler": "zeroserve_call", "script": "auth", "function": "authorize", "config": {"scope": "admin"}},
+              {"handler": "static_response", "status_code": 204}
+            ]
+          }]}}}}
+        }"#;
+
+        let c = compile_caddy_json(source).unwrap();
+        assert!(c.contains("zs_call(\"auth\", 4, \"authorize\", 9"), "{c}");
+        assert!(c.contains("zs_caddy_adopt_call_result("), "{c}");
+        assert!(c.contains("\\\"scope\\\":\\\"admin\\\""), "{c}");
+        assert!(c.contains("zs_caddy_respond_static(\"204\""), "{c}");
     }
 }

@@ -306,6 +306,10 @@ static SCRIPT_HELPERS: &[(&str, Helper)] = &[
     ("zs_caddy_respond", helpers::h_caddy_respond),
     ("zs_caddy_respond_static", helpers::h_caddy_respond_static),
     ("zs_caddy_set_error", helpers::h_caddy_set_error),
+    (
+        "zs_caddy_adopt_call_result",
+        helpers::h_caddy_adopt_call_result,
+    ),
     ("zs_caddy_basic_auth", helpers::h_caddy_basic_auth),
     (
         "zs_caddy_reverse_proxy_url",

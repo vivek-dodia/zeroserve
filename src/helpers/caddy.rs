@@ -18,12 +18,14 @@ use boring::{
     },
 };
 use regex::Regex;
+use serde_json::Value;
 
 use crate::caddy_file::{
     display_path as caddy_file_match_display_path, file_hidden as caddy_file_hidden,
     fs_file_hidden as caddy_fs_file_hidden, glob_match, join_file_path as join_caddy_file_path,
     path_glob_match as caddy_path_glob_match,
 };
+use crate::json::JsonRef;
 use crate::script::{
     CaddyFileServer, ScriptResponse, deref_and_write_cstr, header_pattern_matches, read_utf8,
     split_relative_request_target, with_ectx,
@@ -3884,6 +3886,193 @@ pub fn h_caddy_set_error(
         metadata.insert("http.error.message".to_string(), message.clone());
         metadata.insert("http.error".to_string(), message);
         Ok(0)
+    })
+}
+
+fn caddy_call_set_error(ctx: &crate::script::ScriptExecutionContext, status: u16, message: &str) {
+    let status_text = ::http::StatusCode::from_u16(status)
+        .ok()
+        .and_then(|status| status.canonical_reason())
+        .unwrap_or("");
+    let mut metadata = ctx.metadata.borrow_mut();
+    metadata.insert("http.error.status_code".to_string(), status.to_string());
+    metadata.insert(
+        "http.error.status_text".to_string(),
+        status_text.to_string(),
+    );
+    metadata.insert("http.error.message".to_string(), message.to_string());
+    metadata.insert("http.error".to_string(), message.to_string());
+}
+
+fn caddy_call_failure(ctx: &mut crate::script::ScriptExecutionContext, message: &str) -> u64 {
+    ctx.error = message.to_string();
+    caddy_call_set_error(ctx, 500, message);
+    2
+}
+
+fn caddy_call_action<'a>(
+    ctx: &mut crate::script::ScriptExecutionContext,
+    value: &'a Value,
+) -> Result<&'a str, u64> {
+    let Some(action) = value.get("action").and_then(Value::as_str) else {
+        return Err(caddy_call_failure(
+            ctx,
+            "zeroserve_call result must contain string field 'action'",
+        ));
+    };
+    Ok(action)
+}
+
+fn caddy_call_status(value: &Value, default: u16) -> Option<u16> {
+    match value.get("status") {
+        Some(Value::Number(n)) => n.as_u64().and_then(|n| u16::try_from(n).ok()),
+        Some(Value::String(s)) => s.parse::<u16>().ok(),
+        Some(Value::Null) | None => Some(default),
+        _ => None,
+    }
+    .filter(|status| (100..=999).contains(status))
+}
+
+fn caddy_call_response_headers(value: &Value) -> Result<Vec<(String, String)>, ()> {
+    let Some(headers) = value.get("headers").filter(|value| !value.is_null()) else {
+        return Ok(Vec::new());
+    };
+    let headers = headers.as_object().ok_or(())?;
+    let mut out = Vec::new();
+    for (name, values) in headers {
+        if name.trim().is_empty()
+            || ::http::header::HeaderName::from_bytes(name.as_bytes()).is_err()
+        {
+            return Err(());
+        }
+        let values = values.as_array().ok_or(())?;
+        for value in values {
+            let value = value.as_str().ok_or(())?;
+            out.push((name.to_string(), value.to_string()));
+        }
+    }
+    Ok(out)
+}
+
+/// Adopt a JSON action returned from a Caddy route-scoped custom middleware
+/// call. The invocation itself must happen through `zs_call`; this helper only
+/// validates and applies the returned action.
+///
+/// Returns:
+///   0 = continue to the next generated Caddy handler
+///   1 = terminal response/proxy/abort was installed; generated code should return
+///   2 = Caddy error metadata was set; generated code should run error routes
+pub fn h_caddy_adopt_call_result(
+    scope: &HelperScope,
+    result_handle: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    with_ectx(scope, |ctx| {
+        let value = ctx
+            .extobj::<JsonRef>(result_handle)?
+            .view(|value| value.clone())
+            .map_err(|_| ())?;
+        if !value.is_object() {
+            return Ok(caddy_call_failure(
+                ctx,
+                "zeroserve_call result must be a JSON object",
+            ));
+        }
+        let action = match caddy_call_action(ctx, &value) {
+            Ok(action) => action,
+            Err(code) => return Ok(code),
+        };
+        match action {
+            "continue" => Ok(0),
+            "respond" => {
+                if ctx.response_context.is_some() {
+                    return Err(());
+                }
+                let status = match caddy_call_status(&value, 200) {
+                    Some(status) if status != 103 => status,
+                    _ => {
+                        return Ok(caddy_call_failure(
+                            ctx,
+                            "zeroserve_call respond action has invalid status",
+                        ));
+                    }
+                };
+                let body = value
+                    .get("body")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let headers = match caddy_call_response_headers(&value) {
+                    Ok(headers) => headers,
+                    Err(()) => {
+                        return Ok(caddy_call_failure(
+                            ctx,
+                            "zeroserve_call respond action has invalid headers",
+                        ));
+                    }
+                };
+                ctx.alloc_memory_footprint(
+                    body.len() as u64
+                        + headers
+                            .iter()
+                            .map(|(name, value)| name.len() + value.len())
+                            .sum::<usize>() as u64,
+                )?;
+                ctx.response = Some(ScriptResponse {
+                    status,
+                    body: body.into_bytes(),
+                    content_type: None,
+                    force_close: false,
+                    headers,
+                });
+                Ok(1)
+            }
+            "proxy" => {
+                let Some(url) = value.get("url").and_then(Value::as_str) else {
+                    return Ok(caddy_call_failure(
+                        ctx,
+                        "zeroserve_call proxy action requires string field 'url'",
+                    ));
+                };
+                let url = url.trim();
+                if url.is_empty() || ctx.response.is_some() || ctx.reverse_proxy.is_some() {
+                    return Ok(caddy_call_failure(
+                        ctx,
+                        "zeroserve_call proxy action could not install reverse proxy",
+                    ));
+                }
+                ctx.reverse_proxy = Some(url.to_string());
+                Ok(1)
+            }
+            "abort" => {
+                if ctx.response_context.is_some() {
+                    return Err(());
+                }
+                ctx.abort_and_clear_outputs();
+                Ok(1)
+            }
+            "error" => {
+                let status = match caddy_call_status(&value, 500) {
+                    Some(status) if status != 103 => status,
+                    _ => {
+                        return Ok(caddy_call_failure(
+                            ctx,
+                            "zeroserve_call error action has invalid status",
+                        ));
+                    }
+                };
+                let message = value.get("message").and_then(Value::as_str).unwrap_or("");
+                caddy_call_set_error(ctx, status, message);
+                Ok(2)
+            }
+            _ => Ok(caddy_call_failure(
+                ctx,
+                "zeroserve_call result has unknown action",
+            )),
+        }
     })
 }
 

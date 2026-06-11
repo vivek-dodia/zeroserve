@@ -946,6 +946,25 @@ mod tests {
     }
 
     #[test]
+    fn zeroserve_call_directive_lowers_to_custom_handler() {
+        let r = routes(
+            r#"example.com {
+  zeroserve_call auth authorize {
+    scope admin
+    flags one two
+    enabled
+  }
+}"#,
+        );
+        let h = first_handler(&r, "zeroserve_call").unwrap();
+        assert_eq!(h["script"], json!("auth"));
+        assert_eq!(h["function"], json!("authorize"));
+        assert_eq!(h["config"]["scope"], json!("admin"));
+        assert_eq!(h["config"]["flags"], json!(["one", "two"]));
+        assert_eq!(h["config"]["enabled"], json!(true));
+    }
+
+    #[test]
     fn inline_path_matcher_and_ordering() {
         // file_server is ordered after respond; a path matcher narrows the route.
         let r = routes("example.com {\n  respond /api* \"hi\"\n  respond \"fallback\"\n}");

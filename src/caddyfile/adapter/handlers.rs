@@ -33,6 +33,7 @@ pub const DIRECTIVE_ORDER: &[&str] = &[
     "header",
     "copy_response_headers",
     "request_body",
+    "zeroserve_call",
     "redir",
     "method",
     "rewrite",
@@ -91,6 +92,7 @@ pub fn dispatch(dir: &str, h: &mut Helper) -> Result<Option<Vec<ConfigValue>>> {
         "skip_log" | "log_skip" => handler_directive_helper(h, parse_log_skip)?,
         "log_name" => handler_directive(h, parse_log_name)?,
         "request_body" => handler_directive(h, parse_request_body)?,
+        "zeroserve_call" => handler_directive(h, parse_zeroserve_call)?,
         "file_server" => handler_directive_helper(h, parse_file_server)?,
         "reverse_proxy" => handler_directive_helper(h, parse_reverse_proxy)?,
         "forward_auth" => parse_forward_auth(h)?,
@@ -309,6 +311,37 @@ fn parse_redir(d: &mut Dispenser) -> Result<Value> {
     }
     if !body.is_empty() {
         m.insert("body".into(), json!(body));
+    }
+    Ok(Value::Object(m))
+}
+
+fn parse_zeroserve_call(d: &mut Dispenser) -> Result<Value> {
+    d.next();
+    let args = d.remaining_args();
+    if args.len() != 2 {
+        return Err(d.arg_err());
+    }
+    let script = args[0].clone();
+    let function = args[1].clone();
+
+    let mut config = Map::new();
+    while d.next_block(0) {
+        let key = d.val();
+        let values = d.remaining_args();
+        let value = match values.len() {
+            0 => Value::Bool(true),
+            1 => Value::String(values[0].clone()),
+            _ => Value::Array(values.into_iter().map(Value::String).collect()),
+        };
+        config.insert(key, value);
+    }
+
+    let mut m = Map::new();
+    m.insert("handler".into(), json!("zeroserve_call"));
+    m.insert("script".into(), json!(script));
+    m.insert("function".into(), json!(function));
+    if !config.is_empty() {
+        m.insert("config".into(), Value::Object(config));
     }
     Ok(Value::Object(m))
 }
