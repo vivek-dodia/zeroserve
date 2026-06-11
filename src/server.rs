@@ -23,8 +23,8 @@ use futures::{
 use monoio::{
     buf::SliceMut,
     io::{
-        AsyncReadRent, AsyncReadRentExt, AsyncWriteRent, AsyncWriteRentExt, BufWriter, IntoPollIo,
-        Split, Splitable,
+        AsyncReadRent, AsyncReadRentExt, AsyncWriteRent, AsyncWriteRentExt, IntoPollIo, Split,
+        Splitable,
     },
     net::{TcpListener, TcpStream},
 };
@@ -561,8 +561,7 @@ where
     IO: AsyncReadRent + AsyncWriteRent + Split + 'static,
     H: Future<Output = ()> + Unpin + 'static,
 {
-    let (r, w) = io.into_split();
-    let mut w = BufWriter::new(w);
+    let (r, mut w) = io.into_split();
     let mut reader = h1::H1Connection::new(r);
     loop {
         let result = reader.next_request().await;
