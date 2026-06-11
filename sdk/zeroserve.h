@@ -184,6 +184,10 @@ extern zs_s64 zs_caddy_response_headers(const char *ops_json,
  * request's Accept-Encoding and compresses the response body. */
 extern zs_s64 zs_caddy_encode(const char *config_json, zs_u64 config_json_len);
 extern zs_s64 zs_caddy_path_match(const char *pattern, zs_u64 pattern_len);
+/* Match the request path against NUL-separated patterns, in order; returns 1
+ * on the first match. One call covers a whole `path` matcher list. */
+extern zs_s64 zs_caddy_path_match_multi(const char *patterns,
+                                        zs_u64 patterns_len);
 extern zs_s64 zs_caddy_query_match(const char *name_template,
                                    zs_u64 name_template_len,
                                    const char *value_template,

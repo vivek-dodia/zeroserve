@@ -236,6 +236,10 @@ static SCRIPT_HELPERS: &[(&str, Helper)] = &[
     ),
     ("zs_caddy_encode", helpers::h_caddy_encode),
     ("zs_caddy_path_match", helpers::h_caddy_path_match),
+    (
+        "zs_caddy_path_match_multi",
+        helpers::h_caddy_path_match_multi,
+    ),
     ("zs_caddy_query_match", helpers::h_caddy_query_match),
     ("zs_caddy_query_present", helpers::h_caddy_query_present),
     ("zs_caddy_query_empty", helpers::h_caddy_query_empty),

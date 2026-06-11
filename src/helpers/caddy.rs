@@ -1351,11 +1351,53 @@ pub fn h_caddy_path_match(
     _: u64,
 ) -> Result<u64, ()> {
     let pattern = read_utf8(scope, pattern_ptr, pattern_len)?;
+    with_ectx(scope, |ctx| caddy_path_pattern_match(ctx, pattern))
+}
+
+/// Match the request path against NUL-separated path patterns, returning 1 on
+/// the first match. Lets the generated middleware test a whole `path` matcher
+/// with one host call instead of one per pattern.
+pub fn h_caddy_path_match_multi(
+    scope: &HelperScope,
+    patterns_ptr: u64,
+    patterns_len: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    let patterns = read_utf8(scope, patterns_ptr, patterns_len)?;
     with_ectx(scope, |ctx| {
-        let pattern = expand_caddy_placeholders(ctx, &pattern.to_ascii_lowercase())?;
-        let encoded_path = ctx.request.borrow().path.to_ascii_lowercase();
-        Ok(caddy_match_path(&encoded_path, &pattern)? as u64)
+        for pattern in patterns.split('\0') {
+            if caddy_path_pattern_match(ctx, pattern)? != 0 {
+                return Ok(1);
+            }
+        }
+        Ok(0)
     })
+}
+
+fn caddy_path_pattern_match(
+    ctx: &crate::script::ScriptExecutionContext,
+    pattern: &str,
+) -> Result<u64, ()> {
+    use std::borrow::Cow;
+    let pattern: Cow<str> = if pattern.bytes().any(|b| b.is_ascii_uppercase()) {
+        Cow::Owned(pattern.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(pattern)
+    };
+    let pattern: Cow<str> = if pattern.contains('{') {
+        Cow::Owned(expand_caddy_placeholders(ctx, &pattern)?)
+    } else {
+        pattern
+    };
+    let request = ctx.request.borrow();
+    let encoded_path: Cow<str> = if request.path.bytes().any(|b| b.is_ascii_uppercase()) {
+        Cow::Owned(request.path.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(&request.path)
+    };
+    Ok(caddy_match_path(&encoded_path, &pattern)? as u64)
 }
 
 pub fn h_caddy_query_match(
@@ -1492,7 +1534,7 @@ pub fn h_caddy_header_regexp_match(
 ) -> Result<u64, ()> {
     let name = read_utf8(scope, name_ptr, name_len)?;
     let config = read_utf8(scope, config_ptr, config_len)?;
-    let config: CaddyRegexMatch = serde_json::from_str(config).map_err(|_| ())?;
+    let config = parse_caddy_regex_config(config)?;
     with_ectx(scope, |ctx| {
         let values = caddy_request_header_values(ctx, &name);
         for value in values {
@@ -1514,7 +1556,7 @@ pub fn h_caddy_header_regexp_match_expanded(
 ) -> Result<u64, ()> {
     let name_template = read_utf8(scope, name_ptr, name_len)?;
     let config = read_utf8(scope, config_ptr, config_len)?;
-    let config: CaddyRegexMatch = serde_json::from_str(config).map_err(|_| ())?;
+    let config = parse_caddy_regex_config(config)?;
     with_ectx(scope, |ctx| {
         let name = expand_caddy_placeholders(ctx, name_template)?;
         let values = caddy_request_header_values(ctx, &name);
@@ -1606,12 +1648,36 @@ fn caddy_match_path(encoded_path: &str, pattern: &str) -> Result<bool, ()> {
         return Ok(caddy_http_path_glob_match(&pattern, &hybrid_path));
     }
 
-    let Some(decoded_path) = caddy_percent_decode_path(encoded_path) else {
+    let Some(cleaned_path) = caddy_cleaned_path_subject(encoded_path, merge_slashes) else {
         return Ok(false);
     };
-    let decoded_path = decoded_path.to_ascii_lowercase();
-    let cleaned_path = clean_path_caddy(&decoded_path, merge_slashes);
     Ok(caddy_match_cleaned_path(&cleaned_path, pattern))
+}
+
+/// Decoded, lowercased, cleaned path-match subject, memoized for the common
+/// case of many path matchers testing the same request path in a row. Keyed by
+/// value (path + merge flag), so request interleaving only affects the hit
+/// rate, never correctness. Returns `None` when percent-decoding fails.
+fn caddy_cleaned_path_subject(encoded_path: &str, merge_slashes: bool) -> Option<std::rc::Rc<str>> {
+    type SubjectKey = (String, bool);
+    thread_local! {
+        static CACHE: std::cell::RefCell<Option<(SubjectKey, Option<std::rc::Rc<str>>)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    CACHE.with(|cache| {
+        if let Some((key, subject)) = cache.borrow().as_ref()
+            && key.0 == encoded_path
+            && key.1 == merge_slashes
+        {
+            return subject.clone();
+        }
+        let subject = caddy_percent_decode_path(encoded_path).map(|decoded| {
+            let decoded = decoded.to_ascii_lowercase();
+            std::rc::Rc::<str>::from(clean_path_caddy(&decoded, merge_slashes))
+        });
+        *cache.borrow_mut() = Some(((encoded_path.to_string(), merge_slashes), subject.clone()));
+        subject
+    })
 }
 
 fn caddy_match_cleaned_path(path: &str, pattern: &str) -> bool {
@@ -1765,7 +1831,7 @@ pub fn h_caddy_regex_match(
 ) -> Result<u64, ()> {
     let input = read_utf8(scope, input_ptr, input_len)?;
     let config = read_utf8(scope, config_ptr, config_len)?;
-    let config: CaddyRegexMatch = serde_json::from_str(config).map_err(|_| ())?;
+    let config = parse_caddy_regex_config(config)?;
     with_ectx(scope, |ctx| {
         Ok(caddy_regex_match_and_store(ctx, input, &config)? as u64)
     })
@@ -2436,7 +2502,25 @@ fn caddy_regex_match_and_store(
 }
 
 fn caddy_regex(pattern: &str) -> Result<Regex, regex::Error> {
-    Regex::new(&caddy_go_regexp_for_rust(pattern))
+    // Patterns come from compiled config, so the set is small and stable;
+    // compiling on every request is the dominant cost of regexp matchers.
+    // `Regex` is Arc-backed, so handing out clones is cheap.
+    thread_local! {
+        static CACHE: std::cell::RefCell<HashMap<String, Regex>> =
+            std::cell::RefCell::new(HashMap::new());
+    }
+    CACHE.with(|cache| {
+        if let Some(regex) = cache.borrow().get(pattern) {
+            return Ok(regex.clone());
+        }
+        let regex = Regex::new(&caddy_go_regexp_for_rust(pattern))?;
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= 1024 {
+            cache.clear();
+        }
+        cache.insert(pattern.to_string(), regex.clone());
+        Ok(regex)
+    })
 }
 
 fn caddy_go_regexp_for_rust(pattern: &str) -> String {
@@ -2495,6 +2579,29 @@ struct CaddyRegexMatch {
     name: String,
     #[serde(default)]
     pattern: String,
+}
+
+/// Parse a `CaddyRegexMatch` config JSON, caching the result keyed by the raw
+/// config string. Configs are compile-time constants embedded in the script,
+/// so the set is small and stable.
+fn parse_caddy_regex_config(config: &str) -> Result<std::rc::Rc<CaddyRegexMatch>, ()> {
+    thread_local! {
+        static CACHE: std::cell::RefCell<HashMap<String, std::rc::Rc<CaddyRegexMatch>>> =
+            std::cell::RefCell::new(HashMap::new());
+    }
+    CACHE.with(|cache| {
+        if let Some(config) = cache.borrow().get(config) {
+            return Ok(config.clone());
+        }
+        let parsed: CaddyRegexMatch = serde_json::from_str(config).map_err(|_| ())?;
+        let parsed = std::rc::Rc::new(parsed);
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= 1024 {
+            cache.clear();
+        }
+        cache.insert(config.to_string(), parsed.clone());
+        Ok(parsed)
+    })
 }
 
 fn is_caddy_regex_name(name: &str) -> bool {

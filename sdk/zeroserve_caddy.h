@@ -358,6 +358,43 @@ static ZS_INLINE ZS_MAYBE_UNUSED int zs_caddy_host_match(const char *host, zs_u6
   return host_len == 0 && pat_len == 0;
 }
 
+/* Binary search over a sorted table of NUL-terminated lowercase hostnames
+ * packed into `tbl`, with `off[i]` giving the byte offset of entry i and
+ * `off[n]` the total blob length (each entry includes its trailing NUL).
+ * Returns the sorted index of the entry equal to host[0..host_len], or -1.
+ * `host` must already be normalized (lowercased, port stripped). */
+static ZS_INLINE ZS_MAYBE_UNUSED zs_s64 zs_caddy_host_table_lookup(const char *host,
+                                                                   zs_u64 host_len,
+                                                                   const char *tbl,
+                                                                   const unsigned int *off,
+                                                                   zs_u64 n) {
+  zs_s64 lo = 0;
+  zs_s64 hi = (zs_s64)n - 1;
+  while (lo <= hi) {
+    /* BPF lacks signed division; hi >= lo here, so shift the difference. */
+    zs_s64 mid = lo + (zs_s64)(((zs_u64)(hi - lo)) >> 1);
+    const char *cand = tbl + off[mid];
+    zs_u64 cand_len = (zs_u64)(off[mid + 1] - off[mid] - 1);
+    zs_u64 min_len = host_len < cand_len ? host_len : cand_len;
+    int cmp = 0;
+    for (zs_u64 i = 0; i < min_len; i++) {
+      if (host[i] != cand[i]) {
+        cmp = (unsigned char)host[i] < (unsigned char)cand[i] ? -1 : 1;
+        break;
+      }
+    }
+    if (cmp == 0 && host_len != cand_len)
+      cmp = host_len < cand_len ? -1 : 1;
+    if (cmp == 0)
+      return mid;
+    if (cmp < 0)
+      hi = mid - 1;
+    else
+      lo = mid + 1;
+  }
+  return -1;
+}
+
 static ZS_INLINE ZS_MAYBE_UNUSED zs_u64 zs_caddy_copy(char *dst, zs_u64 cap, zs_u64 off,
                                       const char *src, zs_u64 len) {
   for (zs_u64 i = 0; i < len && off + 1 < cap; i++)

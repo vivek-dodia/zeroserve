@@ -299,6 +299,8 @@ pub fn compile_caddy_json_collecting(source: &str) -> Result<(String, Vec<String
     generator.access_log_config = access_log_config;
     generator.tls_connection_policies = tls_connection_policies;
     generator.emit_preamble();
+    generator.line(HOST_TABLE_MARKER);
+    generator.blank();
 
     let mut groups = BTreeMap::<String, usize>::new();
     for compiled in &routes {
@@ -325,6 +327,7 @@ pub fn compile_caddy_json_collecting(source: &str) -> Result<(String, Vec<String
         generator.line("int route_groups[32];");
         generator.line("zs_memset(route_groups, 0, sizeof(route_groups));");
     }
+    generator.line(HOST_HOIST_MARKER);
     for compiled in &routes {
         generator.client_ip_config = compiled.client_ip_config.clone();
         generator.named_routes = compiled.named_routes.clone();
@@ -339,6 +342,12 @@ pub fn compile_caddy_json_collecting(source: &str) -> Result<(String, Vec<String
             generator.line("zs_meta_set(ZS_STR(\"zs.caddy.has_error_routes\"), ZS_STR(\"1\"));");
             generator.emit_pending_matcher_error()?;
         }
+        // Brace-scope each route so its matcher scratch buffers get tight
+        // lifetimes: LLVM stack coloring then overlays buffers from different
+        // routes into the same stack slots, keeping entry() within the BPF
+        // stack limit regardless of route count.
+        generator.line("{");
+        generator.indent += 1;
         let matched = generator.emit_route_match(&compiled.route)?;
         if route_match_can_set_error(&compiled.route) {
             let match_id = generator.next_id();
@@ -371,6 +380,8 @@ pub fn compile_caddy_json_collecting(source: &str) -> Result<(String, Vec<String
         generator.line("zs_response_clear();");
         generator.indent -= 1;
         generator.line("}");
+        generator.indent -= 1;
+        generator.line("}");
     }
 
     generator.blank();
@@ -385,7 +396,141 @@ pub fn compile_caddy_json_collecting(source: &str) -> Result<(String, Vec<String
             warnings.push(warning);
         }
     }
-    Ok((generator.out, warnings))
+    let out = resolve_host_hoist_markers(
+        &generator.out,
+        generator.host_hoist_used,
+        &generator.host_table,
+    );
+    Ok((out, warnings))
+}
+
+/// Marker emitted at the top of `entry()`; replaced by the hoisted host-header
+/// read when any host matcher uses the shared buffer, dropped otherwise.
+const HOST_HOIST_MARKER: &str = "/*ZS_HOST_HOIST*/";
+/// Marker emitted after handlers that may mutate the request Host header;
+/// replaced by a re-read of the hoisted buffer so later matchers observe the
+/// mutation (matching the previous read-per-matcher behavior).
+const HOST_REFRESH_MARKER: &str = "/*ZS_HOST_REFRESH*/";
+
+/// Marker emitted at file scope before `entry()`; replaced by the sorted
+/// exact-host dispatch table when any host matcher interned a pattern into it.
+const HOST_TABLE_MARKER: &str = "/*ZS_HOST_TABLE*/";
+
+/// Statements that (re)load and normalize the request host into the shared
+/// hoisted buffer (and re-resolve its dispatch-table id when a table exists).
+/// The declarations are only part of the prologue.
+fn host_hoist_load_stmts(has_table: bool) -> Vec<&'static str> {
+    let mut stmts = vec![
+        "caddy_req_host_raw = zs_req_header(ZS_STR(\"host\"), caddy_req_host, sizeof(caddy_req_host));",
+        "caddy_req_host_len = zs_caddy_clamp_len(caddy_req_host_raw, sizeof(caddy_req_host));",
+        "caddy_req_host_len = zs_caddy_host_normalize(caddy_req_host, caddy_req_host_len);",
+    ];
+    if has_table {
+        stmts.push(
+            "caddy_req_host_id = zs_caddy_host_table_lookup(caddy_req_host, caddy_req_host_len, caddy_host_tbl, caddy_host_tbl_off, CADDY_HOST_TBL_N);",
+        );
+    }
+    stmts
+}
+
+/// Render the sorted exact-host dispatch table: the packed hostname blob, the
+/// offset array, and one `ZS_HOST_ID_<insertion id>` define per pattern
+/// resolving to its sorted index (the value `zs_caddy_host_table_lookup`
+/// returns on a match).
+fn render_host_table(table: &BTreeMap<String, usize>) -> String {
+    let mut out = String::new();
+    out.push_str("/* Sorted exact-host dispatch table. */\n");
+    out.push_str("static const char caddy_host_tbl[] =\n");
+    let mut offsets = Vec::with_capacity(table.len() + 1);
+    let mut offset = 0usize;
+    // BTreeMap iterates in byte order, which matches the lookup's unsigned
+    // byte comparison, so iteration order is the sorted table order.
+    for host in table.keys() {
+        offsets.push(offset);
+        out.push_str(&format!("    {}\n", c_str(&format!("{host}\0"))));
+        offset += host.len() + 1;
+    }
+    offsets.push(offset);
+    out.push_str(";\n");
+    out.push_str(&format!(
+        "static const unsigned int caddy_host_tbl_off[] = {{{}}};\n",
+        offsets
+            .iter()
+            .map(|o| o.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+    out.push_str(&format!("#define CADDY_HOST_TBL_N {}\n", table.len()));
+    for (sorted_idx, insertion_id) in table.values().enumerate() {
+        out.push_str(&format!("#define ZS_HOST_ID_{insertion_id} {sorted_idx}\n"));
+    }
+    out
+}
+
+/// Whether a normalized request header-ops object could modify the Host
+/// header: any set/add/replace key or delete entry that is "host"
+/// (case-insensitive), "*", or contains a placeholder.
+fn header_ops_may_touch_host(value: &Value) -> bool {
+    let name_touches_host = |name: &str| {
+        name == "*" || name.eq_ignore_ascii_case("host") || contains_placeholder(name)
+    };
+    let Some(obj) = value.as_object() else {
+        // Unexpected shape: be conservative.
+        return true;
+    };
+    for key in ["set", "add", "replace"] {
+        if let Some(ops) = obj.get(key).and_then(|v| v.as_object())
+            && ops.keys().any(|name| name_touches_host(name))
+        {
+            return true;
+        }
+    }
+    if let Some(deletes) = obj.get("delete").and_then(|v| v.as_array())
+        && deletes
+            .iter()
+            .filter_map(|v| v.as_str())
+            .any(name_touches_host)
+    {
+        return true;
+    }
+    false
+}
+
+fn resolve_host_hoist_markers(source: &str, used: bool, table: &BTreeMap<String, usize>) -> String {
+    let has_table = !table.is_empty();
+    let load_stmts = host_hoist_load_stmts(has_table);
+    let mut out = String::with_capacity(source.len());
+    for line in source.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if trimmed == HOST_HOIST_MARKER {
+            if used {
+                let indent = &line[..line.len() - line.trim_start().len()];
+                out.push_str(&format!("{indent}char caddy_req_host[256];\n"));
+                out.push_str(&format!("{indent}zs_s64 caddy_req_host_raw;\n"));
+                out.push_str(&format!("{indent}zs_u64 caddy_req_host_len;\n"));
+                if has_table {
+                    out.push_str(&format!("{indent}zs_s64 caddy_req_host_id;\n"));
+                }
+                for stmt in &load_stmts {
+                    out.push_str(&format!("{indent}{stmt}\n"));
+                }
+            }
+        } else if trimmed == HOST_REFRESH_MARKER {
+            if used {
+                let indent = &line[..line.len() - line.trim_start().len()];
+                for stmt in &load_stmts {
+                    out.push_str(&format!("{indent}{stmt}\n"));
+                }
+            }
+        } else if trimmed == HOST_TABLE_MARKER {
+            if has_table {
+                out.push_str(&render_host_table(table));
+            }
+        } else {
+            out.push_str(line);
+        }
+    }
+    out
 }
 
 struct CompiledRoute {
@@ -417,6 +562,14 @@ struct Generator {
     route_groups: BTreeMap<String, usize>,
     in_error_route: bool,
     error_routes_fallthrough: bool,
+    /// Whether any host matcher in `entry()` references the hoisted
+    /// `caddy_req_host` buffer (see `HOST_HOIST_MARKER`).
+    host_hoist_used: bool,
+    /// Exact (non-wildcard, non-placeholder) host patterns interned into the
+    /// sorted dispatch table, keyed by the normalized lowercase pattern. The
+    /// value is the insertion id behind the emitted `ZS_HOST_ID_<id>` define;
+    /// the define resolves to the pattern's sorted table index at finish.
+    host_table: BTreeMap<String, usize>,
 }
 
 impl Generator {
@@ -642,15 +795,24 @@ impl Generator {
         if values.is_empty() {
             return Ok("(0)".to_string());
         }
-        let mut checks = Vec::new();
-        for value in values {
-            checks.push(format!(
-                "zs_caddy_path_match({}, {})",
-                c_str(&value),
-                value.len()
-            ));
+        for value in &values {
+            if value.contains('\0') {
+                bail!("path matcher pattern {value:?} contains a NUL byte");
+            }
         }
-        Ok(format!("({})", checks.join(" || ")))
+        // One host call per matcher: patterns are joined NUL-separated and
+        // tested in order on the host side. Lowercased here because the
+        // runtime lowercases the pattern template before expansion anyway.
+        let joined = values
+            .iter()
+            .map(|value| value.to_ascii_lowercase())
+            .collect::<Vec<_>>()
+            .join("\0");
+        Ok(format!(
+            "(zs_caddy_path_match_multi({}, {}) != 0)",
+            c_str(&joined),
+            joined.len()
+        ))
     }
 
     fn emit_host_match(&mut self, value: &Value) -> Result<String> {
@@ -658,17 +820,35 @@ impl Generator {
         if values.is_empty() {
             return Ok("(0)".to_string());
         }
-        let id = self.next_id();
-        self.code_line(&format!("char host_{id}[256];"));
-        self.code_line(&format!(
-            "zs_s64 host_{id}_raw = zs_req_header(ZS_STR(\"host\"), host_{id}, sizeof(host_{id}));"
-        ));
-        self.code_line(&format!(
-            "zs_u64 host_{id}_len = zs_caddy_clamp_len(host_{id}_raw, sizeof(host_{id}));"
-        ));
-        self.code_line(&format!(
-            "host_{id}_len = zs_caddy_host_normalize(host_{id}, host_{id}_len);"
-        ));
+        // Outside response hooks, every host matcher shares one hoisted
+        // host-header read (declared at the top of entry(), refreshed after
+        // handlers that may mutate the Host header) instead of re-reading and
+        // re-normalizing the header per matcher.
+        let (host_var, host_len, host_raw) = if self.current_response_hook.is_none() {
+            self.host_hoist_used = true;
+            (
+                "caddy_req_host".to_string(),
+                "caddy_req_host_len".to_string(),
+                "caddy_req_host_raw".to_string(),
+            )
+        } else {
+            let id = self.next_id();
+            self.code_line(&format!("char host_{id}[256];"));
+            self.code_line(&format!(
+                "zs_s64 host_{id}_raw = zs_req_header(ZS_STR(\"host\"), host_{id}, sizeof(host_{id}));"
+            ));
+            self.code_line(&format!(
+                "zs_u64 host_{id}_len = zs_caddy_clamp_len(host_{id}_raw, sizeof(host_{id}));"
+            ));
+            self.code_line(&format!(
+                "host_{id}_len = zs_caddy_host_normalize(host_{id}, host_{id}_len);"
+            ));
+            (
+                format!("host_{id}"),
+                format!("host_{id}_len"),
+                format!("host_{id}_raw"),
+            )
+        };
         let mut checks = Vec::new();
         let mut seen_hosts = BTreeSet::new();
         for value in values {
@@ -688,26 +868,39 @@ impl Generator {
                     "zs_u64 host_pat_{pat_id}_len = zs_caddy_clamp_len(host_pat_{pat_id}_raw, sizeof(host_pat_{pat_id}));"
                 ));
                 checks.push(format!(
-                    "(host_pat_{pat_id}_raw >= 0 && zs_caddy_host_match(host_{id}, host_{id}_len, host_pat_{pat_id}, host_pat_{pat_id}_len))"
+                    "(host_pat_{pat_id}_raw >= 0 && zs_caddy_host_match({host_var}, {host_len}, host_pat_{pat_id}, host_pat_{pat_id}_len))"
                 ));
             } else {
                 let normalized = caddy_normalize_host_pattern(&value)?;
                 if !seen_hosts.insert(normalized.to_ascii_lowercase()) {
                     bail!("duplicate host matcher entry {value:?}");
                 }
-                let host = if caddy_host_fuzzy(&normalized) {
-                    normalized
+                if caddy_host_fuzzy(&normalized) {
+                    checks.push(format!(
+                        "zs_caddy_host_match({host_var}, {host_len}, {}, {})",
+                        c_str(&normalized),
+                        normalized.len()
+                    ));
+                } else if self.current_response_hook.is_none() {
+                    // Exact patterns dispatch through the sorted host table:
+                    // one prologue lookup, then an integer compare per check.
+                    // For non-wildcard patterns zs_caddy_host_match degenerates
+                    // to case-insensitive equality, and both sides are already
+                    // lowercased, so table equality is semantically identical.
+                    let host = normalized.to_ascii_lowercase();
+                    let id = self.host_table_id(&host);
+                    checks.push(format!("(caddy_req_host_id == ZS_HOST_ID_{id})"));
                 } else {
-                    normalized.to_ascii_lowercase()
-                };
-                checks.push(format!(
-                    "zs_caddy_host_match(host_{id}, host_{id}_len, {}, {})",
-                    c_str(&host),
-                    host.len()
-                ));
+                    let host = normalized.to_ascii_lowercase();
+                    checks.push(format!(
+                        "zs_caddy_host_match({host_var}, {host_len}, {}, {})",
+                        c_str(&host),
+                        host.len()
+                    ));
+                }
             }
         }
-        Ok(format!("(host_{id}_raw >= 0 && ({}))", checks.join(" || ")))
+        Ok(format!("({host_raw} >= 0 && ({}))", checks.join(" || ")))
     }
 
     fn emit_path_regexp_match(&mut self, value: &Value) -> Result<String> {
@@ -1427,6 +1620,10 @@ impl Generator {
 
     fn emit_subroute_route(&mut self, route: &Route) -> Result<()> {
         validate_route_fields(route, "subroute route")?;
+        // Brace-scoped like top-level routes so matcher buffers can share
+        // stack slots across sibling routes.
+        self.line("{");
+        self.indent += 1;
         let matched = self.emit_route_match(route)?;
         if route_match_can_set_error(route) {
             let match_id = self.next_id();
@@ -1454,6 +1651,8 @@ impl Generator {
         self.line("else if (zs_response_pending() != 0) {");
         self.indent += 1;
         self.line("zs_response_clear();");
+        self.indent -= 1;
+        self.line("}");
         self.indent -= 1;
         self.line("}");
         Ok(())
@@ -1841,7 +2040,28 @@ impl Generator {
         self.indent -= 1;
         self.line("}");
         self.line(&format!("if ({result} == 1) return 0;"));
+        // The called script has full SDK access and may have rewritten the
+        // Host header; refresh the hoisted host buffer for later matchers.
+        self.emit_host_refresh();
         Ok(false)
+    }
+
+    /// Re-read the hoisted host buffer after a handler that may mutate the
+    /// request Host header. Emitted as a marker so it can be dropped when no
+    /// host matcher ended up using the hoisted buffer; the marker stays out of
+    /// response hooks, where the buffer does not exist.
+    fn emit_host_refresh(&mut self) {
+        if self.current_response_hook.is_none() {
+            self.line(HOST_REFRESH_MARKER);
+        }
+    }
+
+    /// Intern an exact lowercase host pattern into the dispatch table and
+    /// return its insertion id (the `ZS_HOST_ID_<id>` define).
+    fn host_table_id(&mut self, host: &str) -> usize {
+        self.host_hoist_used = true;
+        let next = self.host_table.len();
+        *self.host_table.entry(host.to_string()).or_insert(next)
     }
 
     fn emit_error_routes(&mut self) -> Result<()> {
@@ -1937,6 +2157,9 @@ impl Generator {
         {
             let request = normalize_header_ops(request, HeaderTarget::Request)?;
             self.emit_header_ops(&request, HeaderTarget::Request)?;
+            if header_ops_may_touch_host(&request) {
+                self.emit_host_refresh();
+            }
         }
         if let Some(response) = handler.config.get("response")
             && !response.is_null()
@@ -7381,7 +7604,7 @@ mod tests {
 
         let c = compile_caddy_json(source).unwrap();
         assert!(c.contains("zs_req_method"));
-        assert!(c.contains("zs_caddy_path_match(\"/health\""));
+        assert!(c.contains("zs_caddy_path_match_multi(\"/health\""));
         assert!(c.contains("zs_caddy_respond_static(\"200\""));
         assert!(c.contains("ok"));
     }
@@ -7408,7 +7631,7 @@ mod tests {
         }"#;
 
         let c = compile_caddy_json(source).unwrap();
-        assert!(c.contains("zs_caddy_path_match(\"/handled\""), "{c}");
+        assert!(c.contains("zs_caddy_path_match_multi(\"/handled\""), "{c}");
         assert!(c.contains("Caddy emptyHandler"), "{c}");
     }
 
@@ -8249,10 +8472,11 @@ mod tests {
         }"#;
 
         let c = compile_caddy_json(source).unwrap();
-        assert!(c.contains("zs_caddy_path_match("));
-        assert!(c.contains("\"/Foo/*/Bar*\""));
-        assert!(c.contains("\"/assets/app.[0-9]?.css\""));
-        assert!(c.contains("\"/escaped/%20\""));
+        // Patterns are lowercased at compile time (mirroring the runtime's
+        // pre-expansion fold) and joined NUL-separated into a single call.
+        assert!(c.contains(
+            "zs_caddy_path_match_multi(\"/foo/*/bar*\\000/assets/app.[0-9]?.css\\000/escaped/%20\""
+        ));
     }
 
     #[test]
@@ -8365,7 +8589,7 @@ mod tests {
         }"#;
 
         let c = compile_caddy_json(source).unwrap();
-        assert!(c.contains("zs_caddy_path_match("), "{c}");
+        assert!(c.contains("zs_caddy_path_match_multi("), "{c}");
         assert!(c.contains("/api/{http.request.uri.query.suffix}"), "{c}");
         assert!(c.contains("zs_req_method("), "{c}");
         assert!(c.contains("zs_caddy_query_match("), "{c}");
@@ -8380,7 +8604,7 @@ mod tests {
         assert!(c.contains("expr_match_left_"), "{c}");
         assert!(c.contains("{http.request.header.X-Request-Id}"), "{c}");
         assert!(c.contains("blocked"), "{c}");
-        assert!(c.contains("zs_caddy_host_match("), "{c}");
+        assert!(c.contains("(caddy_req_host_id == ZS_HOST_ID_0)"), "{c}");
         assert!(c.contains("zs_req_is_tls() != 0"), "{c}");
         assert!(c.contains("zs_req_is_tls() == 0"), "{c}");
         assert!(c.contains("zs_caddy_header_match_expanded("), "{c}");
@@ -8526,8 +8750,8 @@ mod tests {
         }"#;
 
         let c = compile_caddy_json(source).unwrap();
-        assert!(c.contains("zs_caddy_host_normalize(host_"));
-        assert!(c.contains("zs_caddy_host_match(host_"));
+        assert!(c.contains("zs_caddy_host_normalize(caddy_req_host"));
+        assert!(c.contains("zs_caddy_host_match(caddy_req_host"));
         assert!(c.contains("zs_caddy_expand(\"{http.vars.host_pat}\""));
         assert!(c.contains("\"*.example.com\""));
     }
@@ -8542,7 +8766,10 @@ mod tests {
         }"#;
 
         let c = compile_caddy_json(source).unwrap();
-        assert!(c.contains("\"xn--exmple-cua.com\""));
+        // The exact pattern lands in the host dispatch table (with its
+        // trailing NUL); the wildcard stays an inline match.
+        assert!(c.contains("\"xn--exmple-cua.com\\000\""));
+        assert!(c.contains("(caddy_req_host_id == ZS_HOST_ID_0)"));
         assert!(c.contains("\"*.xn--bcher-kva.example\""));
     }
 
@@ -9277,7 +9504,7 @@ mod tests {
 
         let c = compile_caddy_json(source).unwrap();
         assert!(c.contains("/* invoke named route shared */"), "{c}");
-        assert!(c.contains("zs_caddy_path_match(\"/hit\""), "{c}");
+        assert!(c.contains("zs_caddy_path_match_multi(\"/hit\""), "{c}");
         assert!(c.contains("zs_req_set_header(\"X-Invoked\""), "{c}");
         assert!(c.contains("zs_caddy_respond_static(\"204\""), "{c}");
     }
@@ -9914,7 +10141,7 @@ mod tests {
 
         let c = compile_caddy_json(source).unwrap();
         assert!(c.contains("zs_caddy_set_error(\"418\""), "{c}");
-        assert!(c.contains("zs_caddy_path_match(\"/only\""), "{c}");
+        assert!(c.contains("zs_caddy_path_match_multi(\"/only\""), "{c}");
     }
 
     #[test]
@@ -9957,8 +10184,8 @@ mod tests {
         }"#;
 
         let c = compile_caddy_json(source).unwrap();
-        assert!(c.contains("zs_caddy_host_normalize(host_"));
-        assert!(c.contains("zs_caddy_host_match(host_"));
+        assert!(c.contains("zs_caddy_host_normalize(caddy_req_host"));
+        assert!(c.contains("(caddy_req_host_id == ZS_HOST_ID_0)"));
         assert!(c.contains("zs_caddy_query_match(\"debug\""));
         assert!(c.contains("zs_req_set_header(\"X-Test\""));
         assert!(c.contains("zs_caddy_response_headers("));
