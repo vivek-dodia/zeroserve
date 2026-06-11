@@ -313,7 +313,25 @@ async fn run_tls_listener(
             // BoringSSL terminates ECH natively (inner-ClientHello decryption,
             // ServerHello acceptance signal, retry_configs on rejection), so the
             // listener just does a normal accept and reads the negotiated state.
-            match tls_state.acceptor.accept(stream).await {
+            // In the `--caddy` flow the handshake pauses at the ClientHello so
+            // the site's eBPF TLS section can select the certificate by path;
+            // the runtime resolves it through its in-memory certificate cache.
+            let accepted = if tls_state.script_certificates {
+                let selector_runtime = script_runtime.clone();
+                let site = state.site.load_full();
+                let tls_runtime = tls_state.clone();
+                tls_state
+                    .acceptor
+                    .accept_with_cert_selector(stream, move |sni| async move {
+                        selector_runtime
+                            .select_tls_certificate(site, tls_runtime, sni, reported_peer, local)
+                            .await
+                    })
+                    .await
+            } else {
+                tls_state.acceptor.accept(stream).await
+            };
+            match accepted {
                 Ok(AcceptOutcome::Relay {
                     target,
                     prelude,

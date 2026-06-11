@@ -149,6 +149,16 @@ The supported modes are `require`, `verify_if_given`, and
 `require_and_verify` with inline trusted CA certificates produced by Caddy JSON
 or Caddyfile adaptation. Custom client-auth verifier modules and
 trusted-leaf-only verification are rejected.
+Explicit Caddyfile certificate files are supported for the `--caddy` flow:
+`tls cert.pem key.pem` and `tls { load cert.pem key.pem }` are adapted to
+TLS policies and emitted into the generated `zeroserve.tls` section. The TLS
+handshake pauses at the ClientHello while that section runs; the matched
+policy's cert/key paths are passed to the host, which loads them on first use
+and caches the certificate handles in memory. The cache is dropped on hot
+reload, so a reload picks up renewed certificate files and changed paths
+alike. Because this reads host filesystem certificate files, it is only
+allowed when filesystem exposure is enabled; `--caddy` forces
+`--expose-filesystem` on for the generated middleware.
 The Caddy `expression` matcher is supported for the request-matcher subset that
 can be represented directly in generated middleware: boolean `&&`/`||`/`!`,
 parentheses, string equality/inequality and string-list `in`, string
@@ -236,8 +246,9 @@ Key options:
 
 - `--addr <ADDR>`: HTTP listen address (default `0.0.0.0:8080`). Accepts either
   `ip:port` to bind a new socket, or `fd:N` to use an inherited file descriptor.
-- `--tls-addr <ADDR>`: HTTPS listen address (requires `--cert`/`--key` or
-  `--cert-dir`).
+- `--tls-addr <ADDR>`: HTTPS listen address (requires `--cert`/`--key`,
+  `--cert-dir`, or explicit Caddyfile TLS certificate files when using
+  `--caddy`).
   Accepts either `ip:port` or `fd:N`.
 - `--cert <FILE>`: TLS certificate PEM.
 - `--key <FILE>`: TLS private key PEM.

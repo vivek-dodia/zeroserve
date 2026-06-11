@@ -1,20 +1,21 @@
 use std::{
+    cell::RefCell,
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use boring::hpke::HpkeKey;
 use boring::pkey::{PKey, Private};
-use boring::ssl::SslEchKeys;
+use boring::ssl::{SslContext, SslEchKeys};
 use boring::x509::X509;
 
-use crate::boringtls::{BoringAcceptor, ServerIdentity};
+use crate::boringtls::{BoringAcceptor, ServerIdentity, build_identity_context};
 use crate::config::StaticConfig;
 use crate::ech::key::EchKeySet;
 
-#[derive(Clone)]
 pub struct TlsRuntime {
     pub acceptor: BoringAcceptor,
     /// True when ECH keys are loaded (the listener still serves plain TLS too).
@@ -23,6 +24,46 @@ pub struct TlsRuntime {
     /// `Some` only when all loaded configs share one public name (so it is
     /// unambiguous); `None` otherwise (zero or multiple distinct names).
     pub ech_public_name: Option<String>,
+    /// True in the `--caddy` flow: the site's eBPF TLS section selects the
+    /// certificate per connection via `zs_caddy_tls_certificate`.
+    pub script_certificates: bool,
+    /// ECH keys to install on lazily built per-certificate contexts so they
+    /// mirror the acceptor's own configuration.
+    ssl_ech_keys: Option<SslEchKeys>,
+    /// Script-selected certificate contexts, keyed by (cert path, key path).
+    /// Loaded on the first handshake that selects them and held in memory for
+    /// the runtime's lifetime — dropped wholesale when a hot reload rebuilds
+    /// the runtime, like cached log file handles.
+    cert_contexts: Mutex<HashMap<(String, String), SslContext>>,
+}
+
+impl TlsRuntime {
+    /// Resolve the server context for a script-selected certificate/key path
+    /// pair, loading and caching the handle on first use.
+    pub fn certificate_context(&self, cert_path: &str, key_path: &str) -> Result<SslContext> {
+        let key = (cert_path.to_string(), key_path.to_string());
+        let mut cache = self
+            .cert_contexts
+            .lock()
+            .expect("certificate context cache poisoned");
+        if let Some(context) = cache.get(&key) {
+            return Ok(context.clone());
+        }
+        let identity = ServerIdentity::from_paths(Path::new(cert_path), Path::new(key_path))?;
+        let context = build_identity_context(&identity, self.ssl_ech_keys.as_ref())?;
+        cache.insert(key, context.clone());
+        eprintln!("loaded TLS certificate {cert_path} (key {key_path})");
+        Ok(context)
+    }
+}
+
+/// Per-handshake certificate selection state, attached to the script execution
+/// context while the eBPF TLS section runs during the handshake's certificate
+/// pause. `zs_caddy_tls_certificate` resolves paths through `runtime` and
+/// records the first successful selection in `chosen`.
+pub struct TlsCertSelect {
+    pub runtime: Arc<TlsRuntime>,
+    pub chosen: RefCell<Option<SslContext>>,
 }
 
 pub fn load_tls_if_configured(config: &Arc<StaticConfig>) -> Result<Option<TlsRuntime>> {
@@ -62,37 +103,25 @@ pub fn load_tls_if_configured(config: &Arc<StaticConfig>) -> Result<Option<TlsRu
                 None => Vec::new(),
             };
 
+            let ssl_ech_keys = match &ech_keys {
+                Some(set) => Some(build_ssl_ech_keys(set)?),
+                None => None,
+            };
             let configure = |builder: &mut boring::ssl::SslContextBuilder| {
-                if let Some(set) = &ech_keys {
-                    let mut ech = SslEchKeys::builder()
-                        .map_err(|e| anyhow!("SSL_ECH_KEYS_new failed: {e}"))?;
-                    for pair in &set.pairs {
-                        // BoringSSL only ships an X25519 HPKE key constructor
-                        // (the `dhkem_p256_sha256` name is a boring misnomer —
-                        // its body uses EVP_hpke_x25519_hkdf_sha256), which
-                        // matches the suite our keygen emits.
-                        let key = HpkeKey::dhkem_p256_sha256(&pair.private_key).map_err(|e| {
-                            anyhow!(
-                                "invalid ECH HPKE key (config_id 0x{:02x}): {e}",
-                                pair.config.config_id
-                            )
-                        })?;
-                        // is_retry_config = true: advertise every loaded config
-                        // in `retry_configs` when a client offers a stale one.
-                        ech.add_key(true, &pair.config.encode(), key).map_err(|e| {
-                            anyhow!(
-                                "SSL_ECH_KEYS_add failed (config_id 0x{:02x}): {e}",
-                                pair.config.config_id
-                            )
-                        })?;
-                    }
-                    let ech = ech.build();
+                if let Some(ech) = &ssl_ech_keys {
                     builder
-                        .set_ech_keys(&ech)
+                        .set_ech_keys(ech)
                         .map_err(|e| anyhow!("SSL_CTX_set1_ech_keys failed: {e}"))?;
                 }
                 Ok(())
             };
+
+            // In the `--caddy` flow (without an explicit `--cert-dir`) the
+            // site's eBPF TLS section drives certificate selection per
+            // connection; certificates referenced by the Caddyfile are loaded
+            // lazily at handshake time, not preloaded here.
+            let script_certificates =
+                config.caddy_tarball.is_some() && config.cert_dir_path.is_none();
 
             let acceptor = if let Some(cert_dir) = &config.cert_dir_path {
                 let identities = load_cert_dir(cert_dir).with_context(|| {
@@ -105,6 +134,19 @@ pub fn load_tls_if_configured(config: &Arc<StaticConfig>) -> Result<Option<TlsRu
                 );
                 BoringAcceptor::build_with_identities(
                     identities,
+                    relay_public_names.clone(),
+                    configure,
+                )?
+            } else if script_certificates {
+                // `--cert`/`--key`, when given, become the default identity
+                // for connections whose SNI matches no Caddy TLS policy.
+                let default_identity =
+                    match (config.cert_path.as_deref(), config.key_path.as_deref()) {
+                        (Some(cert), Some(key)) => Some(ServerIdentity::from_paths(cert, key)?),
+                        _ => None,
+                    };
+                BoringAcceptor::build_script_selected(
+                    default_identity,
                     relay_public_names.clone(),
                     configure,
                 )?
@@ -151,10 +193,38 @@ pub fn load_tls_if_configured(config: &Arc<StaticConfig>) -> Result<Option<TlsRu
                 acceptor,
                 ech_enabled,
                 ech_public_name,
+                script_certificates,
+                ssl_ech_keys,
+                cert_contexts: Mutex::new(HashMap::new()),
             }))
         }
         None => Ok(None),
     }
+}
+
+fn build_ssl_ech_keys(set: &EchKeySet) -> Result<SslEchKeys> {
+    let mut ech = SslEchKeys::builder().map_err(|e| anyhow!("SSL_ECH_KEYS_new failed: {e}"))?;
+    for pair in &set.pairs {
+        // BoringSSL only ships an X25519 HPKE key constructor
+        // (the `dhkem_p256_sha256` name is a boring misnomer —
+        // its body uses EVP_hpke_x25519_hkdf_sha256), which
+        // matches the suite our keygen emits.
+        let key = HpkeKey::dhkem_p256_sha256(&pair.private_key).map_err(|e| {
+            anyhow!(
+                "invalid ECH HPKE key (config_id 0x{:02x}): {e}",
+                pair.config.config_id
+            )
+        })?;
+        // is_retry_config = true: advertise every loaded config
+        // in `retry_configs` when a client offers a stale one.
+        ech.add_key(true, &pair.config.encode(), key).map_err(|e| {
+            anyhow!(
+                "SSL_ECH_KEYS_add failed (config_id 0x{:02x}): {e}",
+                pair.config.config_id
+            )
+        })?;
+    }
+    Ok(ech.build())
 }
 
 struct CertFile {

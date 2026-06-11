@@ -70,6 +70,8 @@ struct TlsConnectionPolicy {
     match_: Option<TlsConnectionMatch>,
     #[serde(default, deserialize_with = "deserialize_present_value")]
     client_authentication: Option<Value>,
+    #[serde(default, deserialize_with = "deserialize_present_value")]
+    certificate_selection: Option<Value>,
     #[serde(flatten)]
     extra: Map<String, Value>,
 }
@@ -471,9 +473,8 @@ fn render_host_table(table: &BTreeMap<String, usize>) -> String {
 /// header: any set/add/replace key or delete entry that is "host"
 /// (case-insensitive), "*", or contains a placeholder.
 fn header_ops_may_touch_host(value: &Value) -> bool {
-    let name_touches_host = |name: &str| {
-        name == "*" || name.eq_ignore_ascii_case("host") || contains_placeholder(name)
-    };
+    let name_touches_host =
+        |name: &str| name == "*" || name.eq_ignore_ascii_case("host") || contains_placeholder(name);
     let Some(obj) = value.as_object() else {
         // Unexpected shape: be conservative.
         return true;
@@ -615,7 +616,9 @@ impl Generator {
         let policies = self
             .tls_connection_policies
             .iter()
-            .filter(|policy| policy.client_authentication.is_some())
+            .filter(|policy| {
+                policy.client_authentication.is_some() || policy.certificate_selection.is_some()
+            })
             .cloned()
             .collect::<Vec<_>>();
         if policies.is_empty() {
@@ -634,21 +637,38 @@ impl Generator {
         self.line("if (caddy_tls_sni_len < 0) caddy_tls_sni_len = 0;");
 
         for policy in policies {
-            let auth = normalize_tls_client_auth(policy.client_authentication.as_ref().unwrap())?;
-            let auth = serde_json::to_string(&auth)?;
             let condition = tls_policy_sni_condition(&policy);
             self.line(&format!("if ({condition}) {{"));
             self.indent += 1;
-            self.line(&format!(
-                "if (zs_caddy_tls_client_auth({}, {}) == 0) {{",
-                c_str(&auth),
-                auth.len()
-            ));
-            self.indent += 1;
-            self.line("zs_abort();");
-            self.line("return 0;");
-            self.indent -= 1;
-            self.line("}");
+            if let Some(selection) = &policy.certificate_selection {
+                let selection = normalize_tls_certificate_selection(selection)?;
+                self.line(&format!(
+                    "if (zs_caddy_tls_certificate({}, {}, {}, {}) == 0) {{",
+                    c_str(&selection.certificate),
+                    selection.certificate.len(),
+                    c_str(&selection.key),
+                    selection.key.len()
+                ));
+                self.indent += 1;
+                self.line("zs_abort();");
+                self.line("return 0;");
+                self.indent -= 1;
+                self.line("}");
+            }
+            if let Some(auth) = &policy.client_authentication {
+                let auth = normalize_tls_client_auth(auth)?;
+                let auth = serde_json::to_string(&auth)?;
+                self.line(&format!(
+                    "if (zs_caddy_tls_client_auth({}, {}) == 0) {{",
+                    c_str(&auth),
+                    auth.len()
+                ));
+                self.indent += 1;
+                self.line("zs_abort();");
+                self.line("return 0;");
+                self.indent -= 1;
+                self.line("}");
+            }
             self.indent -= 1;
             self.line("}");
         }
@@ -5917,7 +5937,42 @@ fn validate_tls_connection_policy(policy: &TlsConnectionPolicy, label: &str) -> 
         normalize_tls_client_auth(auth)
             .with_context(|| format!("unsupported {label}.client_authentication"))?;
     }
+    if let Some(selection) = &policy.certificate_selection {
+        normalize_tls_certificate_selection(selection)
+            .with_context(|| format!("unsupported {label}.certificate_selection"))?;
+    }
     Ok(())
+}
+
+struct TlsCertificateSelection {
+    certificate: String,
+    key: String,
+}
+
+fn normalize_tls_certificate_selection(selection: &Value) -> Result<TlsCertificateSelection> {
+    let obj = selection
+        .as_object()
+        .ok_or_else(|| anyhow!("certificate_selection must be an object"))?;
+    for key in obj.keys() {
+        if !matches!(key.as_str(), "certificate" | "key") {
+            bail!("unsupported certificate_selection field {key:?}");
+        }
+    }
+    let certificate = obj
+        .get("certificate")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("certificate_selection.certificate must be a string"))?;
+    let key = obj
+        .get("key")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("certificate_selection.key must be a string"))?;
+    if certificate.is_empty() || key.is_empty() {
+        bail!("certificate_selection certificate and key must not be empty");
+    }
+    Ok(TlsCertificateSelection {
+        certificate: certificate.to_string(),
+        key: key.to_string(),
+    })
 }
 
 fn normalize_tls_client_auth(auth: &Value) -> Result<Value> {

@@ -20,6 +20,7 @@ use async_ebpf::{
         ThreadEnv, TimesliceConfig, Timeslicer, UnboundProgram,
     },
 };
+use boring::ssl::SslContext;
 use futures::{FutureExt, channel::oneshot};
 use monoio::fs::File;
 use serde::Deserialize;
@@ -32,6 +33,7 @@ use crate::{
     logging::async_log,
     site::{Site, normalize_request_path},
     thread_pool::CPU_TP,
+    tls::{TlsCertSelect, TlsRuntime},
 };
 
 const SCRIPT_ENTRYPOINT: &str = "zeroserve.request";
@@ -197,6 +199,7 @@ static SCRIPT_HELPERS: &[(&str, Helper)] = &[
         "zs_req_tls_handshake_complete",
         helpers::h_req_tls_handshake_complete,
     ),
+    ("zs_caddy_tls_certificate", helpers::h_caddy_tls_certificate),
     ("zs_caddy_tls_client_auth", helpers::h_caddy_tls_client_auth),
     ("zs_req_remote_ip_matches", helpers::h_req_remote_ip_matches),
     (
@@ -467,6 +470,53 @@ pub(crate) struct CaddyMapEntry {
 }
 
 impl ScriptRequest {
+    /// A synthetic request for the pre-handshake TLS section run: only the
+    /// connection addresses and the ClientHello SNI are known — the TLS
+    /// handshake (and any HTTP request) has not happened yet.
+    pub(crate) fn for_tls_handshake(
+        peer: std::net::SocketAddr,
+        local: std::net::SocketAddr,
+        sni: Option<String>,
+    ) -> Self {
+        ScriptRequest {
+            request_id: Ulid::new(),
+            start_time: Instant::now(),
+            method: String::new(),
+            original_method: String::new(),
+            path: String::new(),
+            original_path: String::new(),
+            normalized_path: String::new(),
+            uri: String::new(),
+            original_uri: String::new(),
+            query: String::new(),
+            original_query: String::new(),
+            scheme: "https".to_string(),
+            proto_major: 0,
+            proto_minor: 0,
+            peer: peer.to_string(),
+            local: local.to_string(),
+            headers: HashMap::new(),
+            header_values: HashMap::new(),
+            transfer_encodings: Vec::new(),
+            query_params: HashMap::new(),
+            query_param_values: HashMap::new(),
+            caddy_query_params: HashMap::new(),
+            caddy_query_valid: true,
+            connection: ConnectionInfo {
+                tls: true,
+                tls_handshake_complete: false,
+                inner_sni: sni,
+                ..ConnectionInfo::default()
+            },
+            proxy_method: None,
+            proxy_uri: None,
+            proxy_headers: None,
+            uri_changed: false,
+            method_changed: false,
+            header_changes: Vec::new(),
+        }
+    }
+
     pub fn header(&self, name: &str) -> Option<&str> {
         let name = name.to_ascii_lowercase();
         self.headers.get(&name).map(String::as_str)
@@ -1108,6 +1158,12 @@ pub struct ScriptExecutionContext {
     /// Current inter-script call nesting depth. The top-level request runs at
     /// depth 0; each `zs_call` increments it for the callee.
     pub call_depth: usize,
+    /// Present only during the pre-handshake TLS section run (`--caddy`
+    /// script-selected certificates): the certificate selection state for the
+    /// in-flight handshake. `None` for request-phase runs — TLS helpers that
+    /// act at handshake time use this to tell the phases apart. Not propagated
+    /// to `zs_call` callees.
+    pub tls_select: Option<Rc<TlsCertSelect>>,
 }
 
 impl ScriptExecutionContext {
@@ -1166,6 +1222,7 @@ impl ScriptExecutionContext {
             scripts,
             t,
             call_depth,
+            tls_select: None,
         }
     }
 
@@ -1342,6 +1399,110 @@ impl ScriptRuntime {
 
     pub(crate) fn install_scripts(&self, scripts: Rc<Vec<(String, Program)>>) {
         *self.scripts.borrow_mut() = scripts;
+    }
+
+    /// Run only the `zeroserve.tls` script sections to choose a certificate
+    /// for an in-flight TLS handshake (the `--caddy` script-selected flow).
+    /// Runs once per connection while the handshake is paused at the
+    /// ClientHello, so only the connection addresses and SNI are populated.
+    /// Returns `Ok(None)` when no policy selected a certificate (serve the
+    /// default identity, if any) and `Err` when a script aborted or failed
+    /// (reject the connection).
+    pub(crate) async fn select_tls_certificate(
+        &self,
+        site: Arc<Site>,
+        tls: Arc<TlsRuntime>,
+        sni: Option<String>,
+        peer: std::net::SocketAddr,
+        local: std::net::SocketAddr,
+    ) -> anyhow::Result<Option<SslContext>> {
+        let scripts = (*self.scripts.borrow()).clone();
+        if !scripts
+            .iter()
+            .any(|(_, program)| program.has_section(SCRIPT_TLS_ENTRYPOINT))
+        {
+            return Ok(None);
+        }
+
+        let select = Rc::new(TlsCertSelect {
+            runtime: tls,
+            chosen: RefCell::new(None),
+        });
+        let request = Rc::new(RefCell::new(ScriptRequest::for_tls_handshake(
+            peer, local, sni,
+        )));
+        let metadata: Rc<RefCell<HashMap<String, String>>> = Rc::new(RefCell::new(HashMap::new()));
+        let caddy_maps: Rc<RefCell<Vec<CaddyMapConfig>>> = Rc::new(RefCell::new(Vec::new()));
+        let timeslice = default_timeslice();
+        let preemption = PreemptionEnabled::new(self.t);
+
+        for (name, program) in scripts.iter() {
+            if !program.has_section(SCRIPT_TLS_ENTRYPOINT) {
+                continue;
+            }
+            let mut ctx = ScriptExecutionContext {
+                request: request.clone(),
+                body_source: BodySource::empty(),
+                metadata: metadata.clone(),
+                caddy_maps: caddy_maps.clone(),
+                early_response_headers: Rc::new(RefCell::new(::http::HeaderMap::new())),
+                response_hooks: Rc::new(RefCell::new(Vec::new())),
+                response_context: None,
+                abort: false,
+                response: None,
+                request_body_limit: Rc::new(Cell::new(None)),
+                reverse_proxy: None,
+                file_server: None,
+                encode: None,
+                script_name: name.clone(),
+                log_buffer: vec![],
+                external_objects: ObjectRegistry {
+                    next_idx: 1,
+                    objects: HashMap::new(),
+                },
+                error: String::new(),
+                memory_footprint_bytes: 0,
+                max_memory_footprint: self.max_memory_footprint,
+                expose_filesystem: self.expose_filesystem,
+                site: site.clone(),
+                scripts: scripts.clone(),
+                t: self.t,
+                call_depth: 0,
+                tls_select: Some(select.clone()),
+            };
+            let mut resources: [&mut dyn Any; 1] = [&mut ctx];
+            let run = program
+                .run(
+                    &timeslice,
+                    &MonoioTimeslicer,
+                    SCRIPT_TLS_ENTRYPOINT,
+                    &mut resources,
+                    &[],
+                    &preemption,
+                )
+                .await;
+            if let Err(err) = run {
+                bail!(
+                    "script '{}' TLS section failed: {:?} ({})",
+                    name,
+                    err,
+                    if ctx.error.is_empty() {
+                        "no details"
+                    } else {
+                        ctx.error.as_str()
+                    }
+                );
+            }
+            if ctx.abort {
+                bail!("script '{name}' aborted TLS certificate selection");
+            }
+            if select.chosen.borrow().is_some() {
+                break;
+            }
+        }
+
+        let chosen = select.chosen.borrow_mut().take();
+        Ok(chosen)
     }
 
     pub async fn run_request(
@@ -1672,6 +1833,7 @@ async fn run_request_scripts_with_state(
                 scripts: scripts.clone(),
                 t,
                 call_depth: 0,
+                tls_select: None,
             };
             let mut resources: [&mut dyn Any; 1] = [&mut ctx];
             let run = program

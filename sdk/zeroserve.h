@@ -159,6 +159,10 @@ extern zs_s64 zs_req_proto_minor(void);
 extern zs_s64 zs_req_peer(char *out, zs_u64 out_len);
 extern zs_s64 zs_req_is_tls(void);
 extern zs_s64 zs_req_tls_handshake_complete(void);
+extern zs_s64 zs_caddy_tls_certificate(const char *cert_path,
+                                       zs_u64 cert_path_len,
+                                       const char *key_path,
+                                       zs_u64 key_path_len);
 extern zs_s64 zs_caddy_tls_client_auth(const char *config_json,
                                        zs_u64 config_json_len);
 extern zs_s64 zs_req_remote_ip_matches(const char *ranges_json,

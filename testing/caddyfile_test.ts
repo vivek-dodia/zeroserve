@@ -221,3 +221,26 @@ Deno.test("caddy-compile adapts basic_auth", async () => {
   assertStringIncludes(c, "Admin Area");
   assertStringIncludes(c, "{http.auth.user.id}");
 });
+
+Deno.test("caddy-compile adapts tls certificate files to zeroserve TLS section", async () => {
+  const json = JSON.parse(await adapt(`example.com {
+  tls /tmp/example.crt /tmp/example.key
+  respond ok
+}`));
+  const policies = json.apps.http.servers.srv0.tls_connection_policies;
+  assertEquals(policies[0].match.sni, ["example.com"]);
+  assertEquals(policies[0].certificate_selection.certificate, "/tmp/example.crt");
+  assertEquals(policies[0].certificate_selection.key, "/tmp/example.key");
+
+  const c = await compile(
+    `example.com {
+  tls /tmp/example.crt /tmp/example.key
+  respond ok
+}`,
+    "Caddyfile",
+  );
+  assertStringIncludes(c, "ZS_TLS_ENTRY");
+  assertStringIncludes(c, "zs_caddy_tls_certificate(");
+  assertStringIncludes(c, "/tmp/example.crt");
+  assertStringIncludes(c, "/tmp/example.key");
+});

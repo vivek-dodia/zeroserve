@@ -11,6 +11,7 @@
 //! No tokio: `boring` (unlike `tokio-boring`) has no async-runtime dependency.
 
 use std::cmp::Ordering;
+use std::future::Future;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -42,6 +43,12 @@ static JA4_EX_INDEX: OnceLock<Index<Ssl, String>> = OnceLock::new();
 // name). The handshake is then deliberately aborted and `drive_handshake`
 // recovers this marker plus the buffered ClientHello.
 static RELAY_EX_INDEX: OnceLock<Index<Ssl, String>> = OnceLock::new();
+// Per-connection certificate decision for script-selected acceptors. Absent
+// while the decision is pending: the selection callback returns RETRY, the
+// handshake pauses with PENDING_CERTIFICATE, and `drive_handshake` runs the
+// async selector and stores its result here before resuming. `None` means the
+// selector chose nothing (serve the default identity if one exists).
+static CERT_SELECT_EX_INDEX: OnceLock<Index<Ssl, Option<SslContext>>> = OnceLock::new();
 
 pub struct ServerIdentity {
     pub cert_path: PathBuf,
@@ -269,16 +276,100 @@ impl BoringAcceptor {
         })
     }
 
+    /// Build a server acceptor whose certificate is chosen per connection by
+    /// the site's eBPF TLS section (the `--caddy` flow). The selection
+    /// callback pauses the handshake at the ClientHello (`RETRY`) until
+    /// `drive_handshake` has run the async selector and recorded its decision
+    /// in ex-data; the callback then installs the chosen context. When the
+    /// selector chooses nothing, the optional default identity (from
+    /// `--cert`/`--key`) serves the connection; with no default the handshake
+    /// is rejected (or transparently relayed for ECH public names).
+    pub fn build_script_selected(
+        default_identity: Option<ServerIdentity>,
+        relay_public_names: Vec<String>,
+        configure: impl FnOnce(&mut SslContextBuilder) -> Result<()>,
+    ) -> Result<Self> {
+        let mut builder = SslContextBuilder::new(SslMethod::tls())
+            .context("creating BoringSSL server context")?;
+        configure_base_server_context(&mut builder)?;
+        let default_dns_names = match &default_identity {
+            Some(identity) => {
+                install_server_identity(&mut builder, identity)?;
+                identity.dns_names.clone()
+            }
+            None => Vec::new(),
+        };
+        let has_default = default_identity.is_some();
+        builder.set_select_certificate_callback(move |mut client_hello| {
+            record_ja4(&mut client_hello);
+            let Some(decision) = client_hello.ssl().ex_data(cert_select_ex_index()).cloned() else {
+                // First pass: pause the handshake until the script has chosen.
+                return Err(SelectCertError::RETRY);
+            };
+            if let Some(ctx) = decision {
+                client_hello
+                    .ssl_mut()
+                    .set_ssl_context(&ctx)
+                    .map_err(|_| SelectCertError::ERROR)?;
+                return Ok(());
+            }
+            // The script selected no certificate: fall back to the default
+            // identity, or reject (relaying ECH public-name connections).
+            if let Some(target) = relay_target(&client_hello, &relay_public_names, |sni| {
+                default_dns_names
+                    .iter()
+                    .any(|name| dns_name_matches(name, sni))
+            }) {
+                client_hello.ssl_mut().set_ex_data(relay_ex_index(), target);
+                return Err(SelectCertError::ERROR);
+            }
+            if has_default {
+                return Ok(());
+            }
+            Err(SelectCertError::ERROR)
+        });
+        configure(&mut builder)?;
+        Ok(Self {
+            ctx: builder.build(),
+        })
+    }
+
     /// Perform the server-side TLS handshake over `io`, pumping records
     /// through the in-memory bridge.
     pub async fn accept<IO>(&self, io: IO) -> Result<AcceptOutcome<IO>>
     where
         IO: AsyncReadRent + AsyncWriteRent,
     {
+        self.accept_with_cert_selector(io, reject_cert_selector)
+            .await
+    }
+
+    /// Like `accept`, but for script-selected acceptors: when the handshake
+    /// pauses for certificate selection, `selector` is run with the
+    /// (lowercased) SNI and its decision resumes the handshake. `Ok(None)`
+    /// falls back to the default identity; `Err` rejects the connection.
+    pub async fn accept_with_cert_selector<IO, F, Fut>(
+        &self,
+        io: IO,
+        selector: F,
+    ) -> Result<AcceptOutcome<IO>>
+    where
+        IO: AsyncReadRent + AsyncWriteRent,
+        F: FnOnce(Option<String>) -> Fut,
+        Fut: Future<Output = Result<Option<SslContext>>>,
+    {
         let ssl = Ssl::new(&self.ctx).context("Ssl::new")?;
         let mid = SslStreamBuilder::new(ssl, MemBridge::new()).setup_accept();
-        drive_handshake(mid, io).await
+        drive_handshake(mid, io, selector).await
     }
+}
+
+/// Selector for acceptors that never pause for certificate selection (their
+/// callbacks never return `RETRY`); reaching it indicates a logic error.
+async fn reject_cert_selector(_sni: Option<String>) -> Result<Option<SslContext>> {
+    Err(anyhow!(
+        "TLS handshake paused for certificate selection on a static acceptor"
+    ))
 }
 
 /// Decide whether a connection should be transparently relayed instead of
@@ -318,12 +409,49 @@ fn configure_server_context(
     builder: &mut SslContextBuilder,
     identity: &ServerIdentity,
 ) -> Result<()> {
+    configure_base_server_context(builder)?;
+    install_server_identity(builder, identity)
+}
+
+/// Server context settings shared by every acceptor variant: TLS 1.3 only,
+/// h2/http1.1 ALPN, and optional client certificates (verification is done by
+/// the script layer, not BoringSSL).
+fn configure_base_server_context(builder: &mut SslContextBuilder) -> Result<()> {
     builder
         .set_min_proto_version(Some(SslVersion::TLS1_3))
         .context("setting minimum TLS version")?;
     builder
         .set_max_proto_version(Some(SslVersion::TLS1_3))
         .context("setting maximum TLS version")?;
+    builder.set_alpn_select_callback(|_ssl, client| {
+        select_next_proto(ALPN_WIRE, client).ok_or(AlpnError::NOACK)
+    });
+    builder.set_verify_callback(SslVerifyMode::PEER, |_, _| true);
+    Ok(())
+}
+
+/// Build a standalone server context for `identity`, configured like the
+/// acceptor's base context (plus ECH keys when given). Used for the contexts
+/// that script-driven certificate selection installs via `set_ssl_context`.
+pub fn build_identity_context(
+    identity: &ServerIdentity,
+    ech_keys: Option<&boring::ssl::SslEchKeys>,
+) -> Result<SslContext> {
+    let mut builder =
+        SslContextBuilder::new(SslMethod::tls()).context("creating BoringSSL server context")?;
+    configure_server_context(&mut builder, identity)?;
+    if let Some(keys) = ech_keys {
+        builder
+            .set_ech_keys(keys)
+            .map_err(|e| anyhow!("SSL_CTX_set1_ech_keys failed: {e}"))?;
+    }
+    Ok(builder.build())
+}
+
+fn install_server_identity(
+    builder: &mut SslContextBuilder,
+    identity: &ServerIdentity,
+) -> Result<()> {
     builder
         .set_certificate_chain_file(&identity.cert_path)
         .with_context(|| format!("loading cert chain {}", identity.cert_path.display()))?;
@@ -337,10 +465,6 @@ fn configure_server_context(
             identity.key_path.display()
         )
     })?;
-    builder.set_alpn_select_callback(|_ssl, client| {
-        select_next_proto(ALPN_WIRE, client).ok_or(AlpnError::NOACK)
-    });
-    builder.set_verify_callback(SslVerifyMode::PEER, |_, _| true);
     Ok(())
 }
 
@@ -398,14 +522,20 @@ fn dns_name_matches(pattern: &str, sni: &str) -> bool {
 
 /// Drive a mid-handshake `SslStream` to completion over `io`, pumping records
 /// through the in-memory bridge. Shared by the server `accept` and client
-/// `connect` paths.
-async fn drive_handshake<IO>(
+/// `connect` paths. `selector` resolves a script-driven certificate selection
+/// pause (`PENDING_CERTIFICATE`); acceptors that never pause pass
+/// `reject_cert_selector`.
+async fn drive_handshake<IO, F, Fut>(
     mut mid: boring::ssl::MidHandshakeSslStream<MemBridge>,
     mut io: IO,
+    selector: F,
 ) -> Result<AcceptOutcome<IO>>
 where
     IO: AsyncReadRent + AsyncWriteRent,
+    F: FnOnce(Option<String>) -> Fut,
+    Fut: Future<Output = Result<Option<SslContext>>>,
 {
+    let mut selector = Some(selector);
     // Snapshot of the peer's first flight (the ClientHello on the server path),
     // taken from the first non-empty inbound read so it survives the handshake's
     // later consumption/compaction of the bridge. Used to recover the cleartext
@@ -417,6 +547,28 @@ where
                 // Flush the final handshake flight to the peer.
                 flush_out(s.get_mut(), &mut io).await?;
                 break s;
+            }
+            Err(HandshakeError::WouldBlock(mut m))
+                if m.error().code() == ErrorCode::PENDING_CERTIFICATE =>
+            {
+                // The selection callback paused the handshake at the
+                // ClientHello: run the certificate selector and record its
+                // decision, then re-enter the handshake (no IO is pending —
+                // the pause is internal to BoringSSL).
+                let Some(selector) = selector.take() else {
+                    return Err(anyhow!(
+                        "TLS handshake paused for certificate selection twice"
+                    ));
+                };
+                let sni = m
+                    .ssl()
+                    .servername(NameType::HOST_NAME)
+                    .map(str::to_ascii_lowercase);
+                let decision = selector(sni)
+                    .await
+                    .context("TLS certificate selection failed")?;
+                m.ssl_mut().set_ex_data(cert_select_ex_index(), decision);
+                mid = m;
             }
             Err(HandshakeError::WouldBlock(mut m)) => {
                 flush_out(m.get_mut(), &mut io).await?;
@@ -550,7 +702,7 @@ where
         .with_context(|| format!("invalid TLS server name {sni:?}"))?;
     let mut builder = SslStreamBuilder::new(ssl, MemBridge::new());
     builder.set_connect_state();
-    match drive_handshake(builder.setup_connect(), io).await? {
+    match drive_handshake(builder.setup_connect(), io, reject_cert_selector).await? {
         AcceptOutcome::Stream(stream) => Ok(stream),
         // Relay is only ever requested by the server cert-selection callback;
         // the client path installs no such marker.
@@ -696,6 +848,11 @@ impl<IO> BoringStream<IO> {
 
 fn ja4_ex_index() -> Index<Ssl, String> {
     *JA4_EX_INDEX.get_or_init(|| Ssl::new_ex_index::<String>().expect("SSL ex-data index"))
+}
+
+fn cert_select_ex_index() -> Index<Ssl, Option<SslContext>> {
+    *CERT_SELECT_EX_INDEX
+        .get_or_init(|| Ssl::new_ex_index::<Option<SslContext>>().expect("SSL ex-data index"))
 }
 
 fn relay_ex_index() -> Index<Ssl, String> {

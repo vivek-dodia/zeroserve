@@ -64,6 +64,11 @@ impl TryFrom<Cli> for StaticConfig {
 
             if let Some(cert_dir) = cli.cert_dir.clone() {
                 (Some(tls_addr), None, None, Some(cert_dir))
+            } else if cli.caddy.is_some() && cli.cert.is_none() && cli.key.is_none() {
+                // `--caddy` without explicit cert flags: certificates come from
+                // the Caddyfile's TLS policies, selected per connection by the
+                // generated eBPF TLS section.
+                (Some(tls_addr), None, None, None)
             } else {
                 let cert = cli
                     .cert

@@ -615,12 +615,16 @@ fn parse_tls(h: &mut Helper) -> Result<Vec<ConfigValue>> {
     if first_line.len() > 2 {
         return Err(h.d.arg_err());
     }
+    let mut cert_policies = Vec::<Value>::new();
     if let [arg] = first_line.as_slice()
         && arg != "internal"
         && arg != "force_automate"
         && !arg.contains('@')
     {
         bail!("single argument must either be 'internal', 'force_automate', or an email address");
+    }
+    if let [cert, key] = first_line.as_slice() {
+        cert_policies.push(tls_certificate_policy(cert, key));
     }
     let mut has_block = false;
     let mut dns_provider_set = h.options.tls_dns_provider_configured;
@@ -639,7 +643,14 @@ fn parse_tls(h: &mut Helper) -> Result<Vec<ConfigValue>> {
                 parse_one_or_more_args(&mut h.d)?;
             }
             "load" => {
-                h.d.remaining_args();
+                let args = h.d.remaining_args();
+                if args.len() == 2 {
+                    cert_policies.push(tls_certificate_policy(&args[0], &args[1]));
+                } else if !args.is_empty() {
+                    h.warn(
+                        "ignoring tls 'load' without an explicit certificate/key pair: zeroserve only supports Caddyfile TLS file certificates",
+                    );
+                }
             }
             "resolvers" => {
                 parse_one_or_more_args(&mut h.d)?;
@@ -745,6 +756,7 @@ fn parse_tls(h: &mut Helper) -> Result<Vec<ConfigValue>> {
     if first_line.is_empty() && !has_block {
         return Err(h.d.arg_err());
     }
+    policies.extend(cert_policies);
     if policies.is_empty() {
         h.warn(
             "site tls directive is accepted but configured outside zeroserve's eBPF request-processing surface",
@@ -752,7 +764,7 @@ fn parse_tls(h: &mut Helper) -> Result<Vec<ConfigValue>> {
         Ok(Vec::new())
     } else {
         h.warn(
-            "site tls directive has client_auth; generated middleware enforces supported client-auth policy in the zeroserve TLS eBPF section",
+            "site tls directive generated middleware for supported TLS policy in the zeroserve TLS eBPF section",
         );
         Ok(policies
             .into_iter()
@@ -763,6 +775,15 @@ fn parse_tls(h: &mut Helper) -> Result<Vec<ConfigValue>> {
             })
             .collect())
     }
+}
+
+fn tls_certificate_policy(cert: &str, key: &str) -> Value {
+    json!({
+        "certificate_selection": {
+            "certificate": cert,
+            "key": key,
+        }
+    })
 }
 
 fn parse_tls_client_auth(mut d: Dispenser) -> Result<Option<Value>> {

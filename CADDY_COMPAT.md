@@ -331,6 +331,14 @@ Current generated middleware support includes:
   certificates from Caddy JSON/Caddyfile adaptation. Generated middleware emits
   a `zeroserve.tls` eBPF section which enforces the policy before normal HTTP
   request routing.
+- Caddyfile explicit TLS file certificates (`tls cert.pem key.pem` and
+  `tls { load cert.pem key.pem }`) for the `--caddy` runtime path. The adapter
+  emits certificate-selection policy into `zeroserve.tls`; at handshake time
+  the generated section passes the matched cert/key paths to the host
+  (`zs_caddy_tls_certificate`), which loads the files on first use and serves
+  later handshakes from an in-memory certificate cache (dropped on hot reload,
+  like cached log file handles). Runtime file access is gated by
+  `--expose-filesystem`; `--caddy` forces that flag on.
 - file serving from packed tarball content and from configured filesystem roots
   only when zeroserve is started with `--expose-filesystem`
 - Caddyfile/Caddy JSON access logging to `output file ...` targets, written by
@@ -385,7 +393,7 @@ body rewriting/copying or Caddy's full server runtime. In particular:
   `zs_res_copy_body` APIs
 - no generic `zs_res_set_header`, `zs_res_append_header`, or
   `zs_res_delete_header` APIs
-- no TLS automation, listener management, certificate management, ACME server
+- no TLS automation, listener management, dynamic certificate management, ACME server
   runtime, ECH, or PKI runtime behavior
 - no custom Caddy `tls.client_auth` verifier modules or trusted-leaf-only
   client-auth behavior

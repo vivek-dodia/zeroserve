@@ -38,6 +38,47 @@ struct CaddyTlsClientAuthConfig {
     trusted_ca_certs: Vec<String>,
 }
 
+/// Select the TLS certificate for the in-flight handshake. The script passes
+/// the certificate/key file paths from the matched Caddy TLS policy; the host
+/// resolves them through the runtime's in-memory certificate cache (loading
+/// the files on first use). Only acts during the pre-handshake TLS section
+/// run — request-phase runs are no-ops, since the certificate was already
+/// chosen while the handshake was paused at the ClientHello.
+pub fn h_caddy_tls_certificate(
+    scope: &HelperScope,
+    cert_ptr: u64,
+    cert_len: u64,
+    key_ptr: u64,
+    key_len: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    let cert_path = read_utf8(scope, cert_ptr, cert_len)?.to_string();
+    let key_path = read_utf8(scope, key_ptr, key_len)?.to_string();
+    with_ectx(scope, |ctx| {
+        let Some(select) = ctx.tls_select.clone() else {
+            return Ok(1);
+        };
+        if !ctx.expose_filesystem {
+            return Ok(0);
+        }
+        // The first matching policy wins, matching Caddy's first-match
+        // connection policy semantics.
+        if select.chosen.borrow().is_some() {
+            return Ok(1);
+        }
+        match select.runtime.certificate_context(&cert_path, &key_path) {
+            Ok(context) => {
+                *select.chosen.borrow_mut() = Some(context);
+                Ok(1)
+            }
+            Err(err) => {
+                eprintln!("TLS certificate selection failed for {cert_path}: {err:#}");
+                Ok(0)
+            }
+        }
+    })
+}
+
 pub fn h_caddy_rewrite_method(
     scope: &HelperScope,
     method_ptr: u64,
@@ -65,6 +106,11 @@ pub fn h_caddy_tls_client_auth(
     let config = read_utf8(scope, config_ptr, config_len)?;
     let config: CaddyTlsClientAuthConfig = serde_json::from_str(config).map_err(|_| ())?;
     with_ectx(scope, |ctx| {
+        // During the pre-handshake TLS section run the client certificate has
+        // not been received yet; enforcement happens on the request-phase run.
+        if ctx.tls_select.is_some() {
+            return Ok(1);
+        }
         let request = ctx.request.borrow();
         let conn = &request.connection;
         if !conn.tls || !conn.tls_handshake_complete {

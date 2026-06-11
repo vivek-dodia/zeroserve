@@ -1,6 +1,7 @@
 import { assertEquals } from "@std/assert";
 import { dirname, join } from "@std/path";
 import {
+  generateSelfSignedCert,
   getFreePort,
   getZeroservePath,
   hasBpfToolchain,
@@ -17,6 +18,8 @@ const canRunScripts = await hasBpfToolchain();
 // specific build (CI pins a known-good commit; see .github/workflows/ci.yml).
 const caddyBin = Deno.env.get("CADDY_BIN") ?? "caddy";
 const canRunCaddy = await hasCommand(caddyBin);
+const caddyTlsRef = Deno.env.get("CADDY_BIN") ?? "/home/user/caddy";
+const canRunCaddyTls = await hasCaddyRunner(caddyTlsRef);
 
 type Probe = {
   path: string;
@@ -7890,6 +7893,93 @@ http://bar.localhost:${caddyPort} {
   },
 });
 
+Deno.test({
+  name: "e2e: Caddyfile explicit TLS certificates match stock Caddy",
+  ignore: !canRunScripts || !canRunCaddyTls,
+  async fn() {
+    const siteDir = await Deno.makeTempDir();
+    const cert = await generateSelfSignedCert();
+    let caddy: { origin: string; stop: () => Promise<void> } | null = null;
+    let zeroserve: { origin: string; stop: () => Promise<void> } | null = null;
+    try {
+      const caddyPort = await getFreePort();
+      const zeroservePort = await getFreePort();
+      const caddyfilePath = join(siteDir, "Caddyfile");
+      await Deno.writeTextFile(
+        caddyfilePath,
+        `{
+  admin off
+  auto_https off
+}
+
+https://localhost:${caddyPort} {
+  tls ${cert.certPath} ${cert.keyPath}
+  header X-Compat explicit-tls
+  respond /tls "tls ok" 203
+}
+`,
+      );
+
+      caddy = await withCaddyRef(caddyTlsRef, siteDir, caddyfilePath, caddyPort);
+
+      const zeroserveCaddyfilePath = join(siteDir, "Zeroserve.Caddyfile");
+      await Deno.writeTextFile(
+        zeroserveCaddyfilePath,
+        `{
+  admin off
+  auto_https off
+}
+
+https://localhost:${zeroservePort} {
+  tls ${cert.certPath} ${cert.keyPath}
+  header X-Compat explicit-tls
+  respond /tls "tls ok" 203
+}
+`,
+      );
+      zeroserve = await withZeroserveCaddyTls(
+        zeroserveCaddyfilePath,
+        zeroservePort,
+      );
+
+      const client = Deno.createHttpClient({
+        caCerts: [await Deno.readTextFile(cert.certPath)],
+        http2: true,
+      });
+      try {
+        const probe: Probe = {
+          path: "/tls",
+          compareHeaders: ["x-compat", "content-type", "content-length"],
+        };
+        const caddyObserved = await fetchObserved(caddy, probe, client);
+        const zeroserveObserved = await fetchObserved(zeroserve, probe, client);
+        assertEquals(zeroserveObserved, caddyObserved);
+        assertExpectedResponse(caddyObserved, {
+          ...probe,
+          expectedStatus: 203,
+          expectedBody: "tls ok",
+          expectedHeaders: {
+            "x-compat": "explicit-tls",
+            "content-type": "text/plain; charset=utf-8",
+            "content-length": "6",
+          },
+        }, "explicit TLS certificate Caddyfile");
+      } finally {
+        client.close();
+      }
+    } finally {
+      if (zeroserve !== null) {
+        await zeroserve.stop();
+      }
+      if (caddy !== null) {
+        await caddy.stop();
+      }
+      await cert.cleanup();
+      await Deno.remove(siteDir, { recursive: true }).catch(() => {});
+    }
+  },
+});
+
 async function compareGeneratedCaddyfile(
   caseDef: GeneratedCase,
 ): Promise<void> {
@@ -8055,15 +8145,72 @@ async function withCaddy(
   };
 }
 
+async function withCaddyRef(
+  caddyRef: string,
+  siteDir: string,
+  caddyfilePath: string,
+  port: number,
+): Promise<{ origin: string; stop: () => Promise<void> }> {
+  const spec = await caddyCommandSpec(caddyRef, [
+    "run",
+    "--config",
+    caddyfilePath,
+    "--adapter",
+    "caddyfile",
+  ]);
+  const child = new Deno.Command(spec.command, {
+    args: spec.args,
+    cwd: spec.cwd ?? siteDir,
+    stdin: "null",
+    stdout: "null",
+    stderr: "inherit",
+  }).spawn();
+  const statusPromise = child.status;
+  await waitForServer("127.0.0.1", port, statusPromise);
+  return {
+    origin: `https://localhost:${port}`,
+    stop: () => stopProcess(child, statusPromise),
+  };
+}
+
+async function withZeroserveCaddyTls(
+  caddyfilePath: string,
+  tlsPort: number,
+): Promise<{ origin: string; stop: () => Promise<void> }> {
+  const zeroservePath = await getZeroservePath();
+  const child = new Deno.Command(zeroservePath, {
+    args: [
+      "--addr",
+      "127.0.0.1:0",
+      "--tls-addr",
+      `127.0.0.1:${tlsPort}`,
+      "--caddy",
+      caddyfilePath,
+    ],
+    cwd: repoRoot,
+    stdin: "null",
+    stdout: "null",
+    stderr: "inherit",
+  }).spawn();
+  const statusPromise = child.status;
+  await waitForServer("127.0.0.1", tlsPort, statusPromise);
+  return {
+    origin: `https://localhost:${tlsPort}`,
+    stop: () => stopProcess(child, statusPromise),
+  };
+}
+
 async function fetchObserved(
   server: { origin: string } | string,
   probe: Probe,
+  client?: Deno.HttpClient,
 ): Promise<ObservedResponse> {
   const origin = typeof server === "string" ? server : server.origin;
   if (probe.rawHost !== undefined) {
     return await fetchObservedRaw(origin, probe);
   }
   const res = await fetch(`${origin}${probe.path}`, {
+    client,
     method: probe.method ?? "GET",
     headers: probe.headers,
     body: probe.body,
@@ -8400,6 +8547,50 @@ async function hasCommand(command: string): Promise<boolean> {
   try {
     const output = await new Deno.Command(command, {
       args: ["version"],
+      stdout: "null",
+      stderr: "null",
+    }).output();
+    return output.success;
+  } catch (err) {
+    if (err instanceof Deno.errors.NotFound) {
+      return false;
+    }
+    throw err;
+  }
+}
+
+type CommandSpec = {
+  command: string;
+  args: string[];
+  cwd?: string;
+};
+
+async function caddyCommandSpec(
+  caddyRef: string,
+  args: string[],
+): Promise<CommandSpec> {
+  try {
+    const stat = await Deno.stat(caddyRef);
+    if (stat.isDirectory) {
+      return {
+        command: "go",
+        args: ["-C", caddyRef, "run", "./cmd/caddy", ...args],
+      };
+    }
+  } catch (err) {
+    if (!(err instanceof Deno.errors.NotFound)) {
+      throw err;
+    }
+  }
+  return { command: caddyRef, args };
+}
+
+async function hasCaddyRunner(caddyRef: string): Promise<boolean> {
+  const spec = await caddyCommandSpec(caddyRef, ["version"]);
+  try {
+    const output = await new Deno.Command(spec.command, {
+      args: spec.args,
+      cwd: spec.cwd,
       stdout: "null",
       stderr: "null",
     }).output();
