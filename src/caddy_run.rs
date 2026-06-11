@@ -192,8 +192,8 @@ fn build_tarball(object: &[u8]) -> Result<Vec<u8>> {
         .context("failed to finalize tar stream")
 }
 
-/// Load the site for this run: from the in-memory `--caddy` tarball when one is
-/// attached (rebuilt into a fresh memfd, so reloads work without disk), or from
+/// Load the site at startup: from the in-memory `--caddy` tarball when one is
+/// attached (already built by `main` while reporting errors fatally), or from
 /// the on-disk `tar_path` otherwise.
 pub fn load_site(config: &StaticConfig) -> Result<Site> {
     match &config.caddy_tarball {
@@ -203,6 +203,26 @@ pub fn load_site(config: &StaticConfig) -> Result<Site> {
                 .context("failed to load in-memory caddy site tarball")
         }
         None => Site::load(&config.tar_path, config.max_rate_limit_buckets),
+    }
+}
+
+/// Load the site for a hot reload. In the `--caddy` flow `tar_path` holds the
+/// source Caddyfile path, so the config is re-adapted and recompiled from disk
+/// — reusing the startup tarball would silently ignore Caddyfile edits. This
+/// still works under namespace isolation: the mount namespace keeps the host
+/// filesystem visible (only /etc is shadowed), /tmp stays writable for the SDK
+/// headers, and the nproc limit leaves room for the clang/llc children. On any
+/// failure the caller keeps serving the previous configuration.
+pub fn reload_site(config: &StaticConfig) -> Result<Site> {
+    if config.caddy_tarball.is_some() {
+        let bytes = build_caddy_tarball(&config.tar_path).with_context(|| {
+            format!("failed to rebuild site from {}", config.tar_path.display())
+        })?;
+        let file = memfd_from_bytes("zeroserve-caddy-site", &bytes)?;
+        Site::load_from_file(file, config.max_rate_limit_buckets)
+            .context("failed to load rebuilt caddy site tarball")
+    } else {
+        Site::load(&config.tar_path, config.max_rate_limit_buckets)
     }
 }
 

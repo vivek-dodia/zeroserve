@@ -143,7 +143,7 @@ fn perform_reload(
         ));
     }
     let site = Arc::new(
-        crate::caddy_run::load_site(&shared.config).with_context(|| "failed to reload site")?,
+        crate::caddy_run::reload_site(&shared.config).with_context(|| "failed to reload site")?,
     );
     let tls_result = load_tls_if_configured(&shared.config);
 
@@ -203,7 +203,14 @@ fn perform_reload(
         });
     }
 
-    eprintln!("reloaded tarball {}", shared.config.tar_path.display());
+    if shared.config.caddy_tarball.is_some() {
+        eprintln!(
+            "rebuilt caddy site from {}",
+            shared.config.tar_path.display()
+        );
+    } else {
+        eprintln!("reloaded tarball {}", shared.config.tar_path.display());
+    }
     for plugin_path in &shared.config.plugin_paths {
         eprintln!("reloaded plugin {}", plugin_path.display());
     }
