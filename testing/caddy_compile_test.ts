@@ -5737,7 +5737,8 @@ Deno.test({
 });
 
 Deno.test({
-  name: "compiled Caddy reverse_proxy sends empty User-Agent when absent",
+  name:
+    "compiled Caddy reverse_proxy preserves absent User-Agent and Accept-Encoding",
   ignore: !canRunScripts,
   sanitizeResources: false,
   sanitizeOps: false,
@@ -5795,8 +5796,14 @@ Deno.test({
 
       const requestHead = await backend.requestHead;
       assert(
-        requestHead.split("\r\n").some((line) =>
-          line.toLowerCase() === "user-agent: "
+        !requestHead.split("\r\n").some((line) =>
+          line.toLowerCase().startsWith("user-agent:")
+        ),
+        requestHead,
+      );
+      assert(
+        !requestHead.split("\r\n").some((line) =>
+          line.toLowerCase().startsWith("accept-encoding:")
         ),
         requestHead,
       );

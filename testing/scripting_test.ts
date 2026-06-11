@@ -794,7 +794,8 @@ zs_u64 entry(void) {
 });
 
 Deno.test({
-    name: "e2e: reverse proxy combines multiple cookie request headers",
+    name:
+        "e2e: reverse proxy combines cookies and preserves absent Accept-Encoding",
     ignore: !canRunScripts,
     fn: async () => {
         const backend = await startRawHeaderCaptureBackend();
@@ -857,6 +858,12 @@ zs_u64 entry(void) {
                     .split("\r\n")
                     .filter((line) => line.toLowerCase().startsWith("cookie:"));
                 assertEquals(cookieLines, ["cookie: theme=light; session=abc"]);
+                assert(
+                    !upstreamHead.split("\r\n").some((line) =>
+                        line.toLowerCase().startsWith("accept-encoding:")
+                    ),
+                    upstreamHead,
+                );
             });
         } finally {
             await backend.close().catch(() => {});

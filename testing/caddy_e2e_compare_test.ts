@@ -215,20 +215,19 @@ Deno.test({
         {
           path: "/dashboard",
           rawHost: "localhost",
-          compareHeaders: ["x-backend-token", "x-seen-accept-encoding"],
+          compareHeaders: ["x-backend-token"],
           expectedStatus: 200,
           expectedBody: "/dashboard:",
           expectedHeaders: {
             "x-backend-token": "backend",
-            "x-seen-accept-encoding": "gzip",
           },
         },
       ],
     });
 
     // Adapted from caddyserver/website reverse_proxy docs (official Caddy docs
-    // repo). Preserves the supported transport behavior where `compression off`
-    // disables Caddy's default upstream `Accept-Encoding: gzip` injection.
+    // repo). Keeps `compression off` accepted and verifies client-provided
+    // Accept-Encoding still reaches the upstream.
     await compareGeneratedCaddyfile({
       name: "wild Caddyfile: caddyserver/website proxy compression off",
       files: {},

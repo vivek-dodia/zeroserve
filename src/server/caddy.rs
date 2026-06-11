@@ -908,7 +908,6 @@ fn finish_reverse_proxy_request_headers(
     metadata: &HashMap<String, String>,
     hook_state: Option<&ResponseHookState<'_>>,
 ) {
-    apply_reverse_proxy_request_defaults(headers, metadata, hook_state);
     apply_reverse_proxy_forwarded_headers(headers, peer, scheme, metadata, hook_state);
 }
 
@@ -921,29 +920,6 @@ fn apply_reverse_proxy_forwarded_headers(
 ) {
     if !reverse_proxy_uses_caddy_headers(metadata, hook_state) {
         apply_caddy_forwarded_headers(headers, peer, scheme);
-    }
-}
-
-fn apply_reverse_proxy_request_defaults(
-    headers: &mut ::http::HeaderMap,
-    metadata: &HashMap<String, String>,
-    hook_state: Option<&ResponseHookState<'_>>,
-) {
-    if !headers.contains_key(::http::header::USER_AGENT) {
-        headers.insert(
-            ::http::header::USER_AGENT,
-            ::http::HeaderValue::from_static(""),
-        );
-    }
-    let compression_off =
-        caddy_proxy_metadata_value(metadata, hook_state, "zs.caddy.reverse_proxy.compression")
-            .as_deref()
-            == Some("off");
-    if !compression_off && !headers.contains_key(::http::header::ACCEPT_ENCODING) {
-        headers.insert(
-            ::http::header::ACCEPT_ENCODING,
-            ::http::HeaderValue::from_static("gzip"),
-        );
     }
 }
 
