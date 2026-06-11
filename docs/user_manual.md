@@ -534,9 +534,9 @@ AWS Signature Version 4:
 
 - `zs_aws_v4_authorization_header(params, params_len)` generates an AWS SigV4
   Authorization header value. Takes a pointer to `zs_aws_v4_sign_params`
-  and the struct size. Returns the number of characters written (excluding null
-  terminator), or -1/-2 on error. If `params->out_len` is 0, returns the required
-  buffer size without writing.
+  and the struct size. Returns the generated string length capped to
+  `params->out_len`, or -1/-2 on error. If `params->out_len` is 0, returns 0
+  without writing.
 
     The `zs_aws_v4_sign_params` struct fields:
     - `access_key`, `access_key_len`: AWS access key ID
@@ -552,9 +552,9 @@ AWS Signature Version 4:
 
 - `zs_aws_v4_presigned_url(params, params_len, expires_secs)` generates an AWS SigV4
   pre-signed URL. Takes a pointer to `zs_aws_v4_sign_params`, the struct size, and the
-  expiration time in seconds. Returns the number of characters written (excluding null
-  terminator), or -1/-2 on error. If `params->out_len` is 0, returns the required
-  buffer size without writing.
+  expiration time in seconds. Returns the generated string length capped to
+  `params->out_len`, or -1/-2 on error. If `params->out_len` is 0, returns 0
+  without writing.
 
   The output is a URL path with query string containing the signature parameters
   (`X-Amz-Algorithm`, `X-Amz-Credential`, `X-Amz-Date`, `X-Amz-Expires`,

@@ -366,17 +366,17 @@ typedef struct {
 } zs_aws_v4_sign_params;
 
 /* Generate AWS SigV4 Authorization header value (not including header name).
- * Returns the number of characters written (excluding null terminator), or -1
- * on error. If out_len is 0, returns the required buffer size without writing.
- * The output is always null-terminated if out_len > 0 and space permits. */
+ * Returns the generated string length capped to out_len, or -1/-2 on error. If
+ * out_len is 0, returns 0 without writing. The output is always null-terminated
+ * if out_len > 0 and space permits. */
 extern zs_s64
 zs_aws_v4_authorization_header(const zs_aws_v4_sign_params *params,
                                zs_u64 params_len);
 
 /* Generate AWS SigV4 pre-signed URL.
- * Returns the number of characters written (excluding null terminator), or -1
- * on error. If out_len is 0, returns the required buffer size without writing.
- * The output is always null-terminated if out_len > 0 and space permits.
+ * Returns the generated string length capped to out_len, or -1/-2 on error. If
+ * out_len is 0, returns 0 without writing. The output is always null-terminated
+ * if out_len > 0 and space permits.
  * The output is a URL path with query string containing the signature
  * parameters (X-Amz-Algorithm, X-Amz-Credential, X-Amz-Date, X-Amz-Expires,
  * X-Amz-SignedHeaders, X-Amz-Signature). */

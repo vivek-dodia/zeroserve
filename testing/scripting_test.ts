@@ -562,6 +562,63 @@ Deno.test({
 });
 
 Deno.test({
+    name: "e2e: cstring helpers cap returned length to output buffer",
+    ignore: !canRunScripts,
+    fn: async () => {
+        const siteDir = await Deno.makeTempDir();
+        let tarPath: string | null = null;
+        try {
+            const scriptsDir = join(siteDir, ".zeroserve", "scripts");
+            await Deno.mkdir(scriptsDir, { recursive: true });
+
+            const scriptSource = `#include <zeroserve.h>
+
+ZS_ENTRY
+zs_u64 entry(void) {
+  char path[8];
+
+  zs_s64 zero_len = zs_req_path(path, 0);
+  if (zero_len != 0) {
+    zs_respond(500, ZS_STR("zero-length output returned nonzero\\n"));
+    return 0;
+  }
+
+  zs_s64 path_len = zs_req_path(path, sizeof(path));
+  if (path_len != (zs_s64)sizeof(path)) {
+    zs_respond(500, ZS_STR("truncated output length was not capped\\n"));
+    return 0;
+  }
+
+  if (zs_memcmp(path, "/abcdef", 7) != 0 || path[7] != 0) {
+    zs_respond(500, ZS_STR("truncated output contents mismatch\\n"));
+    return 0;
+  }
+
+  zs_respond(204, ZS_STR(""));
+  return 0;
+}
+`;
+            await Deno.writeTextFile(
+                join(scriptsDir, "10-cstr-return.c"),
+                scriptSource,
+            );
+
+            tarPath = await packSite(siteDir);
+
+            await withZeroserve(tarPath, async (baseUrl) => {
+                const res = await fetch(`${baseUrl}/abcdefghijklmnopqrstuvwxyz`);
+                assertEquals(res.status, 204);
+            });
+        } finally {
+            if (tarPath) {
+                await Deno.remove(tarPath).catch(() => {});
+            }
+            await Deno.remove(siteDir, { recursive: true }).catch(() => {});
+        }
+    },
+});
+
+Deno.test({
     name: "e2e: zs_connection_info reports tls/alpn/ech",
     ignore: !canRunScripts,
     fn: async () => {
@@ -1297,10 +1354,10 @@ static int check_json(zs_u64 root) {
   if (name_h == -1) return 0;
 
   char name[16];
-  zs_s64 name_needed = zs_json_read_string(name_h, name, 0);
-  if (name_needed != 3) return 0;
+  zs_s64 zero_len = zs_json_read_string(name_h, name, 0);
+  if (zero_len != 0) return 0;
   zs_s64 name_len = zs_json_read_string(name_h, name, sizeof(name));
-  if (name_len != name_needed) return 0;
+  if (name_len != 3) return 0;
   if (zs_memcmp(name, "Ada", 3) != 0) return 0;
 
   zs_s64 active_h = zs_json_get(root, ZS_STR("active"));

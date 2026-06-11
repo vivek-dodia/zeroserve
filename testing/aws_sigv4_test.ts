@@ -203,14 +203,6 @@ zs_u64 entry(void) {
     .out_len = 0
   };
 
-  // Query required length
-  zs_s64 needed = zs_aws_v4_authorization_header(&p, sizeof(p));
-  if (needed <= 0) {
-    zs_respond(500, ZS_STR("failed to query length\\n"));
-    zs_object_free(headers);
-    return 0;
-  }
-
   char auth[512];
   p.out = auth;
   p.out_len = sizeof(auth);

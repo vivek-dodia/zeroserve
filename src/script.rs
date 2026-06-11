@@ -14,10 +14,11 @@ use ::http::{
 };
 use anyhow::{Context, bail};
 use async_ebpf::{
-    helpers::{Helper, write_cstr},
+    helpers::{Helper, write_cstr as write_cstr_snprintf},
     program::{
-        GlobalEnv, HelperScope, PreemptionEnabled, Program, ProgramEventListener, ProgramLoader,
-        ThreadEnv, TimesliceConfig, Timeslicer, UnboundProgram,
+        GlobalEnv, HelperScope, MutableUserMemory, PreemptionEnabled, Program,
+        ProgramEventListener, ProgramLoader, ThreadEnv, TimesliceConfig, Timeslicer,
+        UnboundProgram,
     },
 };
 use boring::ssl::SslContext;
@@ -2042,6 +2043,10 @@ pub fn deref_and_write_cstr(
 ) -> Result<u64, ()> {
     let mut out = scope.user_memory_mut(out_ptr, out_len)?;
     Ok(write_cstr(&[value.as_bytes()], &mut out))
+}
+
+fn write_cstr(input: &[&[u8]], output: &mut MutableUserMemory) -> u64 {
+    write_cstr_snprintf(input, output).min(output.len() as u64)
 }
 
 pub(crate) struct MonoioTimeslicer;
