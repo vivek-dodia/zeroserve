@@ -630,11 +630,11 @@ impl Generator {
         self.indent += 1;
         self.line("char caddy_tls_sni[256];");
         self.line(&format!(
-            "zs_s64 caddy_tls_sni_len = zs_caddy_expand({}, {}, caddy_tls_sni, sizeof(caddy_tls_sni));",
+            "zs_s64 caddy_tls_sni_raw = zs_caddy_expand({}, {}, caddy_tls_sni, sizeof(caddy_tls_sni));",
             c_str("{http.request.tls.server_name}"),
             "{http.request.tls.server_name}".len()
         ));
-        self.line("if (caddy_tls_sni_len < 0) caddy_tls_sni_len = 0;");
+        self.line("zs_u64 caddy_tls_sni_len = zs_caddy_clamp_len(caddy_tls_sni_raw, sizeof(caddy_tls_sni));");
 
         for policy in policies {
             let condition = tls_policy_sni_condition(&policy);
@@ -807,7 +807,11 @@ impl Generator {
                 )
             });
         }
-        Ok(format!("({})", checks.join(" || ")))
+        Ok(format!(
+            "({} && ({}))",
+            c_buffer_fits(&format!("{label}_{id}_raw"), &format!("{label}_{id}")),
+            checks.join(" || ")
+        ))
     }
 
     fn emit_path_match(&mut self, value: &Value) -> Result<String> {
@@ -888,7 +892,11 @@ impl Generator {
                     "zs_u64 host_pat_{pat_id}_len = zs_caddy_clamp_len(host_pat_{pat_id}_raw, sizeof(host_pat_{pat_id}));"
                 ));
                 checks.push(format!(
-                    "(host_pat_{pat_id}_raw >= 0 && zs_caddy_host_match({host_var}, {host_len}, host_pat_{pat_id}, host_pat_{pat_id}_len))"
+                    "({} && zs_caddy_host_match({host_var}, {host_len}, host_pat_{pat_id}, host_pat_{pat_id}_len))",
+                    c_buffer_fits(
+                        &format!("host_pat_{pat_id}_raw"),
+                        &format!("host_pat_{pat_id}")
+                    )
                 ));
             } else {
                 let normalized = caddy_normalize_host_pattern(&value)?;
@@ -920,7 +928,11 @@ impl Generator {
                 }
             }
         }
-        Ok(format!("({host_raw} >= 0 && ({}))", checks.join(" || ")))
+        Ok(format!(
+            "({} && ({}))",
+            c_buffer_fits(&host_raw, &host_var),
+            checks.join(" || ")
+        ))
     }
 
     fn emit_path_regexp_match(&mut self, value: &Value) -> Result<String> {
@@ -935,7 +947,8 @@ impl Generator {
             "zs_u64 path_re_{id}_len = zs_caddy_clamp_len(path_re_{id}_raw, sizeof(path_re_{id}));"
         ));
         Ok(format!(
-            "(path_re_{id}_raw >= 0 && zs_caddy_regex_match(path_re_{id}, path_re_{id}_len, {}, {}) != 0)",
+            "({} && zs_caddy_regex_match(path_re_{id}, path_re_{id}_len, {}, {}) != 0)",
+            c_buffer_fits(&format!("path_re_{id}_raw"), &format!("path_re_{id}")),
             c_str(&config_json),
             config_json.len()
         ))
@@ -966,10 +979,11 @@ impl Generator {
                     "zs_u64 header_{id}_len = zs_caddy_clamp_len(header_{id}_raw, sizeof(header_{id}));"
                 ));
                 if value == "*" {
-                    format!("header_{id}_raw >= 0")
+                    c_buffer_fits(&format!("header_{id}_raw"), &format!("header_{id}"))
                 } else {
                     format!(
-                        "zs_caddy_eq_fold(header_{id}, header_{id}_len, {}, {})",
+                        "({} && zs_caddy_eq_fold(header_{id}, header_{id}_len, {}, {}))",
+                        c_buffer_fits(&format!("header_{id}_raw"), &format!("header_{id}")),
                         c_str(&value),
                         value.len()
                     )
@@ -1132,10 +1146,12 @@ impl Generator {
             "zs_u64 expr_num_right_{id}_len = zs_caddy_clamp_len(expr_num_right_{id}_raw, sizeof(expr_num_right_{id}));"
         ));
         self.code_line(&format!(
-            "zs_s64 expr_num_left_{id}_value = expr_num_left_{id}_raw >= 0 ? zs_caddy_parse_u16(expr_num_left_{id}, expr_num_left_{id}_len) : -1;"
+            "zs_s64 expr_num_left_{id}_value = {} ? zs_caddy_parse_u16(expr_num_left_{id}, expr_num_left_{id}_len) : -1;",
+            c_buffer_fits(&format!("expr_num_left_{id}_raw"), &format!("expr_num_left_{id}"))
         ));
         self.code_line(&format!(
-            "zs_s64 expr_num_right_{id}_value = expr_num_right_{id}_raw >= 0 ? zs_caddy_parse_u16(expr_num_right_{id}, expr_num_right_{id}_len) : -1;"
+            "zs_s64 expr_num_right_{id}_value = {} ? zs_caddy_parse_u16(expr_num_right_{id}, expr_num_right_{id}_len) : -1;",
+            c_buffer_fits(&format!("expr_num_right_{id}_raw"), &format!("expr_num_right_{id}"))
         ));
         let cmp = match op {
             NumericCompareOp::Gt => ">",
@@ -1178,7 +1194,11 @@ impl Generator {
             "zs_u64 expr_match_left_{id}_len = zs_caddy_clamp_len(expr_match_left_{id}_raw, sizeof(expr_match_left_{id}));"
         ));
         Ok(format!(
-            "(expr_match_left_{id}_raw >= 0 && zs_caddy_regex_match(expr_match_left_{id}, expr_match_left_{id}_len, {}, {}) != 0)",
+            "({} && zs_caddy_regex_match(expr_match_left_{id}, expr_match_left_{id}_len, {}, {}) != 0)",
+            c_buffer_fits(
+                &format!("expr_match_left_{id}_raw"),
+                &format!("expr_match_left_{id}")
+            ),
             c_str(&config_json),
             config_json.len()
         ))
@@ -2130,7 +2150,9 @@ impl Generator {
         self.line(&format!(
             "zs_s64 matcher_error_status_{id}_raw = zs_meta_get(ZS_STR(\"http.error.status_code\"), matcher_error_status_{id}, sizeof(matcher_error_status_{id}));"
         ));
-        self.line(&format!("if (matcher_error_status_{id}_raw > 0) {{"));
+        self.line(&format!(
+            "if (matcher_error_status_{id}_raw > 0 && (zs_u64)matcher_error_status_{id}_raw < sizeof(matcher_error_status_{id})) {{"
+        ));
         self.indent += 1;
         self.line(&format!(
             "zs_u64 matcher_error_status_{id}_len = zs_caddy_clamp_len(matcher_error_status_{id}_raw, sizeof(matcher_error_status_{id}));"
@@ -2389,6 +2411,7 @@ impl Generator {
         self.begin_header_op_scope(target);
         let name = self.emit_maybe_expanded(target, "header_name", name, expansion)?;
         let value = self.emit_maybe_expanded(target, "header_value", value, expansion)?;
+        let guarded = self.emit_carg_guard(target, &[&name, &value]);
         match target {
             HeaderTarget::Request => self.request_header_line(&format!(
                 "zs_req_set_header({}, {}, {}, {});",
@@ -2398,6 +2421,7 @@ impl Generator {
                 bail!("response header set operations must use Caddy ops JSON")
             }
         }
+        self.end_carg_guard(target, guarded);
         self.end_header_op_scope(target);
         Ok(())
     }
@@ -2412,6 +2436,7 @@ impl Generator {
         self.begin_header_op_scope(target);
         let name = self.emit_maybe_expanded(target, "header_name", name, expansion)?;
         let value = self.emit_maybe_expanded(target, "header_value", value, expansion)?;
+        let guarded = self.emit_carg_guard(target, &[&name, &value]);
         match target {
             HeaderTarget::Request => self.request_header_line(&format!(
                 "zs_req_append_header({}, {}, {}, {});",
@@ -2421,6 +2446,7 @@ impl Generator {
                 bail!("response header add operations must use Caddy ops JSON")
             }
         }
+        self.end_carg_guard(target, guarded);
         self.end_header_op_scope(target);
         Ok(())
     }
@@ -2433,6 +2459,7 @@ impl Generator {
     ) -> Result<()> {
         self.begin_header_op_scope(target);
         let pattern = self.emit_maybe_expanded(target, "header_pattern", pattern, expansion)?;
+        let guarded = self.emit_carg_guard(target, &[&pattern]);
         match target {
             HeaderTarget::Request => self.request_header_line(&format!(
                 "zs_req_delete_header({}, {});",
@@ -2442,6 +2469,7 @@ impl Generator {
                 bail!("response header delete operations must use Caddy ops JSON")
             }
         }
+        self.end_carg_guard(target, guarded);
         self.end_header_op_scope(target);
         Ok(())
     }
@@ -2474,7 +2502,12 @@ impl Generator {
         self.begin_header_op_scope(target);
         let pattern = self.emit_maybe_expanded(target, "header_pattern", pattern, expansion)?;
         let condition = format!(
-            "{}zs_caddy_eq({}, {}, \"*\", 1)",
+            "{}{}zs_caddy_eq({}, {}, \"*\", 1)",
+            pattern
+                .ok
+                .as_ref()
+                .map(|ok| format!("{ok} && "))
+                .unwrap_or_default(),
             if only_star { "" } else { "!" },
             pattern.ptr,
             pattern.len
@@ -2530,6 +2563,38 @@ impl Generator {
         }
     }
 
+    fn emit_carg_guard(&mut self, target: HeaderTarget, args: &[&CArg]) -> bool {
+        let conditions = args
+            .iter()
+            .filter_map(|arg| arg.ok.as_deref())
+            .collect::<Vec<_>>();
+        if conditions.is_empty() {
+            return false;
+        }
+        let condition = conditions.join(" && ");
+        match target {
+            HeaderTarget::Request => self.request_header_line(&format!("if ({condition}) {{")),
+            HeaderTarget::Response => self.response_line(&format!("if ({condition}) {{")),
+        }
+        if matches!(target, HeaderTarget::Request) && self.current_response_hook.is_none() {
+            self.indent += 1;
+        }
+        true
+    }
+
+    fn end_carg_guard(&mut self, target: HeaderTarget, guarded: bool) {
+        if !guarded {
+            return;
+        }
+        if matches!(target, HeaderTarget::Request) && self.current_response_hook.is_none() {
+            self.indent -= 1;
+        }
+        match target {
+            HeaderTarget::Request => self.request_header_line("}"),
+            HeaderTarget::Response => self.response_line("}"),
+        }
+    }
+
     fn emit_maybe_expanded(
         &mut self,
         target: HeaderTarget,
@@ -2541,6 +2606,7 @@ impl Generator {
             return Ok(CArg {
                 ptr: c_str(value),
                 len: value.len().to_string(),
+                ok: None,
             });
         }
         let id = self.next_id();
@@ -2569,7 +2635,11 @@ impl Generator {
                 self.response_line(&clamp);
             }
         }
-        Ok(CArg { ptr: buffer, len })
+        Ok(CArg {
+            ptr: buffer.clone(),
+            len,
+            ok: Some(c_buffer_fits(&raw, &buffer)),
+        })
     }
 
     fn emit_replace_header(
@@ -2808,7 +2878,7 @@ impl Generator {
             skip_key.len()
         ));
         self.line(&format!(
-            "if (reverse_proxy_skip_{proxy_id}_raw > 0 && zs_caddy_eq(reverse_proxy_skip_{proxy_id}, zs_caddy_clamp_len(reverse_proxy_skip_{proxy_id}_raw, sizeof(reverse_proxy_skip_{proxy_id})), \"1\", 1)) {{"
+            "if (reverse_proxy_skip_{proxy_id}_raw > 0 && (zs_u64)reverse_proxy_skip_{proxy_id}_raw < sizeof(reverse_proxy_skip_{proxy_id}) && zs_caddy_eq(reverse_proxy_skip_{proxy_id}, zs_caddy_clamp_len(reverse_proxy_skip_{proxy_id}_raw, sizeof(reverse_proxy_skip_{proxy_id})), \"1\", 1)) {{"
         ));
         self.indent += 1;
         self.line(&format!(
@@ -2868,7 +2938,9 @@ impl Generator {
             self.line(&format!(
                 "zs_u64 reverse_proxy_url_{id}_len = zs_caddy_clamp_len(reverse_proxy_url_{id}_raw, sizeof(reverse_proxy_url_{id}));"
             ));
-            self.line(&format!("if (reverse_proxy_url_{id}_raw <= 0) {{"));
+            self.line(&format!(
+                "if (reverse_proxy_url_{id}_raw <= 0 || (zs_u64)reverse_proxy_url_{id}_raw >= sizeof(reverse_proxy_url_{id})) {{"
+            ));
             self.indent += 1;
             self.line("zs_respond(502, ZS_STR(\"Bad Gateway\"));");
             self.line("return 0;");
@@ -3926,6 +3998,11 @@ enum PlaceholderExpansion {
 struct CArg {
     ptr: String,
     len: String,
+    ok: Option<String>,
+}
+
+fn c_buffer_fits(raw: &str, buffer: &str) -> String {
+    format!("({raw} >= 0 && (zs_u64){raw} < sizeof({buffer}))")
 }
 
 fn regex_match_config(value: &Value, label: &str) -> Result<Value> {
@@ -6040,7 +6117,8 @@ fn tls_policy_sni_condition(policy: &TlsConnectionPolicy) -> String {
         .iter()
         .map(|sni| {
             format!(
-                "(zs_caddy_eq_fold(caddy_tls_sni, zs_caddy_clamp_len(caddy_tls_sni_len, sizeof(caddy_tls_sni)), {}, {}) != 0)",
+                "({} && zs_caddy_eq_fold(caddy_tls_sni, caddy_tls_sni_len, {}, {}) != 0)",
+                c_buffer_fits("caddy_tls_sni_raw", "caddy_tls_sni"),
                 c_str(sni),
                 sni.len()
             )
@@ -8551,6 +8629,36 @@ mod tests {
     }
 
     #[test]
+    fn guards_generated_string_output_buffers_before_use() {
+        let source = r#"{
+          "apps": {"http": {"servers": {"srv0": {"routes": [{
+            "match": [{
+              "method": ["GET"],
+              "host": ["{http.vars.host_pat}"],
+              "path_regexp": {"pattern": "^/api/"},
+              "expression": "{http.request.uri.query.code} >= 200 && {http.request.header.X-Trace}.matches('^ok')"
+            }],
+            "handle": [
+              {"handler": "headers", "request": {"set": {"X-Expanded": ["{http.request.uri.path}"]}}},
+              {"handler": "reverse_proxy",
+                "headers": {"request": {"set": {"X-Upstream": ["fixed"]}}},
+                "upstreams": [{"dial": "127.0.0.1:9000"}]
+              }
+            ]
+          }]}}}}
+        }"#;
+
+        let c = compile_caddy_json(source).unwrap();
+        assert!(c.contains("(zs_u64)method_"), "{c}");
+        assert!(c.contains("(zs_u64)host_pat_"), "{c}");
+        assert!(c.contains("(zs_u64)path_re_"), "{c}");
+        assert!(c.contains("(zs_u64)expr_num_left_"), "{c}");
+        assert!(c.contains("(zs_u64)expr_match_left_"), "{c}");
+        assert!(c.contains("if ((header_value_"), "{c}");
+        assert!(c.contains(">= sizeof(reverse_proxy_url_"), "{c}");
+    }
+
+    #[test]
     fn compiles_capture_matchers_before_placeholder_consumers() {
         let source = r#"{
           "apps": {"http": {"servers": {"srv0": {"routes": [{
@@ -9138,6 +9246,10 @@ mod tests {
         assert!(c.contains("zs_caddy_tls_client_auth"), "{c}");
         assert!(c.contains("zs_abort();"), "{c}");
         assert!(c.contains("example.com"), "{c}");
+        assert!(
+            c.contains("(zs_u64)caddy_tls_sni_raw < sizeof(caddy_tls_sni)"),
+            "{c}"
+        );
     }
 
     #[test]
