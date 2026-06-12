@@ -325,12 +325,14 @@ Current generated middleware support includes:
 - maps with defaults, literal mappings, regexp mappings, typed Caddyfile
   outputs, and multiple destinations
 - basic auth with bcrypt and argon2id hashes, challenge responses, credential
-  checks, and `{http.auth.user.id}`
+  checks, `{http.auth.user.id}`, and runtime-resolved Caddy provision
+  placeholders for usernames/passwords
 - Caddy `tls.client_auth` policies for supported modes (`require`,
   `verify_if_given`, and `require_and_verify`) using inline trusted CA
-  certificates from Caddy JSON/Caddyfile adaptation. Generated middleware emits
-  a `zeroserve.tls` eBPF section which enforces the policy before normal HTTP
-  request routing.
+  certificates or Caddyfile `trusted_ca_cert_file` paths. Generated middleware
+  emits a `zeroserve.tls` eBPF section which enforces the policy before normal
+  HTTP request routing; CA files are read and cached by the runtime, not by the
+  compiler.
 - Caddyfile explicit TLS file certificates (`tls cert.pem key.pem` and
   `tls { load cert.pem key.pem }`) for the `--caddy` runtime path. The adapter
   emits certificate-selection policy into `zeroserve.tls`; at handshake time

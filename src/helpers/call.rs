@@ -79,6 +79,7 @@ pub fn h_call(
             ctx.call_depth,
             ctx.max_memory_footprint,
             ctx.expose_filesystem,
+            ctx.caddy_file_cache.clone(),
         )))
     })?;
 
@@ -98,6 +99,7 @@ pub fn h_call(
         call_depth,
         max_mem,
         expose_filesystem,
+        caddy_file_cache,
     )) = prepared
     else {
         return Ok(-1i64 as u64);
@@ -135,6 +137,7 @@ pub fn h_call(
                 max_mem,
                 expose_filesystem,
                 call_depth + 1,
+                caddy_file_cache,
             );
             let timeslice = default_timeslice();
             let preemption = PreemptionEnabled::new(t);

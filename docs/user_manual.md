@@ -152,9 +152,10 @@ placeholders.
 Supported Caddy `tls.client_auth` policies are emitted into a separate
 `zeroserve.tls` eBPF section which runs before normal HTTP request routing.
 The supported modes are `require`, `verify_if_given`, and
-`require_and_verify` with inline trusted CA certificates produced by Caddy JSON
-or Caddyfile adaptation. Custom client-auth verifier modules and
-trusted-leaf-only verification are rejected.
+`require_and_verify` with inline trusted CA certificates or Caddyfile
+`trusted_ca_cert_file` paths. CA files are loaded and cached by the runtime on
+first verification, then refreshed by hot reload. Custom client-auth verifier
+modules and trusted-leaf-only verification are rejected.
 Explicit Caddyfile certificate files are supported for the `--caddy` flow:
 `tls cert.pem key.pem` and `tls { load cert.pem key.pem }` are adapted to
 TLS policies and emitted into the generated `zeroserve.tls` section. The TLS
@@ -165,6 +166,9 @@ reload, so a reload picks up renewed certificate files and changed paths
 alike. Because this reads host filesystem certificate files, it is only
 allowed when filesystem exposure is enabled; `--caddy` forces
 `--expose-filesystem` on for the generated middleware.
+Basic-auth provision placeholders such as `{env.NAME}` and `{file.path}` are
+preserved by compilation and resolved by the runtime; file-placeholder reads
+use the same runtime cache and filesystem exposure gate.
 The Caddy `expression` matcher is supported for the request-matcher subset that
 can be represented directly in generated middleware: boolean `&&`/`||`/`!`,
 parentheses, string equality/inequality and string-list `in`, string

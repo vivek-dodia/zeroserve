@@ -8,7 +8,6 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use anyhow::{Result, bail};
-use base64ct::Encoding;
 use serde_json::{Map, Value, json};
 
 use super::matchers;
@@ -794,6 +793,7 @@ fn parse_tls_client_auth(mut d: Dispenser) -> Result<Option<Value>> {
     let mut has_trust_pool = false;
     let mut auth = Map::new();
     let mut ca_certs = Vec::<Value>::new();
+    let mut ca_cert_files = Vec::<Value>::new();
     while d.next_block(nesting) {
         let subdirective = d.val();
         match subdirective.as_str() {
@@ -818,17 +818,7 @@ fn parse_tls_client_auth(mut d: Dispenser) -> Result<Option<Value>> {
                     );
                 }
                 let args = parse_exact_args(&mut d, 1)?;
-                let pem = std::fs::read(&args[0])
-                    .map_err(|e| d.errf(format!("open {}: {e}", args[0])))?;
-                let certs = boring::x509::X509::stack_from_pem(&pem).map_err(|e| {
-                    d.errf(format!("parsing trusted CA certificate {}: {e}", args[0]))
-                })?;
-                for cert in certs {
-                    let der = cert.to_der().map_err(|e| {
-                        d.errf(format!("encoding trusted CA certificate {}: {e}", args[0]))
-                    })?;
-                    ca_certs.push(json!(base64ct::Base64::encode_string(&der)));
-                }
+                ca_cert_files.push(json!(args[0]));
                 has_trusted_ca = true;
             }
             "trusted_leaf_cert" | "trusted_leaf_cert_file" => {
@@ -873,10 +863,14 @@ fn parse_tls_client_auth(mut d: Dispenser) -> Result<Option<Value>> {
             other => bail!("unknown subdirective for client_auth: {other}"),
         }
     }
-    if !ca_certs.is_empty() {
+    if !ca_certs.is_empty() || !ca_cert_files.is_empty() {
         auth.insert(
             "ca".into(),
-            json!({ "provider": "inline", "trusted_ca_certs": ca_certs }),
+            json!({
+                "provider": "inline",
+                "trusted_ca_certs": ca_certs,
+                "trusted_ca_cert_files": ca_cert_files,
+            }),
         );
     }
     if auth.is_empty() {

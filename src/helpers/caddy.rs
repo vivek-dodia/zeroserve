@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     fs,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    path::{Path, PathBuf},
+    path::{MAIN_SEPARATOR, Path, PathBuf},
     str::FromStr,
     time::UNIX_EPOCH,
 };
@@ -20,6 +20,8 @@ use boring::{
 use regex::Regex;
 use serde_json::Value;
 
+use futures::channel::oneshot;
+
 use crate::caddy_file::{
     display_path as caddy_file_match_display_path, file_hidden as caddy_file_hidden,
     fs_file_hidden as caddy_fs_file_hidden, glob_match, join_file_path as join_caddy_file_path,
@@ -30,12 +32,15 @@ use crate::script::{
     CaddyFileServer, ScriptResponse, deref_and_write_cstr, header_pattern_matches,
     parse_json_cached, read_utf8, split_relative_request_target, with_ectx,
 };
+use crate::thread_pool::CPU_TP;
 
 #[derive(Default, serde::Deserialize)]
 struct CaddyTlsClientAuthConfig {
     mode: String,
     #[serde(default)]
     trusted_ca_certs: Vec<String>,
+    #[serde(default)]
+    trusted_ca_cert_files: Vec<String>,
 }
 
 /// Select the TLS certificate for the in-flight handshake. The script passes
@@ -126,9 +131,11 @@ pub fn h_caddy_tls_client_auth(
             "request" | "require" => Ok(1),
             "verify_if_given" | "require_and_verify" => {
                 let verified = verify_caddy_client_cert(
+                    ctx,
                     leaf_der,
                     &conn.tls_client_chain_der,
                     &config.trusted_ca_certs,
+                    &config.trusted_ca_cert_files,
                 )?;
                 Ok(verified as u64)
             }
@@ -138,11 +145,13 @@ pub fn h_caddy_tls_client_auth(
 }
 
 fn verify_caddy_client_cert(
+    ctx: &crate::script::ScriptExecutionContext,
     leaf_der: &[u8],
     chain_der: &[Vec<u8>],
     trusted_ca_certs: &[String],
+    trusted_ca_cert_files: &[String],
 ) -> Result<bool, ()> {
-    let store = caddy_client_auth_store(trusted_ca_certs)?;
+    let store = caddy_client_auth_store(ctx, trusted_ca_certs, trusted_ca_cert_files)?;
     let leaf = X509::from_der(leaf_der).map_err(|_| ())?;
     let mut chain = Stack::new().map_err(|_| ())?;
     for cert_der in chain_der {
@@ -159,7 +168,11 @@ fn verify_caddy_client_cert(
         .map_err(|_| ())
 }
 
-fn caddy_client_auth_store(trusted_ca_certs: &[String]) -> Result<X509Store, ()> {
+fn caddy_client_auth_store(
+    ctx: &crate::script::ScriptExecutionContext,
+    trusted_ca_certs: &[String],
+    trusted_ca_cert_files: &[String],
+) -> Result<X509Store, ()> {
     let mut builder = X509StoreBuilder::new().map_err(|_| ())?;
     for cert in trusted_ca_certs {
         let der = Base64::decode_vec(cert).map_err(|_| ())?;
@@ -167,7 +180,31 @@ fn caddy_client_auth_store(trusted_ca_certs: &[String]) -> Result<X509Store, ()>
             .add_cert(X509::from_der(&der).map_err(|_| ())?)
             .map_err(|_| ())?;
     }
+    for file in trusted_ca_cert_files {
+        if !ctx.expose_filesystem {
+            return Err(());
+        }
+        let pem = caddy_cached_file(ctx, file)?;
+        let certs = X509::stack_from_pem(&pem).map_err(|_| ())?;
+        for cert in certs {
+            builder.add_cert(cert).map_err(|_| ())?;
+        }
+    }
     Ok(builder.build())
+}
+
+fn caddy_cached_file(
+    ctx: &crate::script::ScriptExecutionContext,
+    path: &str,
+) -> Result<Vec<u8>, ()> {
+    if let Some(bytes) = ctx.caddy_file_cache.borrow().get(path).cloned() {
+        return Ok(bytes);
+    }
+    let bytes = fs::read(path).map_err(|_| ())?;
+    ctx.caddy_file_cache
+        .borrow_mut()
+        .insert(path.to_string(), bytes.clone());
+    Ok(bytes)
 }
 
 pub fn h_caddy_path_regexp_subject(
@@ -4229,7 +4266,7 @@ pub fn h_caddy_basic_auth(
     _: u64,
 ) -> Result<u64, ()> {
     let config = parse_json_cached::<CaddyBasicAuthConfig>(scope, config_ptr, config_len)?;
-    with_ectx(scope, |ctx| {
+    let action = with_ectx(scope, |ctx| {
         let credentials = ctx
             .request
             .borrow()
@@ -4238,38 +4275,102 @@ pub fn h_caddy_basic_auth(
             .and_then(|values| values.first())
             .map(String::as_str)
             .and_then(parse_basic_auth_credentials);
-        let mut provider_error = None::<String>;
-        let authed_user = if let Some((username, plaintext)) = credentials {
-            let account = config
-                .accounts
-                .iter()
-                .find(|account| account.username == username);
-            let hash = account
-                .map(|account| account.password.as_str())
-                .unwrap_or_else(|| caddy_basic_auth_fake_hash(&config.hash.algorithm));
-            let password_hash = caddy_basic_auth_password_hash(hash)?;
-            match caddy_basic_auth_verify(&config.hash.algorithm, &password_hash, &plaintext) {
-                Ok(true) if account.is_some() => Some(username),
-                Ok(_) => None,
-                Err(err) => {
-                    provider_error = Some(err);
-                    None
-                }
-            }
-        } else {
-            None
+        let Some((username, plaintext)) = credentials else {
+            caddy_basic_auth_prompt(ctx, &config.realm, None)?;
+            return Ok(CaddyBasicAuthAction::Done(0));
         };
 
-        if let Some(username) = authed_user {
+        let account = config.accounts.iter().find_map(|account| {
+            let configured = caddy_provision_replace_all(ctx, &account.username);
+            if configured == username && !configured.is_empty() {
+                Some(account)
+            } else {
+                None
+            }
+        });
+        let account_found = account.is_some();
+        let hash = account
+            .map(|account| caddy_provision_replace_all(ctx, &account.password))
+            .unwrap_or_else(|| caddy_basic_auth_fake_hash(&config.hash.algorithm).to_string());
+        let password_hash = caddy_basic_auth_password_hash(&hash)?;
+        Ok(CaddyBasicAuthAction::Verify(CaddyBasicAuthVerifyTask {
+            algorithm: config.hash.algorithm.clone(),
+            password_hash,
+            plaintext,
+            username,
+            account_found,
+            realm: config.realm.clone(),
+        }))
+    })?;
+
+    match action {
+        CaddyBasicAuthAction::Done(value) => Ok(value),
+        CaddyBasicAuthAction::Verify(task) => {
+            scope.post_task(async move {
+                let CaddyBasicAuthVerifyTask {
+                    algorithm,
+                    password_hash,
+                    plaintext,
+                    username,
+                    account_found,
+                    realm,
+                } = task;
+                let (tx, rx) = oneshot::channel();
+                CPU_TP.spawn(move || {
+                    let result = caddy_basic_auth_verify(&algorithm, &password_hash, &plaintext);
+                    let _ = tx.send(result);
+                });
+                let result = rx
+                    .await
+                    .unwrap_or_else(|_| Err("password verifier task failed".to_string()));
+                move |scope: &HelperScope| {
+                    with_ectx(scope, |ctx| {
+                        caddy_basic_auth_finish(ctx, username, account_found, &realm, result)
+                    })
+                }
+            });
+            Ok(0)
+        }
+    }
+}
+
+enum CaddyBasicAuthAction {
+    Done(u64),
+    Verify(CaddyBasicAuthVerifyTask),
+}
+
+struct CaddyBasicAuthVerifyTask {
+    algorithm: String,
+    password_hash: Vec<u8>,
+    plaintext: Vec<u8>,
+    username: String,
+    account_found: bool,
+    realm: String,
+}
+
+fn caddy_basic_auth_finish(
+    ctx: &mut crate::script::ScriptExecutionContext,
+    username: String,
+    account_found: bool,
+    realm: &str,
+    result: Result<bool, String>,
+) -> Result<u64, ()> {
+    match result {
+        Ok(true) if account_found => {
             let key = "http.auth.user.id";
             ctx.alloc_memory_footprint((key.len() + username.len()) as u64)?;
             ctx.metadata.borrow_mut().insert(key.to_string(), username);
-            return Ok(1);
+            Ok(1)
         }
-
-        caddy_basic_auth_prompt(ctx, &config.realm, provider_error)?;
-        Ok(0)
-    })
+        Ok(_) => {
+            caddy_basic_auth_prompt(ctx, realm, None)?;
+            Ok(0)
+        }
+        Err(err) => {
+            caddy_basic_auth_prompt(ctx, realm, Some(err))?;
+            Ok(0)
+        }
+    }
 }
 
 fn parse_basic_auth_credentials(header: &str) -> Option<(String, Vec<u8>)> {
@@ -4284,6 +4385,161 @@ fn parse_basic_auth_credentials(header: &str) -> Option<(String, Vec<u8>)> {
     let separator = decoded.iter().position(|byte| *byte == b':')?;
     let username = String::from_utf8(decoded[..separator].to_vec()).ok()?;
     Some((username, decoded[separator + 1..].to_vec()))
+}
+
+fn caddy_provision_replace_all(ctx: &crate::script::ScriptExecutionContext, input: &str) -> String {
+    if !input.contains('{') && !input.contains('}') {
+        return input.to_string();
+    }
+
+    let mut out = String::with_capacity(input.len());
+    let mut last = 0;
+    let mut i = 0;
+    let bytes = input.as_bytes();
+    let mut unclosed = 0;
+    'scan: while i < bytes.len() {
+        if i > 0 && bytes[i - 1] == b'\\' && matches!(bytes[i], b'{' | b'}') {
+            out.push_str(&input[last..i - 1]);
+            last = i;
+            i += 1;
+            continue;
+        }
+        if bytes[i] != b'{' {
+            i += 1;
+            continue;
+        }
+        if unclosed > 100 {
+            return String::new();
+        }
+
+        let mut end = match input[i..].find('}') {
+            Some(relative) => i + relative,
+            None => {
+                unclosed += 1;
+                i += 1;
+                continue;
+            }
+        };
+        loop {
+            if end == 0 || end >= bytes.len() - 1 || bytes[end - 1] != b'\\' {
+                break;
+            }
+            match input[end + 1..].find('}') {
+                Some(relative) => end += relative + 1,
+                None => {
+                    unclosed += 1;
+                    i += 1;
+                    continue 'scan;
+                }
+            }
+        }
+
+        out.push_str(&input[last..i]);
+        let key = &input[i + 1..end];
+        if let Some(value) = caddy_provision_placeholder_value(ctx, key) {
+            out.push_str(&value);
+        }
+        i = end + 1;
+        last = i;
+    }
+
+    out.push_str(&input[last..]);
+    out
+}
+
+fn caddy_provision_placeholder_value(
+    ctx: &crate::script::ScriptExecutionContext,
+    key: &str,
+) -> Option<String> {
+    if let Some(name) = key.strip_prefix("env.") {
+        return Some(std::env::var(name).unwrap_or_default());
+    }
+    if let Some(filename) = key.strip_prefix("file.") {
+        const MAX_FILE_PLACEHOLDER_SIZE: u64 = 1024 * 1024;
+        if !ctx.expose_filesystem {
+            return None;
+        }
+        if let Some(cached) = ctx.caddy_file_cache.borrow().get(filename).cloned() {
+            if cached.len() as u64 > MAX_FILE_PLACEHOLDER_SIZE {
+                return Some(String::new());
+            }
+            return Some(caddy_provision_file_text(cached));
+        }
+        let meta = fs::metadata(filename).ok()?;
+        if meta.len() > MAX_FILE_PLACEHOLDER_SIZE {
+            return Some(String::new());
+        }
+        let body = fs::read(filename).ok()?;
+        ctx.caddy_file_cache
+            .borrow_mut()
+            .insert(filename.to_string(), body.clone());
+        return Some(caddy_provision_file_text(body));
+    }
+    match key {
+        "system.hostname" => Some(caddy_system_hostname().unwrap_or_default()),
+        "system.slash" => Some(MAIN_SEPARATOR.to_string()),
+        "system.os" => Some(caddy_go_os().to_string()),
+        "system.wd" => Some(
+            std::env::current_dir()
+                .ok()
+                .and_then(|path| path.into_os_string().into_string().ok())
+                .unwrap_or_default(),
+        ),
+        "system.arch" => Some(caddy_go_arch().to_string()),
+        "time.now" => {
+            let now = chrono::Local::now();
+            Some(now.format("%Y-%m-%d %H:%M:%S%.f %z").to_string())
+        }
+        "time.now.http" => Some(
+            chrono::Utc::now()
+                .format("%a, %d %b %Y %H:%M:%S GMT")
+                .to_string(),
+        ),
+        "time.now.common_log" => Some(
+            chrono::Local::now()
+                .format("%d/%b/%Y:%H:%M:%S %z")
+                .to_string(),
+        ),
+        _ => None,
+    }
+}
+
+fn caddy_provision_file_text(mut body: Vec<u8>) -> String {
+    if body.last() == Some(&b'\n') {
+        body.pop();
+    }
+    if body.last() == Some(&b'\r') {
+        body.pop();
+    }
+    String::from_utf8_lossy(&body).into_owned()
+}
+
+fn caddy_system_hostname() -> Option<String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: `buf` is valid for writes of its full length and is NUL-terminated
+    // below before conversion even when the hostname exactly fills the buffer.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    if rc != 0 {
+        return None;
+    }
+    let len = buf.iter().position(|byte| *byte == 0).unwrap_or(buf.len());
+    Some(String::from_utf8_lossy(&buf[..len]).into_owned())
+}
+
+fn caddy_go_os() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "darwin",
+        other => other,
+    }
+}
+
+fn caddy_go_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "x86" => "386",
+        "aarch64" => "arm64",
+        other => other,
+    }
 }
 
 fn caddy_basic_auth_password_hash(configured: &str) -> Result<Vec<u8>, ()> {

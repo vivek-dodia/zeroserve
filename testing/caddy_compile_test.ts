@@ -11354,6 +11354,102 @@ Deno.test({
 });
 
 Deno.test({
+  name:
+    "compiled Caddy basic_auth argon2id protects routes and exposes user placeholder",
+  ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
+  async fn() {
+    const siteDir = await Deno.makeTempDir();
+    let tarPath: string | null = null;
+    try {
+      await Deno.mkdir(join(siteDir, ".zeroserve", "scripts"), {
+        recursive: true,
+      });
+      await Deno.writeTextFile(join(siteDir, "index.html"), "unused");
+
+      const caddyConfig = {
+        apps: {
+          http: {
+            servers: {
+              srv0: {
+                routes: [{
+                  handle: [{
+                    handler: "authentication",
+                    providers: {
+                      http_basic: {
+                        hash: { algorithm: "argon2id" },
+                        realm: "Argon Area",
+                        accounts: [{
+                          username: "alice",
+                          password:
+                            "$argon2id$v=19$m=47104,t=1,p=1$P2nzckEdTZ3bxCiBCkRTyA$xQL3Z32eo5jKl7u5tcIsnEKObYiyNZQQf5/4sAau6Pg",
+                        }],
+                      },
+                    },
+                  }, {
+                    handler: "static_response",
+                    body: "argon {http.auth.user.id}",
+                  }],
+                  terminal: true,
+                }],
+              },
+            },
+          },
+        },
+      };
+      const caddyConfigPath = join(siteDir, "caddy.json");
+      await Deno.writeTextFile(caddyConfigPath, JSON.stringify(caddyConfig));
+
+      const zeroservePath = await getZeroservePath();
+      const compiled = await new Deno.Command(zeroservePath, {
+        args: ["--caddy-compile", caddyConfigPath],
+        cwd: repoRoot,
+        stdout: "piped",
+        stderr: "piped",
+      }).output();
+      if (!compiled.success) {
+        throw new Error(new TextDecoder().decode(compiled.stderr));
+      }
+      await Deno.writeFile(
+        join(siteDir, ".zeroserve", "scripts", "caddy.c"),
+        compiled.stdout,
+      );
+
+      tarPath = await packSite(siteDir);
+      await withZeroserve(tarPath, async (baseUrl) => {
+        const missing = await fetch(`${baseUrl}/`);
+        assertEquals(missing.status, 401);
+        assertEquals(
+          missing.headers.get("www-authenticate"),
+          'Basic realm="Argon Area"',
+        );
+
+        const wrong = await fetch(`${baseUrl}/`, {
+          headers: {
+            Authorization: `Basic ${btoa("alice:wrong")}`,
+          },
+        });
+        assertEquals(wrong.status, 401);
+
+        const ok = await fetch(`${baseUrl}/`, {
+          headers: {
+            Authorization: `Basic ${btoa("alice:antitiming")}`,
+          },
+        });
+        assertEquals(ok.status, 200);
+        assertEquals(await ok.text(), "argon alice");
+      });
+    } finally {
+      await Deno.remove(siteDir, { recursive: true }).catch(() => {});
+      if (tarPath) {
+        await Deno.remove(tarPath).catch(() => {});
+      }
+    }
+  },
+});
+
+Deno.test({
   name: "compiled Caddy basic_auth exposes provider errors to error routes",
   ignore: !canRunScripts,
   sanitizeResources: false,

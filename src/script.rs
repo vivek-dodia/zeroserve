@@ -1159,6 +1159,9 @@ pub struct ScriptExecutionContext {
     /// Current inter-script call nesting depth. The top-level request runs at
     /// depth 0; each `zs_call` increments it for the callee.
     pub call_depth: usize,
+    /// Runtime cache for Caddy-generated helpers that intentionally defer host
+    /// filesystem reads until request time.
+    pub caddy_file_cache: Rc<RefCell<HashMap<String, Vec<u8>>>>,
     /// Present only during the pre-handshake TLS section run (`--caddy`
     /// script-selected certificates): the certificate selection state for the
     /// in-flight handshake. `None` for request-phase runs — TLS helpers that
@@ -1189,6 +1192,7 @@ impl ScriptExecutionContext {
         max_memory_footprint: u64,
         expose_filesystem: bool,
         call_depth: usize,
+        caddy_file_cache: Rc<RefCell<HashMap<String, Vec<u8>>>>,
     ) -> Self {
         let input_mem = helpers::estimate_json_memory_usage(&input) as u64;
         let mut external_objects = ObjectRegistry {
@@ -1223,6 +1227,7 @@ impl ScriptExecutionContext {
             scripts,
             t,
             call_depth,
+            caddy_file_cache,
             tls_select: None,
         }
     }
@@ -1287,6 +1292,7 @@ impl ObjectRegistry {
 pub struct ScriptRuntime {
     t: ThreadEnv,
     scripts: RefCell<Rc<Vec<(String, Program)>>>,
+    caddy_file_cache: Rc<RefCell<HashMap<String, Vec<u8>>>>,
     max_memory_footprint: u64,
     expose_filesystem: bool,
     code_size_limit: usize,
@@ -1310,6 +1316,7 @@ impl ScriptRuntime {
         ScriptRuntime {
             t,
             scripts,
+            caddy_file_cache: Rc::new(RefCell::new(HashMap::new())),
             max_memory_footprint: config.max_memory_footprint,
             expose_filesystem: config.expose_filesystem,
             code_size_limit: config.code_size_limit,
@@ -1400,6 +1407,7 @@ impl ScriptRuntime {
 
     pub(crate) fn install_scripts(&self, scripts: Rc<Vec<(String, Program)>>) {
         *self.scripts.borrow_mut() = scripts;
+        self.caddy_file_cache.borrow_mut().clear();
     }
 
     /// Run only the `zeroserve.tls` script sections to choose a certificate
@@ -1469,6 +1477,7 @@ impl ScriptRuntime {
                 scripts: scripts.clone(),
                 t: self.t,
                 call_depth: 0,
+                caddy_file_cache: self.caddy_file_cache.clone(),
                 tls_select: Some(select.clone()),
             };
             let mut resources: [&mut dyn Any; 1] = [&mut ctx];
@@ -1524,6 +1533,7 @@ impl ScriptRuntime {
             &MonoioTimeslicer,
             self.max_memory_footprint,
             self.expose_filesystem,
+            self.caddy_file_cache.clone(),
         )
         .await;
         Ok(outcome)
@@ -1551,6 +1561,7 @@ impl ScriptRuntime {
             &MonoioTimeslicer,
             self.max_memory_footprint,
             self.expose_filesystem,
+            self.caddy_file_cache.clone(),
         )
         .await;
         Ok(outcome)
@@ -1655,6 +1666,7 @@ impl ScriptRuntime {
                 self.max_memory_footprint,
                 self.expose_filesystem,
                 0,
+                self.caddy_file_cache.clone(),
             );
             let mut resources: [&mut dyn Any; 1] = [&mut ctx];
             let before_hook = response_context.borrow().clone();
@@ -1734,6 +1746,7 @@ async fn run_request_scripts(
     timeslicer: &impl Timeslicer,
     max_memory_footprint: u64,
     expose_filesystem: bool,
+    caddy_file_cache: Rc<RefCell<HashMap<String, Vec<u8>>>>,
 ) -> ScriptOutcome {
     let request = Rc::new(RefCell::new(request));
     let metadata: Rc<RefCell<HashMap<String, String>>> = Rc::new(RefCell::new(HashMap::new()));
@@ -1750,6 +1763,7 @@ async fn run_request_scripts(
         timeslicer,
         max_memory_footprint,
         expose_filesystem,
+        caddy_file_cache,
     )
     .await
 }
@@ -1767,6 +1781,7 @@ async fn run_request_scripts_with_state(
     timeslicer: &impl Timeslicer,
     max_memory_footprint: u64,
     expose_filesystem: bool,
+    caddy_file_cache: Rc<RefCell<HashMap<String, Vec<u8>>>>,
 ) -> ScriptOutcome {
     if scripts.is_empty() {
         let request_value = request.borrow().clone();
@@ -1834,6 +1849,7 @@ async fn run_request_scripts_with_state(
                 scripts: scripts.clone(),
                 t,
                 call_depth: 0,
+                caddy_file_cache: caddy_file_cache.clone(),
                 tls_select: None,
             };
             let mut resources: [&mut dyn Any; 1] = [&mut ctx];

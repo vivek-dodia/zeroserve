@@ -1,8 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
-    fs,
     net::IpAddr,
-    path::MAIN_SEPARATOR,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -6087,18 +6085,32 @@ fn normalize_tls_client_auth(auth: &Value) -> Result<Value> {
         let certs = ca
             .get("trusted_ca_certs")
             .and_then(Value::as_array)
-            .ok_or_else(|| anyhow!("verified client authentication requires trusted_ca_certs"))?;
-        if certs.is_empty() {
-            bail!("verified client authentication requires at least one trusted_ca_cert");
+            .cloned()
+            .unwrap_or_default();
+        let files = ca
+            .get("trusted_ca_cert_files")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if certs.is_empty() && files.is_empty() {
+            bail!(
+                "verified client authentication requires at least one trusted_ca_cert or trusted_ca_cert_file"
+            );
         }
-        for cert in certs {
+        for cert in &certs {
             if !cert.is_string() {
                 bail!("trusted_ca_certs entries must be base64 DER strings");
+            }
+        }
+        for file in &files {
+            if !file.as_str().is_some_and(|file| !file.is_empty()) {
+                bail!("trusted_ca_cert_files entries must be non-empty strings");
             }
         }
         Ok(json!({
             "mode": mode,
             "trusted_ca_certs": certs,
+            "trusted_ca_cert_files": files,
         }))
     } else {
         Ok(json!({ "mode": mode }))
@@ -6280,14 +6292,7 @@ fn normalize_http_basic_auth_config(config: &Map<String, Value>) -> Result<Optio
         if normalized_accounts.contains_key(username) {
             bail!("authentication.providers.http_basic account username is not unique: {username}");
         }
-        let username = caddy_provision_replace_all(username);
-        let password = caddy_provision_replace_all(password);
-        if username.is_empty() || password.is_empty() {
-            bail!(
-                "authentication.providers.http_basic.accounts.{idx}.username and password are required"
-            );
-        }
-        if !password.starts_with('$') {
+        if !contains_caddy_placeholder(password) && !password.starts_with('$') {
             Base64::decode_vec(&password).with_context(|| {
                 format!(
                     "authentication.providers.http_basic.accounts.{idx}.password must be Modular Crypt Format or base64-encoded"
@@ -7424,142 +7429,6 @@ fn contains_caddy_placeholder(s: &str) -> bool {
         rest = &after_start[end + 1..];
     }
     false
-}
-
-fn caddy_provision_replace_all(input: &str) -> String {
-    if !input.contains('{') && !input.contains('}') {
-        return input.to_string();
-    }
-
-    let mut out = String::with_capacity(input.len());
-    let mut last = 0;
-    let mut i = 0;
-    let bytes = input.as_bytes();
-    let mut unclosed = 0;
-    'scan: while i < bytes.len() {
-        if i > 0 && bytes[i - 1] == b'\\' && matches!(bytes[i], b'{' | b'}') {
-            out.push_str(&input[last..i - 1]);
-            last = i;
-            i += 1;
-            continue;
-        }
-        if bytes[i] != b'{' {
-            i += 1;
-            continue;
-        }
-        if unclosed > 100 {
-            return String::new();
-        }
-
-        let mut end = match input[i..].find('}') {
-            Some(relative) => i + relative,
-            None => {
-                unclosed += 1;
-                i += 1;
-                continue;
-            }
-        };
-        loop {
-            if end == 0 || end >= bytes.len() - 1 || bytes[end - 1] != b'\\' {
-                break;
-            }
-            match input[end + 1..].find('}') {
-                Some(relative) => end += relative + 1,
-                None => {
-                    unclosed += 1;
-                    i += 1;
-                    continue 'scan;
-                }
-            }
-        }
-
-        out.push_str(&input[last..i]);
-        let key = &input[i + 1..end];
-        if let Some(value) = caddy_provision_placeholder_value(key) {
-            out.push_str(&value);
-        }
-        i = end + 1;
-        last = i;
-    }
-
-    out.push_str(&input[last..]);
-    out
-}
-
-fn caddy_provision_placeholder_value(key: &str) -> Option<String> {
-    if let Some(name) = key.strip_prefix("env.") {
-        return Some(std::env::var(name).unwrap_or_default());
-    }
-    if let Some(filename) = key.strip_prefix("file.") {
-        const MAX_FILE_PLACEHOLDER_SIZE: u64 = 1024 * 1024;
-        let meta = fs::metadata(filename).ok()?;
-        if meta.len() > MAX_FILE_PLACEHOLDER_SIZE {
-            return Some(String::new());
-        }
-        let mut body = fs::read(filename).ok()?;
-        if body.last() == Some(&b'\n') {
-            body.pop();
-        }
-        if body.last() == Some(&b'\r') {
-            body.pop();
-        }
-        return Some(String::from_utf8_lossy(&body).into_owned());
-    }
-    match key {
-        "system.hostname" => Some(caddy_system_hostname().unwrap_or_default()),
-        "system.slash" => Some(MAIN_SEPARATOR.to_string()),
-        "system.os" => Some(caddy_go_os().to_string()),
-        "system.wd" => Some(
-            std::env::current_dir()
-                .ok()
-                .and_then(|path| path.into_os_string().into_string().ok())
-                .unwrap_or_default(),
-        ),
-        "system.arch" => Some(caddy_go_arch().to_string()),
-        "time.now" => {
-            let now = chrono::Local::now();
-            Some(now.format("%Y-%m-%d %H:%M:%S%.f %z").to_string())
-        }
-        "time.now.http" => Some(
-            chrono::Utc::now()
-                .format("%a, %d %b %Y %H:%M:%S GMT")
-                .to_string(),
-        ),
-        "time.now.common_log" => Some(
-            chrono::Local::now()
-                .format("%d/%b/%Y:%H:%M:%S %z")
-                .to_string(),
-        ),
-        _ => None,
-    }
-}
-
-fn caddy_system_hostname() -> Option<String> {
-    let mut buf = [0u8; 256];
-    // SAFETY: `buf` is valid for writes of its full length and is NUL-terminated
-    // below before conversion even when the hostname exactly fills the buffer.
-    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
-    if rc != 0 {
-        return None;
-    }
-    let len = buf.iter().position(|byte| *byte == 0).unwrap_or(buf.len());
-    Some(String::from_utf8_lossy(&buf[..len]).into_owned())
-}
-
-fn caddy_go_os() -> &'static str {
-    match std::env::consts::OS {
-        "macos" => "darwin",
-        other => other,
-    }
-}
-
-fn caddy_go_arch() -> &'static str {
-    match std::env::consts::ARCH {
-        "x86_64" => "amd64",
-        "x86" => "386",
-        "aarch64" => "arm64",
-        other => other,
-    }
 }
 
 fn caddy_regex(pattern: &str) -> Result<Regex, regex::Error> {
@@ -9233,7 +9102,8 @@ mod tests {
                 "mode": "require_and_verify",
                 "ca": {
                   "provider": "inline",
-                  "trusted_ca_certs": ["AA=="]
+                  "trusted_ca_certs": ["AA=="],
+                  "trusted_ca_cert_files": ["/tmp/client-ca.pem"]
                 }
               }
             }],
@@ -9246,6 +9116,7 @@ mod tests {
         assert!(c.contains("zs_caddy_tls_client_auth"), "{c}");
         assert!(c.contains("zs_abort();"), "{c}");
         assert!(c.contains("example.com"), "{c}");
+        assert!(c.contains("/tmp/client-ca.pem"), "{c}");
         assert!(
             c.contains("(zs_u64)caddy_tls_sni_raw < sizeof(caddy_tls_sni)"),
             "{c}"
@@ -11957,19 +11828,14 @@ mod tests {
     }
 
     #[test]
-    fn compiles_basic_authentication_provisioning_placeholders() {
+    fn preserves_basic_authentication_provisioning_placeholders() {
         unsafe {
             std::env::set_var("ZS_CADDY_AUTH_USER", "env-alice");
         }
-        let password_file = std::env::temp_dir().join(format!(
-            "zeroserve-caddy-auth-password-{}",
+        let password_file = format!(
+            "/tmp/zeroserve-caddy-auth-password-missing-{}",
             std::process::id()
-        ));
-        std::fs::write(
-            &password_file,
-            "$2a$14$gqs5yvNgSqb/ksrUoam91ewSE1TjpYIgCuaiuZH395DQEPsiCVIei\r\n",
-        )
-        .unwrap();
+        );
 
         let source = format!(
             r#"{{
@@ -11991,19 +11857,18 @@ mod tests {
                 }}]
               }}]}}}}}}}}
             }}"#,
-            password_file.display()
+            password_file
         );
 
         let c = compile_caddy_json(&source).unwrap();
-        std::fs::remove_file(&password_file).ok();
         unsafe {
             std::env::remove_var("ZS_CADDY_AUTH_USER");
         }
 
-        assert!(c.contains("env-alice"), "{c}");
-        assert!(c.contains("prefix-"), "{c}");
-        assert!(!c.contains("http.vars.missing"), "{c}");
-        assert!(!c.contains("\\r\\n"), "{c}");
+        assert!(c.contains("{env.ZS_CADDY_AUTH_USER}"), "{c}");
+        assert!(c.contains(&format!("{{file.{password_file}}}")), "{c}");
+        assert!(c.contains("prefix-{http.vars.missing}"), "{c}");
+        assert!(!c.contains("env-alice"), "{c}");
     }
 
     #[test]

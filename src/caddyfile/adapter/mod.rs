@@ -4814,6 +4814,23 @@ example.com {
             [0];
         assert_eq!(h["handler"], "static_response");
 
+        let (v, _) = adapt_full(
+            r#"example.com {
+  tls {
+    client_auth {
+      mode require_and_verify
+      trusted_ca_cert_file /tmp/client-ca.pem
+    }
+  }
+  respond ok
+}"#,
+        );
+        assert_eq!(
+            v["apps"]["http"]["servers"]["srv0"]["tls_connection_policies"][0]["client_authentication"]
+                ["ca"]["trusted_ca_cert_files"],
+            json!(["/tmp/client-ca.pem"])
+        );
+
         let mode_extra = adapt_err(
             r#"example.com {
   tls {
