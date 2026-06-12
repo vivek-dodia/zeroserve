@@ -391,6 +391,9 @@ async fn request(
     basic_auth: Option<(&str, &str)>,
 ) -> Result<(u16, Vec<u8>)> {
     let target = parse_backend_target(url)?;
+    if matches!(target.scheme, BackendScheme::Unix) {
+        bail!("OIDC endpoints do not support unix socket URLs");
+    }
     let uri = origin_form_uri(&target)?;
 
     let mut headers = http::HeaderMap::new();
@@ -441,6 +444,7 @@ async fn request(
     match connect_backend(&target).await? {
         PooledConnection::Http(mut conn) => run_over(&mut conn, head, body).await,
         PooledConnection::Https(mut conn) => run_over(&mut conn, head, body).await,
+        PooledConnection::Unix(_) => unreachable!("unix OIDC endpoint rejected before connect"),
     }
 }
 

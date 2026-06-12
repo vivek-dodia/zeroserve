@@ -7505,10 +7505,14 @@ fn upstream_to_url(dial: &str, transport: Option<&Value>) -> Result<String> {
         bail!("reverse_proxy upstream scheme {scheme:?} cannot be represented by zs_reverse_proxy");
     }
     if let Some((network, _)) = dial.split_once("//") {
-        if matches!(
-            network,
-            "unix" | "unixgram" | "unixpacket" | "unix+h2c" | "fd"
-        ) {
+        if network == "unix" {
+            let transport_obj = transport.and_then(Value::as_object);
+            if transport_obj.is_some_and(|obj| obj.get("tls").is_some_and(|tls| !tls.is_null())) {
+                bail!("reverse_proxy unix upstreams cannot use upstream TLS");
+            }
+            return Ok(dial.to_string());
+        }
+        if matches!(network, "unixgram" | "unixpacket" | "unix+h2c" | "fd") {
             bail!(
                 "reverse_proxy upstream network {network:?} cannot be represented by zs_reverse_proxy"
             );
@@ -10234,6 +10238,29 @@ mod tests {
     }
 
     #[test]
+    fn compiles_reverse_proxy_unix_upstream() {
+        let source = r#"{
+          "apps": {"http": {"servers": {"srv0": {"routes": [{
+            "handle": [
+              {"handler": "headers", "request": {"set": {
+                "X-Upstream-Address": ["{http.reverse_proxy.upstream.address}"],
+                "X-Upstream-Host": ["{http.reverse_proxy.upstream.host}"],
+                "X-Upstream-Port": ["{http.reverse_proxy.upstream.port}"]
+              }}},
+              {"handler": "reverse_proxy", "upstreams": [{"dial": "unix//run/docker.sock"}]}
+            ]
+          }]}}}}
+        }"#;
+
+        let c = compile_caddy_json(source).unwrap();
+        assert!(
+            c.contains("zs_reverse_proxy(\"unix//run/docker.sock\", 21);"),
+            "{c}"
+        );
+        assert!(!c.contains("http://unix//run/docker.sock"), "{c}");
+    }
+
+    #[test]
     fn compiles_headers_null_sections_as_omitted() {
         let source = r#"{
           "apps": {"http": {"servers": {"srv0": {"routes": [{
@@ -12240,7 +12267,15 @@ mod tests {
         for (dial, expected) in [
             ("h2c://127.0.0.1:8080", "upstream scheme \"h2c\""),
             ("ws://127.0.0.1:8080", "upstream scheme \"ws\""),
-            ("unix//var/run/backend.sock", "upstream network \"unix\""),
+            (
+                "unixgram//var/run/backend.sock",
+                "upstream network \"unixgram\"",
+            ),
+            (
+                "unixpacket//var/run/backend.sock",
+                "upstream network \"unixpacket\"",
+            ),
+            ("fd//3", "upstream network \"fd\""),
         ] {
             let source = format!(
                 r#"{{

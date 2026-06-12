@@ -189,6 +189,46 @@ async function startBackend(): Promise<
   };
 }
 
+async function startUnixBackend(): Promise<
+  { dial: string; socketPath: string; close: () => Promise<void> }
+> {
+  const socketPath = await Deno.makeTempFile();
+  await Deno.remove(socketPath);
+  const controller = new AbortController();
+  const server = Deno.serve(
+    {
+      path: socketPath,
+      transport: "unix",
+      signal: controller.signal,
+      onListen() {},
+    },
+    async (req) => {
+      const url = new URL(req.url);
+      const bodyText = await req.text();
+      return Response.json({
+        method: req.method,
+        path: url.pathname,
+        query: url.search,
+        body: bodyText,
+        host: req.headers.get("host"),
+        upstreamAddress: req.headers.get("x-upstream-address"),
+        upstreamHost: req.headers.get("x-upstream-host"),
+        upstreamPort: req.headers.get("x-upstream-port"),
+      });
+    },
+  );
+
+  return {
+    dial: `unix/${socketPath}`,
+    socketPath,
+    close: async () => {
+      controller.abort();
+      await server.finished.catch(() => {});
+      await Deno.remove(socketPath).catch(() => {});
+    },
+  };
+}
+
 async function startForwardAuthBackends(): Promise<
   {
     authDial: string;
@@ -5547,6 +5587,97 @@ Deno.test({
           deferredStaticUpstream.headers.get("x-deferred-upstream"),
           backend.dial,
         );
+      });
+    } finally {
+      await backend.close();
+      await Deno.remove(siteDir, { recursive: true }).catch(() => {});
+      if (tarPath) {
+        await Deno.remove(tarPath).catch(() => {});
+      }
+    }
+  },
+});
+
+Deno.test({
+  name: "compiled Caddy reverse_proxy supports unix socket upstreams",
+  ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
+  async fn() {
+    const backend = await startUnixBackend();
+    const siteDir = await Deno.makeTempDir();
+    let tarPath: string | null = null;
+    try {
+      await Deno.mkdir(join(siteDir, ".zeroserve", "scripts"), {
+        recursive: true,
+      });
+      await Deno.writeTextFile(join(siteDir, "index.html"), "fallback");
+
+      const caddyConfig = {
+        apps: {
+          http: {
+            servers: {
+              srv0: {
+                routes: [{
+                  handle: [{
+                    handler: "reverse_proxy",
+                    headers: {
+                      request: {
+                        set: {
+                          "X-Upstream-Address": [
+                            "{http.reverse_proxy.upstream.address}",
+                          ],
+                          "X-Upstream-Host": [
+                            "{http.reverse_proxy.upstream.host}",
+                          ],
+                          "X-Upstream-Port": [
+                            "{http.reverse_proxy.upstream.port}",
+                          ],
+                        },
+                      },
+                    },
+                    upstreams: [{ dial: backend.dial }],
+                  }],
+                  terminal: true,
+                }],
+              },
+            },
+          },
+        },
+      };
+      const caddyConfigPath = join(siteDir, "caddy.json");
+      await Deno.writeTextFile(caddyConfigPath, JSON.stringify(caddyConfig));
+
+      const zeroservePath = await getZeroservePath();
+      const compiled = await new Deno.Command(zeroservePath, {
+        args: ["--caddy-compile", caddyConfigPath],
+        cwd: repoRoot,
+        stdout: "piped",
+        stderr: "piped",
+      }).output();
+      if (!compiled.success) {
+        throw new Error(new TextDecoder().decode(compiled.stderr));
+      }
+      await Deno.writeFile(
+        join(siteDir, ".zeroserve", "scripts", "caddy.c"),
+        compiled.stdout,
+      );
+
+      tarPath = await packSite(siteDir);
+      await withZeroserve(tarPath, async (baseUrl) => {
+        const res = await fetch(`${baseUrl}/v1.41/info?pretty=1`, {
+          method: "POST",
+          body: "payload",
+        });
+        assertEquals(res.status, 200);
+        const body = await res.json();
+        assertEquals(body.method, "POST");
+        assertEquals(body.path, "/v1.41/info");
+        assertEquals(body.query, "?pretty=1");
+        assertEquals(body.body, "payload");
+        assertEquals(body.upstreamAddress, backend.dial);
+        assertEquals(body.upstreamHost, backend.socketPath);
+        assertEquals(body.upstreamPort, "");
       });
     } finally {
       await backend.close();

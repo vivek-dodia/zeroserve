@@ -4688,7 +4688,24 @@ struct CaddyReverseProxyRewrite {
 
 fn set_caddy_reverse_proxy_placeholders(ctx: &crate::script::ScriptExecutionContext, url: &str) {
     let mut metadata = ctx.metadata.borrow_mut();
-    if let Ok(parsed) = ::url::Url::parse(url) {
+    if let Some(path) = url.strip_prefix("unix/") {
+        metadata.insert(
+            "http.reverse_proxy.upstream.address".to_string(),
+            url.to_string(),
+        );
+        metadata.insert(
+            "http.reverse_proxy.upstream.hostport".to_string(),
+            url.to_string(),
+        );
+        metadata.insert(
+            "http.reverse_proxy.upstream.host".to_string(),
+            path.to_string(),
+        );
+        metadata.insert(
+            "http.reverse_proxy.upstream.port".to_string(),
+            String::new(),
+        );
+    } else if let Ok(parsed) = ::url::Url::parse(url) {
         let host = parsed.host_str().unwrap_or("").to_string();
         let port = parsed
             .port_or_known_default()

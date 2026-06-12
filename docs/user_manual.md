@@ -129,7 +129,8 @@ and `reveal_symlinks`, `canonical_uris`,
 placeholder-expanded `status_code`, `pass_thru`, byte-range responses, built-in `precompressed`
 sidecars, `precompressed_order`, and `etag_file_extensions`),
 `request_body.max_size`, and single-upstream `reverse_proxy` including
-placeholder-expanded upstream dials, Caddy forwarded-header defaults,
+placeholder-expanded upstream dials, Unix socket upstream dials such as
+`unix//run/docker.sock`, Caddy forwarded-header defaults,
 and upstream request method/URI/query/path rewrites, upstream response status/header
 placeholders, upstream latency placeholders, `handle_response` status replacement,
 and request-mutating `handle_response.routes` flows such as `forward_auth`;
@@ -1065,8 +1066,9 @@ If a script does `zs_meta_set("name", ..., "Ada", ...)`, the response becomes:
 
 ## Reverse proxy behavior
 
-`zs_reverse_proxy` takes a backend URL such as `http://127.0.0.1:9000` or
-`https://api.example.com/v1?token=abc`.
+`zs_reverse_proxy` takes a backend URL such as `http://127.0.0.1:9000`,
+`https://api.example.com/v1?token=abc`, or a Unix socket upstream dial such as
+`unix//run/docker.sock`.
 
 Zeroserve will:
 

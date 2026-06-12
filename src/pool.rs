@@ -10,7 +10,7 @@ use futures::{
     channel::oneshot,
     future::{self, Either},
 };
-use monoio::net::TcpStream;
+use monoio::net::{TcpStream, UnixStream};
 
 use crate::boringtls::BoringStream;
 use crate::http::h1::H1Connection;
@@ -34,11 +34,20 @@ impl PoolKey {
             tls,
         }
     }
+
+    pub fn unix(path: String) -> Self {
+        Self {
+            host: format!("unix:{path}"),
+            port: 0,
+            tls: false,
+        }
+    }
 }
 
 pub enum PooledConnection {
     Http(H1Connection<TcpStream>),
     Https(H1Connection<BoringStream<TcpStream>>),
+    Unix(H1Connection<UnixStream>),
 }
 
 impl PooledConnection {
@@ -46,6 +55,7 @@ impl PooledConnection {
         match self {
             PooledConnection::Http(conn) => conn.io_ref().map(AsRawFd::as_raw_fd),
             PooledConnection::Https(conn) => conn.io_ref().map(AsRawFd::as_raw_fd),
+            PooledConnection::Unix(conn) => conn.io_ref().map(AsRawFd::as_raw_fd),
         }
     }
 }

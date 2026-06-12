@@ -27,7 +27,7 @@ use monoio::{
         AsyncReadRent, AsyncReadRentExt, AsyncWriteRent, AsyncWriteRentExt, IntoPollIo, Split,
         Splitable,
     },
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpStream, UnixStream},
 };
 use monoio_compat::StreamWrapper;
 use ulid::Ulid;
@@ -3892,11 +3892,7 @@ async fn reverse_proxy_request(
     head.headers = headers;
     head.version = ::http::Version::HTTP_11;
 
-    let pool_key = PoolKey::new(
-        target.host.clone(),
-        target.port,
-        matches!(target.scheme, BackendScheme::Https),
-    );
+    let pool_key = target.pool_key();
     let mut conn = match pool::take_connection(&pool_key) {
         Some(conn) => conn,
         None => match connect_backend(&target).await {
@@ -3928,6 +3924,24 @@ async fn reverse_proxy_request(
             .await?
         }
         PooledConnection::Https(codec) => {
+            proxy_over_connection(
+                codec,
+                head,
+                body,
+                reader,
+                w,
+                head_only,
+                early_response_headers,
+                metadata,
+                hook_state,
+                is_ws_request,
+                send_request_body,
+                request_body_limit,
+                encode,
+            )
+            .await?
+        }
+        PooledConnection::Unix(codec) => {
             proxy_over_connection(
                 codec,
                 head,
@@ -4031,11 +4045,7 @@ async fn reverse_proxy_request_h2(
     head.headers = headers;
     head.version = ::http::Version::HTTP_11;
 
-    let pool_key = PoolKey::new(
-        target.host.clone(),
-        target.port,
-        matches!(target.scheme, BackendScheme::Https),
-    );
+    let pool_key = target.pool_key();
     let mut conn = match pool::take_connection(&pool_key) {
         Some(conn) => conn,
         None => match connect_backend(&target).await {
@@ -4081,6 +4091,23 @@ async fn reverse_proxy_request_h2(
             )
             .await?
         }
+        PooledConnection::Unix(codec) => {
+            proxy_over_connection_h2(
+                codec,
+                head,
+                body,
+                respond,
+                head_only,
+                early_response_headers,
+                metadata,
+                hook_state,
+                chunked,
+                send_request_body,
+                request_body_limit,
+                encode,
+            )
+            .await?
+        }
     };
 
     if outcome.reuse_backend {
@@ -4095,6 +4122,10 @@ async fn reverse_proxy_request_h2(
 }
 
 pub(crate) async fn connect_backend(target: &BackendTarget) -> Result<PooledConnection> {
+    if matches!(target.scheme, BackendScheme::Unix) {
+        return connect_unix_backend(&target.host).await;
+    }
+
     thread_local! {
         static DNS_CACHE: RefCell<mini_moka::unsync::Cache<String, Arc<Vec<SocketAddr>>>> =
             RefCell::new(mini_moka::unsync::CacheBuilder::new(128)
@@ -4135,7 +4166,15 @@ pub(crate) async fn connect_backend(target: &BackendTarget) -> Result<PooledConn
             let tls_stream = connect_tls(stream, &target.host).await?;
             Ok(PooledConnection::Https(h1::H1Connection::new(tls_stream)))
         }
+        BackendScheme::Unix => unreachable!("unix backend targets are returned before DNS"),
     }
+}
+
+async fn connect_unix_backend(path: &str) -> Result<PooledConnection> {
+    UnixStream::connect(path)
+        .await
+        .map(|stream| PooledConnection::Unix(h1::H1Connection::new(stream)))
+        .map_err(|err| anyhow!("failed to connect to unix backend {path:?}: {err}"))
 }
 
 async fn connect_tls(stream: TcpStream, host: &str) -> Result<BoringStream<TcpStream>> {
@@ -5213,6 +5252,7 @@ fn header_values_contain_token(headers: &::http::HeaderMap, name: &str, token: &
 pub(crate) enum BackendScheme {
     Http,
     Https,
+    Unix,
 }
 
 pub(crate) struct BackendTarget {
@@ -5228,9 +5268,33 @@ impl BackendTarget {
     fn authority(&self) -> String {
         format_host_port(&self.host, self.port, self.is_ipv6)
     }
+
+    fn pool_key(&self) -> PoolKey {
+        match self.scheme {
+            BackendScheme::Unix => PoolKey::unix(self.host.clone()),
+            BackendScheme::Http | BackendScheme::Https => PoolKey::new(
+                self.host.clone(),
+                self.port,
+                matches!(self.scheme, BackendScheme::Https),
+            ),
+        }
+    }
 }
 
 pub(crate) fn parse_backend_target(raw: &str) -> Result<BackendTarget> {
+    if let Some(path) = raw.strip_prefix("unix/") {
+        if path.is_empty() {
+            return Err(anyhow!("backend unix socket path is empty"));
+        }
+        return Ok(BackendTarget {
+            scheme: BackendScheme::Unix,
+            host: path.to_string(),
+            is_ipv6: false,
+            port: 0,
+            base_path: String::new(),
+            base_query: None,
+        });
+    }
     let url = Url::parse(raw).map_err(|err| anyhow!("invalid backend url: {err}"))?;
     let scheme = match url.scheme() {
         "http" => BackendScheme::Http,
@@ -5664,6 +5728,24 @@ mod tests {
 
         assert!(!headers.contains_key("x-first"));
         assert!(!headers.contains_key("x-second"));
+    }
+
+    #[test]
+    fn parse_backend_target_accepts_unix_socket_dials() {
+        let target = parse_backend_target("unix//run/docker.sock").unwrap();
+        assert!(matches!(target.scheme, BackendScheme::Unix));
+        assert_eq!(target.host, "/run/docker.sock");
+        assert_eq!(target.port, 0);
+        assert_eq!(target.base_path, "");
+        assert_eq!(target.base_query, None);
+        assert_eq!(
+            build_backend_uri(&target, &"/v1.41/info?pretty=1".parse().unwrap()).unwrap(),
+            "/v1.41/info?pretty=1"
+        );
+
+        let target = parse_backend_target("unix/relative.sock").unwrap();
+        assert!(matches!(target.scheme, BackendScheme::Unix));
+        assert_eq!(target.host, "relative.sock");
     }
 
     #[test]
