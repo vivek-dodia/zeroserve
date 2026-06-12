@@ -8450,11 +8450,15 @@ async function withUpstream(): Promise<{
   port: number;
   stop: () => Promise<void>;
 }> {
-  const port = await getFreePort();
+  const controller = new AbortController();
+  let port = 0;
   const server = Deno.serve({
     hostname: "127.0.0.1",
-    port,
-    onListen: () => {},
+    port: 0,
+    signal: controller.signal,
+    onListen: ({ port: listenPort }) => {
+      port = listenPort;
+    },
   }, async (req) => {
     let bodyLength = 0;
     if (req.body !== null) {
@@ -8534,10 +8538,21 @@ async function withUpstream(): Promise<{
       { status, headers },
     );
   });
+
+  if (port === 0) {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  if (port === 0) {
+    controller.abort();
+    await server.finished;
+    throw new Error("failed to start upstream");
+  }
+
   return {
     port,
     stop: async () => {
-      await server.shutdown();
+      controller.abort();
+      await server.finished;
     },
   };
 }
