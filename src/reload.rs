@@ -138,8 +138,12 @@ fn perform_reload(
     let mut plugin_sites = Vec::with_capacity(shared.config.plugin_paths.len());
     for plugin_path in &shared.config.plugin_paths {
         plugin_sites.push(Arc::new(
-            Site::load_path(plugin_path, shared.config.max_rate_limit_buckets)
-                .with_context(|| format!("failed to reload plugin {}", plugin_path.display()))?,
+            Site::load_path(
+                plugin_path,
+                shared.config.max_rate_limit_buckets,
+                shared.config.ebpf_compiler,
+            )
+            .with_context(|| format!("failed to reload plugin {}", plugin_path.display()))?,
         ));
     }
     let site = Arc::new(

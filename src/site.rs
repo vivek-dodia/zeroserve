@@ -11,6 +11,7 @@ use anyhow::{Context, Result, bail};
 use nix::sys::memfd::{MFdFlags, memfd_create};
 use tar::{Archive, EntryType};
 
+use crate::bpf_compiler::EbpfCompiler;
 use crate::ratelimit::RateLimitManager;
 
 pub struct Site {
@@ -33,9 +34,13 @@ pub struct TarEntry {
 }
 
 impl Site {
-    pub fn load_path(path: &Path, max_rate_limit_buckets: usize) -> Result<Self> {
+    pub fn load_path(
+        path: &Path,
+        max_rate_limit_buckets: usize,
+        compiler: EbpfCompiler,
+    ) -> Result<Self> {
         if is_standalone_script_path(path) {
-            Self::load_standalone_script(path, max_rate_limit_buckets)
+            Self::load_standalone_script(path, max_rate_limit_buckets, compiler)
         } else {
             Self::load(path, max_rate_limit_buckets)
         }
@@ -121,10 +126,14 @@ impl Site {
         Self::load_from_file(file, max_rate_limit_buckets)
     }
 
-    pub fn load_standalone_script(path: &Path, max_rate_limit_buckets: usize) -> Result<Self> {
+    pub fn load_standalone_script(
+        path: &Path,
+        max_rate_limit_buckets: usize,
+        compiler: EbpfCompiler,
+    ) -> Result<Self> {
         let script_name = standalone_script_name(path)?;
         let object = if is_script_c_path(path) {
-            crate::script_compile::compile_c_path_to_object_bytes(path)
+            crate::script_compile::compile_c_path_to_object_bytes(path, compiler)
                 .with_context(|| format!("failed to compile script {}", path.display()))?
         } else {
             std::fs::read(path)

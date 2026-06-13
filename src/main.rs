@@ -412,7 +412,11 @@ fn run_worker(
 fn load_plugin_sites(config: &StaticConfig) -> Result<Vec<Arc<Site>>> {
     let mut sites = Vec::with_capacity(config.plugin_paths.len());
     for plugin_path in &config.plugin_paths {
-        let site = Arc::new(Site::load_path(plugin_path, config.max_rate_limit_buckets)?);
+        let site = Arc::new(Site::load_path(
+            plugin_path,
+            config.max_rate_limit_buckets,
+            config.ebpf_compiler,
+        )?);
         eprintln!(
             "loaded {} entries from plugin {} ({} bytes)",
             site.total_entries,

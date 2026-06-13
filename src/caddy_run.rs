@@ -128,7 +128,11 @@ pub fn load_site(config: &StaticConfig) -> Result<Site> {
             Site::load_from_bytes("zeroserve-caddy-site", bytes, config.max_rate_limit_buckets)
                 .context("failed to load in-memory caddy site tarball")
         }
-        None => Site::load_path(&config.tar_path, config.max_rate_limit_buckets),
+        None => Site::load_path(
+            &config.tar_path,
+            config.max_rate_limit_buckets,
+            config.ebpf_compiler,
+        ),
     }
 }
 
@@ -152,6 +156,10 @@ pub fn reload_site(config: &StaticConfig) -> Result<Site> {
         )
         .context("failed to load rebuilt caddy site tarball")
     } else {
-        Site::load_path(&config.tar_path, config.max_rate_limit_buckets)
+        Site::load_path(
+            &config.tar_path,
+            config.max_rate_limit_buckets,
+            config.ebpf_compiler,
+        )
     }
 }
