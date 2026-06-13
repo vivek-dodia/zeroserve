@@ -382,6 +382,7 @@ fn run_worker(
                     max_memory_footprint: config.max_request_external_memory_footprint,
                     expose_filesystem: config.expose_filesystem,
                     code_size_limit: config.script_code_size_limit,
+                    require_static_region_analysis: config.ebpf_require_static_region_analysis,
                 })
             };
             let script_runtime = Rc::new(script_runtime);

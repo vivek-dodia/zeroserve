@@ -1331,6 +1331,7 @@ pub struct ScriptRuntime {
     max_memory_footprint: u64,
     expose_filesystem: bool,
     code_size_limit: usize,
+    require_static_region_analysis: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1341,6 +1342,7 @@ pub struct ScriptRuntimeConfig {
     /// JIT code zone size per loaded program, in bytes (a non-zero multiple
     /// of 64 KiB that fits in u32).
     pub code_size_limit: usize,
+    pub require_static_region_analysis: bool,
 }
 
 impl ScriptRuntime {
@@ -1355,6 +1357,7 @@ impl ScriptRuntime {
             max_memory_footprint: config.max_memory_footprint,
             expose_filesystem: config.expose_filesystem,
             code_size_limit: config.code_size_limit,
+            require_static_region_analysis: config.require_static_region_analysis,
         }
     }
 
@@ -1365,7 +1368,8 @@ impl ScriptRuntime {
                 Arc::new(EventListener),
                 HELPER_TABLES,
             )
-            .with_code_size_limit(self.code_size_limit),
+            .with_code_size_limit(self.code_size_limit)
+            .require_static_region_analysis(self.require_static_region_analysis),
         );
         let file = site
             .tar_file

@@ -1,6 +1,6 @@
 [package]
 name = "zeroserve"
-version = "0.2.10"
+version = "0.2.11-alpha.1"
 edition = "2024"
 
 [profile.release]

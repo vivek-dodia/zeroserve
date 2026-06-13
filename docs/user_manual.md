@@ -283,6 +283,8 @@ Key options:
   (memfd). Used in place of the `SITE_TAR_OR_SCRIPT` argument.
 - `--ebpf-compiler <tcc|clang>`: Select the compiler for `.zeroserve/scripts/*.c`
   during `--pack` and generated middleware during `--caddy`. Defaults to `tcc`.
+- `--ebpf-require-static-region-analysis`: Require async-ebpf static region
+  analysis for loaded eBPF programs.
 - `--adapt-caddyfile <CADDYFILE>`: Adapt a Caddyfile to Caddy JSON and print it
   to stdout (without compiling), for inspecting the adapter output.
 - `--manual`: Print the embedded user manual to stdout.

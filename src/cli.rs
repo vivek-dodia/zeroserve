@@ -114,6 +114,10 @@ pub struct Cli {
     #[arg(long, value_enum, default_value_t = EbpfCompiler::Tcc)]
     pub ebpf_compiler: EbpfCompiler,
 
+    /// Require async-ebpf static region analysis for loaded eBPF programs.
+    #[arg(long)]
+    pub ebpf_require_static_region_analysis: bool,
+
     /// Dump the embedded SDK header to stdout.
     #[arg(long, conflicts_with_all = ["pack", "tarball", "manual"])]
     pub dump_sdk: bool,
@@ -278,5 +282,24 @@ mod tests {
             Cli::try_parse_from(["zeroserve", "--ebpf-compiler", "clang", "site.tar"]).unwrap();
 
         assert_eq!(cli.ebpf_compiler, EbpfCompiler::Clang);
+    }
+
+    #[test]
+    fn ebpf_require_static_region_analysis_defaults_to_false() {
+        let cli = Cli::try_parse_from(["zeroserve", "site.tar"]).unwrap();
+
+        assert!(!cli.ebpf_require_static_region_analysis);
+    }
+
+    #[test]
+    fn ebpf_require_static_region_analysis_can_be_enabled() {
+        let cli = Cli::try_parse_from([
+            "zeroserve",
+            "--ebpf-require-static-region-analysis",
+            "site.tar",
+        ])
+        .unwrap();
+
+        assert!(cli.ebpf_require_static_region_analysis);
     }
 }

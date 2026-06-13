@@ -37,6 +37,7 @@ pub struct StaticConfig {
     pub max_request_external_memory_footprint: u64,
     pub max_rate_limit_buckets: usize,
     pub script_code_size_limit: usize,
+    pub ebpf_require_static_region_analysis: bool,
     pub validate_hostnames: Vec<String>,
     pub ebpf_compiler: EbpfCompiler,
 }
@@ -144,6 +145,7 @@ impl TryFrom<Cli> for StaticConfig {
                 * 1024) as u64,
             max_rate_limit_buckets: cli.max_rate_limit_buckets,
             script_code_size_limit,
+            ebpf_require_static_region_analysis: cli.ebpf_require_static_region_analysis,
             validate_hostnames: cli.validate_hostnames,
             ebpf_compiler: cli.ebpf_compiler,
         })
