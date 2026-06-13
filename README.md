@@ -54,4 +54,6 @@ cd testing
 deno test -A --parallel
 ```
 
-The scripting tests require `clang` and `llc` to be available on PATH; they are skipped if the toolchain is missing.
+The scripting tests use the builtin tinycc compiler by default. Pass
+`--ebpf-compiler clang` to use clang/llc for `.zeroserve/scripts/*.c` and
+generated `--caddy` middleware instead.

@@ -1,4 +1,5 @@
 mod boringtls;
+mod bpf_compiler;
 mod caddy_compile;
 mod caddy_file;
 mod caddy_run;
@@ -23,6 +24,7 @@ mod server;
 mod shared;
 mod site;
 mod thread_pool;
+mod tinycc;
 mod tls;
 
 use std::io::Write;
@@ -143,19 +145,19 @@ fn main() -> Result<()> {
         return Ok(());
     }
     if let Some(pack_root) = args.pack.as_ref() {
-        pack::pack_site(pack_root)?;
+        pack::pack_site(pack_root, args.ebpf_compiler)?;
         return Ok(());
     }
-    // The `--caddy` flow builds the entire site in memory up front, while clang
-    // and a writable filesystem are still available (before namespace isolation).
-    // The generated middleware C and the tarball stay in memfds.
+    // The `--caddy` flow builds the entire site up front, while a writable
+    // filesystem is still available for the compiler output scratch file
+    // (before namespace isolation).
     let caddy_tarball = match args.caddy.as_ref() {
         Some(path) => {
             eprintln!(
                 "warning: --caddy forces expose-filesystem on; generated middleware \
                  may read absolute host filesystem roots referenced by the Caddyfile"
             );
-            let bytes = caddy_run::build_caddy_tarball(path)
+            let bytes = caddy_run::build_caddy_tarball(path, args.ebpf_compiler)
                 .with_context(|| format!("failed to build site from {}", path.display()))?;
             eprintln!(
                 "built in-memory caddy site from {} ({} bytes)",

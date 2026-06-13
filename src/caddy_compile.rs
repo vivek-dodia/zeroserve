@@ -328,6 +328,7 @@ pub fn compile_caddy_json_collecting(source: &str) -> Result<(String, Vec<String
         generator.line("zs_memset(route_groups, 0, sizeof(route_groups));");
     }
     generator.line(HOST_HOIST_MARKER);
+    let mut pending_cleanup_needed = false;
     for compiled in &routes {
         generator.client_ip_config = compiled.client_ip_config.clone();
         generator.named_routes = compiled.named_routes.clone();
@@ -349,7 +350,13 @@ pub fn compile_caddy_json_collecting(source: &str) -> Result<(String, Vec<String
         generator.line("{");
         generator.indent += 1;
         let matched = generator.emit_route_match(&compiled.route)?;
-        if route_match_can_set_error(&compiled.route) {
+        if match_is_statically_false(&matched) {
+            generator.indent -= 1;
+            generator.line("}");
+            continue;
+        }
+        let match_can_set_error = route_match_can_set_error(&compiled.route);
+        if match_can_set_error {
             let match_id = generator.next_id();
             generator.line(&format!("int route_match_{match_id} = ({matched});"));
             generator.emit_pending_matcher_error()?;
@@ -375,11 +382,17 @@ pub fn compile_caddy_json_collecting(source: &str) -> Result<(String, Vec<String
 
         generator.indent -= 1;
         generator.line("}");
-        generator.line("else if (zs_response_pending() != 0) {");
-        generator.indent += 1;
-        generator.line("zs_response_clear();");
-        generator.indent -= 1;
-        generator.line("}");
+        let clear_unmatched_response = match_can_set_error || pending_cleanup_needed;
+        if clear_unmatched_response {
+            generator.line("else if (zs_response_pending() != 0) {");
+            generator.indent += 1;
+            generator.line("zs_response_clear();");
+            generator.indent -= 1;
+            generator.line("}");
+        }
+        if !compiled.route.terminal && !stopped {
+            pending_cleanup_needed = true;
+        }
         generator.indent -= 1;
         generator.line("}");
     }
@@ -1663,7 +1676,13 @@ impl Generator {
         self.line("{");
         self.indent += 1;
         let matched = self.emit_route_match(route)?;
-        if route_match_can_set_error(route) {
+        if match_is_statically_false(&matched) {
+            self.indent -= 1;
+            self.line("}");
+            return Ok(());
+        }
+        let match_can_set_error = route_match_can_set_error(route);
+        if match_can_set_error {
             let match_id = self.next_id();
             self.line(&format!("int subroute_match_{match_id} = ({matched});"));
             self.emit_pending_matcher_error()?;
@@ -1818,7 +1837,11 @@ impl Generator {
 
         self.line(&format!("/* invoke named route {} */", c_comment(name)));
         let matched = self.emit_route_match(&route)?;
-        if route_match_can_set_error(&route) {
+        if match_is_statically_false(&matched) {
+            return Ok(false);
+        }
+        let match_can_set_error = route_match_can_set_error(&route);
+        if match_can_set_error {
             let match_id = self.next_id();
             self.line(&format!("int invoke_match_{match_id} = ({matched});"));
             self.emit_pending_matcher_error()?;
@@ -2112,6 +2135,9 @@ impl Generator {
         for (idx, route) in routes.iter().enumerate() {
             self.line(&format!("/* server error route {idx} */"));
             let matched = self.emit_route_match(route)?;
+            if match_is_statically_false(&matched) {
+                continue;
+            }
             self.line(&format!("if ({matched}) {{"));
             self.indent += 1;
             self.line("if (zs_response_pending() != 0) return 0;");
@@ -3381,6 +3407,9 @@ impl Generator {
         for (idx, route) in routes.iter().enumerate() {
             validate_route_fields(route, &format!("{label}.handle_response route {idx}"))?;
             let matched = self.emit_route_match(route)?;
+            if match_is_statically_false(&matched) {
+                continue;
+            }
             self.response_line(&format!("if (!{done} && {matched}) {{"));
             let grouped = self.emit_response_route_group_guard(route, label)?;
             let route_stop = format!("{}_route_stop_{}", label, self.next_id());
@@ -4454,6 +4483,45 @@ fn route_match_can_set_error(route: &Route) -> bool {
         }
     }
     false
+}
+
+fn match_is_statically_false(expr: &str) -> bool {
+    let expr: String = expr.chars().filter(|c| !c.is_whitespace()).collect();
+    if expr.contains("||") {
+        return false;
+    }
+
+    let mut inner = expr.as_str();
+    while let Some(stripped) = strip_outer_parens(inner) {
+        inner = stripped;
+    }
+
+    inner == "0"
+        || inner.starts_with("0&&")
+        || inner.ends_with("&&0")
+        || inner.contains("&&(0)")
+        || inner.contains("(0)&&")
+}
+
+fn strip_outer_parens(expr: &str) -> Option<&str> {
+    if !expr.starts_with('(') || !expr.ends_with(')') {
+        return None;
+    }
+
+    let mut depth = 0usize;
+    for (idx, ch) in expr.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 && idx != expr.len() - 1 {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+    (depth == 0).then_some(&expr[1..expr.len() - 1])
 }
 
 fn matcher_set_can_set_error(set: &MatcherSet) -> bool {
@@ -7974,7 +8042,11 @@ mod tests {
             );
 
             let c = compile_caddy_json(&source).unwrap();
-            assert!(c.contains("if ((((0)))) {"), "{matcher}: {c}");
+            assert!(c.contains("/* server srv0, route 0 */"), "{matcher}: {c}");
+            assert!(
+                !c.contains("zs_caddy_respond_static(\"204\""),
+                "{matcher}: {c}"
+            );
             assert!(!c.contains("if ((())) {"), "{matcher}: {c}");
         }
     }
@@ -10358,7 +10430,8 @@ mod tests {
         }"#;
 
         let c = compile_caddy_json(source).unwrap();
-        assert!(c.contains("if (((((0))))) {"), "{c}");
+        assert!(c.contains("/* server srv0, route 1 */"), "{c}");
+        assert!(!c.contains("zs_caddy_respond_static(\"204\""), "{c}");
         assert!(!c.contains("zs_caddy_query_present("), "{c}");
     }
 
@@ -11259,7 +11332,8 @@ mod tests {
         }"#;
 
         let c = compile_caddy_json(source).unwrap();
-        assert!(c.contains("if (((((0))))) {"), "{c}");
+        assert!(c.contains("/* server srv0, route 0 */"), "{c}");
+        assert!(!c.contains("zs_caddy_respond_static(\"204\""), "{c}");
         assert!(!c.contains("if ((())) {"), "{c}");
     }
 
