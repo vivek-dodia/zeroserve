@@ -1,16 +1,12 @@
 use std::{
     ffi::OsStr,
     fs, io,
-    path::{Component, Path, PathBuf},
-    process::{Command, Stdio},
+    path::{Component, Path},
 };
 
 use anyhow::{Context, Result, bail};
 use tar::Builder;
-use ulid::Ulid;
 
-pub const ZEROSERVE_H: &[u8] = include_bytes!("../sdk/zeroserve.h");
-pub const ZEROSERVE_CADDY_H: &[u8] = include_bytes!("../sdk/zeroserve_caddy.h");
 pub const USER_MANUAL: &str = include_str!("../docs/user_manual.md");
 
 pub fn pack_site(root: &Path) -> Result<()> {
@@ -20,27 +16,20 @@ pub fn pack_site(root: &Path) -> Result<()> {
         bail!("--pack expects a directory, got {}", root.display());
     }
 
-    let temp_dir = create_temp_dir()?;
-    let header_dir = extract_header(&temp_dir)?;
+    let work_dir = crate::script_compile::WorkDir::new("zeroserve-pack")?;
     let stdout = io::stdout();
     let mut builder = Builder::new(stdout.lock());
 
-    let result = (|| {
-        pack_dir(&mut builder, root, root, &temp_dir, &header_dir)?;
-        builder.finish().context("failed to finalize tar stream")?;
-        Ok(())
-    })();
-
-    let _ = fs::remove_dir_all(&temp_dir);
-    result
+    pack_dir(&mut builder, root, root, &work_dir)?;
+    builder.finish().context("failed to finalize tar stream")?;
+    Ok(())
 }
 
 fn pack_dir(
     builder: &mut Builder<impl io::Write>,
     root: &Path,
     dir: &Path,
-    temp_dir: &Path,
-    header_dir: &Path,
+    work_dir: &crate::script_compile::WorkDir,
 ) -> Result<()> {
     for entry in fs::read_dir(dir).with_context(|| format!("failed to read {}", dir.display()))? {
         let entry = entry.with_context(|| format!("failed to read entry in {}", dir.display()))?;
@@ -55,7 +44,7 @@ fn pack_dir(
             builder
                 .append_dir(rel, &path)
                 .with_context(|| format!("failed to append directory {}", rel.display()))?;
-            pack_dir(builder, root, &path, temp_dir, header_dir)?;
+            pack_dir(builder, root, &path, work_dir)?;
             continue;
         }
         if !file_type.is_file() {
@@ -63,13 +52,12 @@ fn pack_dir(
         }
 
         if is_script_c(rel) {
-            let compiled = compile_script(&path, temp_dir, header_dir)?;
+            let compiled = crate::script_compile::compile_c_path_to_temp_object(&path, work_dir)?;
             let mut tar_path = rel.to_path_buf();
             tar_path.set_extension("o");
             builder
                 .append_path_with_name(&compiled.obj_path, &tar_path)
                 .with_context(|| format!("failed to append {}", tar_path.display()))?;
-            compiled.cleanup();
             continue;
         }
 
@@ -114,84 +102,4 @@ fn has_extension(path: &Path, ext: &str) -> bool {
         .and_then(|s| s.to_str())
         .map(|s| s.eq_ignore_ascii_case(ext))
         .unwrap_or(false)
-}
-
-fn create_temp_dir() -> Result<PathBuf> {
-    let dir = std::env::temp_dir().join(format!("zeroserve-pack-{}", Ulid::new()));
-    fs::create_dir_all(&dir)
-        .with_context(|| format!("failed to create temp dir {}", dir.display()))?;
-    Ok(dir)
-}
-
-fn extract_header(temp_dir: &Path) -> Result<PathBuf> {
-    let header_path = temp_dir.join("zeroserve.h");
-    fs::write(&header_path, ZEROSERVE_H)
-        .with_context(|| format!("failed to write {}", header_path.display()))?;
-    let caddy_header_path = temp_dir.join("zeroserve_caddy.h");
-    fs::write(&caddy_header_path, ZEROSERVE_CADDY_H)
-        .with_context(|| format!("failed to write {}", caddy_header_path.display()))?;
-    Ok(temp_dir.to_path_buf())
-}
-
-struct CompiledScript {
-    obj_path: PathBuf,
-    bc_path: PathBuf,
-}
-
-impl CompiledScript {
-    fn cleanup(&self) {
-        let _ = fs::remove_file(&self.obj_path);
-        let _ = fs::remove_file(&self.bc_path);
-    }
-}
-
-fn compile_script(source: &Path, temp_dir: &Path, header_dir: &Path) -> Result<CompiledScript> {
-    let stem = source
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("script");
-    let unique = Ulid::new();
-    let bc_path = temp_dir.join(format!("{}-{}.bc", stem, unique));
-    let obj_path = temp_dir.join(format!("{}-{}.o", stem, unique));
-
-    let clang_status = Command::new("clang")
-        .args([
-            "-O2",
-            "-Wall",
-            "-target",
-            "bpf",
-            "-fno-builtin",
-            "-emit-llvm",
-            "-c",
-        ])
-        .arg("-I")
-        .arg(header_dir)
-        .arg(source)
-        .arg("-o")
-        .arg(&bc_path)
-        .stdout(Stdio::null())
-        .status()
-        .with_context(|| format!("failed to run clang on {}", source.display()))?;
-    if !clang_status.success() {
-        bail!("clang failed for {}", source.display());
-    }
-
-    let llc_status = Command::new("llc")
-        .args([
-            "-march=bpf",
-            "-bpf-stack-size=4096",
-            "-mcpu=v3",
-            "-filetype=obj",
-        ])
-        .arg(&bc_path)
-        .arg("-o")
-        .arg(&obj_path)
-        .stdout(Stdio::null())
-        .status()
-        .with_context(|| format!("failed to run llc on {}", source.display()))?;
-    if !llc_status.success() {
-        bail!("llc failed for {}", source.display());
-    }
-
-    Ok(CompiledScript { obj_path, bc_path })
 }

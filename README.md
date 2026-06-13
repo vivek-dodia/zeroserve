@@ -2,7 +2,8 @@
 
 Zero-config, fast `io_uring`-based HTTPS server.
 
-`zeroserve` serves a website packaged as a tarball, and handles hot-reload via SIGHUP.
+`zeroserve` serves a website packaged as a tarball, can run standalone eBPF
+`.c`/`.o` scripts directly, and handles hot-reload via SIGHUP.
 
 ## Features
 
@@ -36,7 +37,10 @@ zeroserve --addr 0.0.0.0:8080 --try-html site.tar
 # Honor PROXY protocol v1 headers (e.g. when behind a TCP load balancer)
 zeroserve --enable-proxy-protocol site.tar
 
-# Hot-reload certificate and site tarball
+# Run standalone eBPF scripts directly
+zeroserve --plugin auth.c app.o
+
+# Hot-reload certificate, site tarball, or standalone eBPF scripts
 killall -SIGHUP zeroserve
 ```
 

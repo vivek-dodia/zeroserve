@@ -3,7 +3,8 @@
 ## Overview
 
 Zeroserve is a high-performance, scriptable HTTP server that uses `io_uring` and eBPF. It
-serves a static website from a tarball, and optionally runs eBPF request scripts.
+serves a static website from a tarball, and optionally runs eBPF request scripts
+from tarballs or standalone `.c`/`.o` files.
 It supports HTTP, HTTPS, hot reload, a small templating pass for text responses, and
 an opt-in reverse proxy from scripts.
 
@@ -250,7 +251,7 @@ push side effects rather than modifying the eventual response.
 Command synopsis:
 
 ```bash
-zeroserve [OPTIONS] [SITE_TAR]
+zeroserve [OPTIONS] [SITE_TAR_OR_SCRIPT]
 ```
 
 Key options:
@@ -277,7 +278,7 @@ Key options:
   `.zeroserve/scripts/` and compiled by `--pack`.
 - `--caddy <CADDYFILE>`: Run a Caddyfile (or Caddy JSON) directly — adapt,
   compile, build an in-memory site tarball, and serve it, all in memory
-  (memfd). Used in place of the `SITE_TAR` argument.
+  (memfd). Used in place of the `SITE_TAR_OR_SCRIPT` argument.
 - `--adapt-caddyfile <CADDYFILE>`: Adapt a Caddyfile to Caddy JSON and print it
   to stdout (without compiling), for inspecting the adapter output.
 - `--manual`: Print the embedded user manual to stdout.
@@ -289,9 +290,12 @@ Key options:
 - `--expose-filesystem`: Allow generated Caddy middleware to read absolute host
   filesystem roots. Without this flag, Caddy `file` matchers and `file_server`
   handlers with absolute roots do not read the host filesystem.
-- `--plugin <PLUGIN_TAR[,PLUGIN_TAR...]>`: Load scripts from one or more
-  plugin tarballs before scripts from `SITE_TAR`. Plugin tarballs use the same
-  layout as site tarballs; eBPF objects are read from `.zeroserve/scripts/*.o`.
+- `--plugin <PLUGIN_TAR_OR_SCRIPT[,PLUGIN_TAR_OR_SCRIPT...]>`: Load scripts
+  from one or more plugin tarballs or standalone `.c`/`.o` eBPF scripts before
+  scripts from `SITE_TAR_OR_SCRIPT`. Plugin tarballs use the same layout as site
+  tarballs; eBPF objects are read from `.zeroserve/scripts/*.o`. A standalone
+  `.o` is loaded using its file name as the script name; a standalone `.c` is
+  compiled with `clang`/`llc` and loaded as `<stem>.o`.
 - `--chunk-size <BYTES>`: Streaming chunk size for tar reads (default 65536).
 - `--max-buffered-body-size-kb <KB>`: Maximum request body size in KB for script
   body reads via `zs_req_body_json` (default 256).
@@ -327,6 +331,9 @@ zeroserve --try-html --enable-proxy-protocol site.tar
 # Plugin scripts before site scripts
 zeroserve --plugin auth.tar,headers.tar site.tar
 
+# Standalone eBPF scripts without a plugin/site tarball
+zeroserve --plugin auth.c app.o
+
 # Socket activation (inherit pre-bound sockets)
 zeroserve --addr fd:3 --tls-addr fd:4 --cert cert.pem --key key.pem site.tar
 
@@ -348,12 +355,14 @@ The default index document is `index.html`, configurable via `--index`.
 
 ## Hot reload
 
-Zeroserve reloads the site tarball, scripts, and TLS configuration on:
+Zeroserve reloads the site tarball or standalone site `.c`/`.o`, plugin tarballs
+or standalone plugin `.c`/`.o` files, scripts, and TLS configuration on:
 
 - `SIGHUP` (for example: `killall -SIGHUP zeroserve`).
 - Changes to `--reload-signal-file` (polled periodically, content-based).
 
-This is useful for replacing the tarball and certificate in place without downtime.
+This is useful for replacing the tarball, standalone script, and certificate in
+place without downtime.
 
 ## TLS
 
@@ -457,9 +466,12 @@ the undecryptable case. It is enabled automatically whenever ECH is configured.
 ## Request scripting (eBPF)
 
 Zeroserve can run eBPF programs on every request. Scripts are loaded from
-`.zeroserve/scripts/*.o` inside plugin tarballs and the site tarball. Scripts in
-plugins run first, in the order given to `--plugin`; scripts inside each tarball
-run in sorted path order, followed by site scripts in sorted path order.
+`.zeroserve/scripts/*.o` inside plugin tarballs and the site tarball, or from
+standalone `.c`/`.o` files passed to `--plugin` or as `SITE_TAR_OR_SCRIPT`.
+Scripts in plugins run first, in the order given to `--plugin`; scripts inside
+each tarball run in sorted path order, standalone plugin scripts run at their
+position in the `--plugin` list, and then site scripts run. A standalone site
+script serves no static files unless the script itself responds or proxies.
 
 Flow and behavior:
 
@@ -501,21 +513,26 @@ clang -O2 -target bpf -emit-llvm -c input.c -o tmp.bc
 llc -march=bpf -bpf-stack-size=4096 -mcpu=v3 -filetype=obj tmp.bc -o out.o
 ```
 
-Put the `.o` files at `.zeroserve/scripts/` in the tarball.
+Put the `.o` files at `.zeroserve/scripts/` in the tarball, or pass a single
+`.c`/`.o` directly as a plugin or site path.
 
 ### Plugin tarballs
 
 Plugin tarballs use the same layout as site tarballs, but only their eBPF script
-objects are loaded. Static file serving and helpers such as
-`zs_load_static_json` read from the main site tarball.
+objects are loaded. `--plugin` also accepts standalone `.c`/`.o` files. Static
+file serving and helpers such as `zs_load_static_json` read from the main site
+tarball.
 
 ```bash
 zeroserve --plugin auth.tar,headers.tar site.tar
+zeroserve --plugin auth.c site.tar
+zeroserve --plugin auth.o site.tar
 ```
 
-Hot reload reloads plugin tarballs, site scripts, site files, and TLS assets
-together. If any plugin or site script fails to load during reload, Zeroserve
-keeps serving the previous site and script chain.
+Hot reload reloads plugin tarballs, standalone plugin `.c`/`.o` files, site
+scripts, site files or a standalone site `.c`/`.o`, and TLS assets together. If
+any plugin or site script fails to load during reload, Zeroserve keeps serving
+the previous site and script chain.
 
 ### Helper API overview
 
@@ -684,6 +701,7 @@ JSON parsing:
 
 - `zs_json_parse(data, data_len)` parses JSON and returns a handle (-1 on failure).
 - `zs_load_static_json(path, path_len)` reads the static file at `path` in the tarball,
+  or returns an error when the main site is a standalone script,
   parses JSON, and returns a handle (-1 if missing or invalid JSON). The path is used
   verbatim (no normalization, index fallback, or `.html` try).
 - `zs_load_file_metadata(path, path_len)` returns a JSON handle for a tarball entry
@@ -1143,5 +1161,6 @@ ExecStart=/usr/bin/zeroserve --addr fd:3 --tls-addr fd:4 --cert /etc/certs/cert.
 - TLS startup errors: `--tls-addr` requires either `--cert` plus `--key`, or
   `--cert-dir`.
 - `--pack expects a directory`: pass a directory path, not a file.
-- `tarball ... does not contain any regular files`: ensure your site has files.
+- `tarball ... does not contain any regular files`: ensure your tarball has
+  files, or pass a standalone `.c`/`.o` script.
 - Script compilation fails: verify `clang` and `llc` are on `PATH`.

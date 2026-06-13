@@ -95,10 +95,10 @@ pub struct Cli {
     #[arg(long)]
     pub expose_filesystem: bool,
 
-    /// Comma-separated plugin tarballs. Scripts from plugins run before site scripts.
+    /// Comma-separated plugin tarballs or standalone .c/.o scripts. Plugin scripts run before site scripts.
     #[arg(
         long,
-        value_name = "PLUGIN_TAR",
+        value_name = "PLUGIN_TAR_OR_SCRIPT",
         value_delimiter = ',',
         conflicts_with_all = ["pack", "dump_sdk", "manual", "gen_ech_key"]
     )]
@@ -123,7 +123,7 @@ pub struct Cli {
 
     /// Run a Caddyfile (or Caddy JSON) directly: adapt -> compile -> in-memory
     /// site tarball -> serve, with the generated middleware C and tarball kept
-    /// entirely in memory (memfd). Used in place of a SITE_TAR argument.
+    /// entirely in memory (memfd). Used in place of a SITE_TAR_OR_SCRIPT argument.
     #[arg(long, value_name = "CADDYFILE", conflicts_with_all = ["pack", "tarball", "dump_sdk", "manual", "gen_ech_key", "caddy_compile", "adapt_caddyfile"])]
     pub caddy: Option<PathBuf>,
 
@@ -149,9 +149,9 @@ pub struct Cli {
     #[arg(long, value_name = "PATH")]
     pub ech_key: Option<PathBuf>,
 
-    /// Path to the site tarball.
+    /// Path to the site tarball, or a standalone .c/.o script with no static files.
     #[arg(
-        value_name = "SITE_TAR",
+        value_name = "SITE_TAR_OR_SCRIPT",
         required_unless_present_any = ["pack", "dump_sdk", "manual", "gen_ech_key", "caddy_compile", "adapt_caddyfile", "caddy"],
         conflicts_with = "pack"
     )]

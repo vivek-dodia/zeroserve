@@ -18,6 +18,7 @@ mod pool;
 mod ratelimit;
 mod reload;
 mod script;
+mod script_compile;
 mod server;
 mod shared;
 mod site;
@@ -46,9 +47,9 @@ use crate::{
     hupwatch::HupWatcher,
     logging::spawn_file_logger,
     pack::USER_MANUAL,
-    pack::ZEROSERVE_H,
     reload::{ReloadRequest, spawn_coordinator, worker_reload_loop},
     script::{ScriptRuntime, ScriptRuntimeConfig},
+    script_compile::ZEROSERVE_H,
     server::amain,
     shared::SharedState,
     site::Site,
@@ -408,7 +409,7 @@ fn run_worker(
 fn load_plugin_sites(config: &StaticConfig) -> Result<Vec<Arc<Site>>> {
     let mut sites = Vec::with_capacity(config.plugin_paths.len());
     for plugin_path in &config.plugin_paths {
-        let site = Arc::new(Site::load(plugin_path, config.max_rate_limit_buckets)?);
+        let site = Arc::new(Site::load_path(plugin_path, config.max_rate_limit_buckets)?);
         eprintln!(
             "loaded {} entries from plugin {} ({} bytes)",
             site.total_entries,

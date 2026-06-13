@@ -1,12 +1,14 @@
 use std::{
     collections::{HashMap, HashSet},
+    ffi::{OsStr, OsString},
     fs::File as StdFile,
-    io::Read,
+    io::{Read, Seek, SeekFrom, Write},
     path::Path,
     sync::Arc,
 };
 
 use anyhow::{Context, Result, bail};
+use nix::sys::memfd::{MFdFlags, memfd_create};
 use tar::{Archive, EntryType};
 
 use crate::ratelimit::RateLimitManager;
@@ -31,6 +33,14 @@ pub struct TarEntry {
 }
 
 impl Site {
+    pub fn load_path(path: &Path, max_rate_limit_buckets: usize) -> Result<Self> {
+        if is_standalone_script_path(path) {
+            Self::load_standalone_script(path, max_rate_limit_buckets)
+        } else {
+            Self::load(path, max_rate_limit_buckets)
+        }
+    }
+
     pub fn load(path: &Path, max_rate_limit_buckets: usize) -> Result<Self> {
         let file = StdFile::open(path)
             .with_context(|| format!("failed to open tarball {}", path.display()))?;
@@ -102,6 +112,41 @@ impl Site {
         })
     }
 
+    pub fn load_from_bytes(
+        name: &str,
+        bytes: &[u8],
+        max_rate_limit_buckets: usize,
+    ) -> Result<Self> {
+        let file = memfd_from_bytes(name, bytes)?;
+        Self::load_from_file(file, max_rate_limit_buckets)
+    }
+
+    pub fn load_standalone_script(path: &Path, max_rate_limit_buckets: usize) -> Result<Self> {
+        let script_name = standalone_script_name(path)?;
+        let object = if is_script_c_path(path) {
+            crate::script_compile::compile_c_path_to_object_bytes(path)
+                .with_context(|| format!("failed to compile script {}", path.display()))?
+        } else {
+            std::fs::read(path)
+                .with_context(|| format!("failed to read script object {}", path.display()))?
+        };
+        if object.is_empty() {
+            bail!("script {} produced an empty object", path.display());
+        }
+        let tarball = script_object_tarball(&script_name, &object).with_context(|| {
+            format!(
+                "failed to build in-memory script site for {}",
+                path.display()
+            )
+        })?;
+        Self::load_from_bytes(
+            "zeroserve-standalone-script",
+            &tarball,
+            max_rate_limit_buckets,
+        )
+        .with_context(|| format!("failed to load standalone script {}", path.display()))
+    }
+
     fn get_entry_safe<'a>(&'a self, key: &str) -> Option<&'a Arc<TarEntry>> {
         if key.starts_with(".zeroserve/") {
             return None;
@@ -145,6 +190,76 @@ impl Site {
 
         None
     }
+}
+
+pub fn is_standalone_script_path(path: &Path) -> bool {
+    is_script_c_path(path) || is_script_object_path(path)
+}
+
+fn is_script_c_path(path: &Path) -> bool {
+    has_extension(path, "c")
+}
+
+fn is_script_object_path(path: &Path) -> bool {
+    has_extension(path, "o")
+}
+
+fn has_extension(path: &Path, ext: &str) -> bool {
+    path.extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.eq_ignore_ascii_case(ext))
+        .unwrap_or(false)
+}
+
+fn standalone_script_name(path: &Path) -> Result<OsString> {
+    if is_script_c_path(path) {
+        let stem = path
+            .file_stem()
+            .ok_or_else(|| anyhow::anyhow!("script source path has no file stem"))?;
+        let mut name = stem.to_os_string();
+        name.push(".o");
+        Ok(name)
+    } else {
+        path.file_name()
+            .map(OsStr::to_os_string)
+            .ok_or_else(|| anyhow::anyhow!("script object path has no file name"))
+    }
+}
+
+fn script_object_tarball(file_name: &OsStr, object: &[u8]) -> Result<Vec<u8>> {
+    let script_path = Path::new(".zeroserve")
+        .join("scripts")
+        .join(Path::new(file_name));
+    let mut builder = tar::Builder::new(Vec::new());
+    let mut header = tar::Header::new_gnu();
+    header
+        .set_path(&script_path)
+        .with_context(|| format!("invalid script object path {}", script_path.display()))?;
+    header.set_size(object.len() as u64);
+    header.set_mode(0o644);
+    header.set_mtime(0);
+    header.set_entry_type(tar::EntryType::Regular);
+    header.set_cksum();
+    builder
+        .append(&header, object)
+        .context("failed to append script object to tar")?;
+    builder
+        .into_inner()
+        .context("failed to finalize script object tar")
+}
+
+/// Build a fresh in-memory file seeded with `bytes`, for use as a tarball
+/// backing file. The returned file is seekable and supports positional reads.
+pub fn memfd_from_bytes(name: &str, bytes: &[u8]) -> Result<StdFile> {
+    let cname = std::ffi::CString::new(name).expect("memfd name has no interior NUL");
+    let fd = memfd_create(cname.as_c_str(), MFdFlags::MFD_CLOEXEC)
+        .with_context(|| format!("memfd_create({name}) failed"))?;
+    let mut file = StdFile::from(fd);
+    file.write_all(bytes)
+        .context("failed to write bytes into memfd")?;
+    file.seek(SeekFrom::Start(0))
+        .context("failed to rewind memfd")?;
+    Ok(file)
 }
 
 #[derive(Clone)]

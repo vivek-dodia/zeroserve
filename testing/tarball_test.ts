@@ -2,6 +2,7 @@ import { assert, assertEquals } from "@std/assert";
 import { join } from "@std/path";
 import {
   checkExited,
+  compileScriptObject,
   delay,
   getZeroservePath,
   hasBpfToolchain,
@@ -139,6 +140,123 @@ zs_u64 entry(void) {
   },
 });
 
+Deno.test({
+  name: "e2e: direct script objects load as plugins and site and reload",
+  ignore: !canRunScripts,
+  fn: async () => {
+    const tempDir = await Deno.makeTempDir();
+    const pluginPath = join(tempDir, "10-plugin.o");
+    const replacementPluginPath = join(tempDir, "10-plugin-v2.o");
+    const sitePath = join(tempDir, "20-site.o");
+    const replacementSitePath = join(tempDir, "20-site-v2.o");
+    let proc: ZeroserveProc | null = null;
+    try {
+      await compileScriptObject(pluginObjectSource("plugin-v1"), pluginPath);
+      await compileScriptObject(
+        pluginObjectSource("plugin-v2"),
+        replacementPluginPath,
+      );
+      await compileScriptObject(siteObjectSource("site-v1"), sitePath);
+      await compileScriptObject(siteObjectSource("site-v2"), replacementSitePath);
+
+      proc = await spawnZeroserve(["--plugin", pluginPath, sitePath], {
+        quiet: true,
+      });
+      const port = proc.httpPort;
+
+      await assertDirectObjectResponse(port, "site-v1:plugin-v1");
+
+      await Deno.rename(replacementPluginPath, pluginPath);
+      proc.child.kill("SIGHUP");
+      await waitForDirectObjectResponse(
+        proc,
+        "site-v1:plugin-v2",
+        "plugin object reload",
+      );
+
+      await Deno.rename(replacementSitePath, sitePath);
+      proc.child.kill("SIGHUP");
+      await waitForDirectObjectResponse(
+        proc,
+        "site-v2:plugin-v2",
+        "site object reload",
+      );
+
+      await Deno.writeTextFile(sitePath, "not an elf object\n");
+      proc.child.kill("SIGHUP");
+      for (let i = 0; i < 20; i++) {
+        const exited = await checkExited(proc.statusPromise);
+        assert(
+          exited === null,
+          `zeroserve exited during failed site object reload with code ${exited?.code}`,
+        );
+        await assertDirectObjectResponse(port, "site-v2:plugin-v2");
+        await delay(100);
+      }
+    } finally {
+      if (proc) {
+        await proc.stop();
+      }
+      await Deno.remove(tempDir, { recursive: true }).catch(() => {});
+    }
+  },
+});
+
+Deno.test({
+  name: "e2e: direct C scripts compile as plugins and site and reload",
+  ignore: !canRunScripts,
+  fn: async () => {
+    const tempDir = await Deno.makeTempDir();
+    const pluginPath = join(tempDir, "10-plugin.c");
+    const sitePath = join(tempDir, "20-site.c");
+    let proc: ZeroserveProc | null = null;
+    try {
+      await Deno.writeTextFile(pluginPath, pluginObjectSource("plugin-c-v1"));
+      await Deno.writeTextFile(sitePath, siteObjectSource("site-c-v1"));
+
+      proc = await spawnZeroserve(["--plugin", pluginPath, sitePath], {
+        quiet: true,
+      });
+      const port = proc.httpPort;
+
+      await assertDirectObjectResponse(port, "site-c-v1:plugin-c-v1");
+
+      await Deno.writeTextFile(pluginPath, pluginObjectSource("plugin-c-v2"));
+      proc.child.kill("SIGHUP");
+      await waitForDirectObjectResponse(
+        proc,
+        "site-c-v1:plugin-c-v2",
+        "plugin C reload",
+      );
+
+      await Deno.writeTextFile(sitePath, siteObjectSource("site-c-v2"));
+      proc.child.kill("SIGHUP");
+      await waitForDirectObjectResponse(
+        proc,
+        "site-c-v2:plugin-c-v2",
+        "site C reload",
+      );
+
+      await Deno.writeTextFile(sitePath, "this is not valid C\n");
+      proc.child.kill("SIGHUP");
+      for (let i = 0; i < 20; i++) {
+        const exited = await checkExited(proc.statusPromise);
+        assert(
+          exited === null,
+          `zeroserve exited during failed site C reload with code ${exited?.code}`,
+        );
+        await assertDirectObjectResponse(port, "site-c-v2:plugin-c-v2");
+        await delay(100);
+      }
+    } finally {
+      if (proc) {
+        await proc.stop();
+      }
+      await Deno.remove(tempDir, { recursive: true }).catch(() => {});
+    }
+  },
+});
+
 Deno.test("e2e: refuses to start when a script object fails to load", async () => {
   const siteDir = await Deno.makeTempDir();
   let tarPath: string | null = null;
@@ -259,6 +377,83 @@ zs_u64 entry(void) {
 }
 `,
   );
+}
+
+function pluginObjectSource(version: string): string {
+  return `#include <zeroserve.h>
+
+ZS_ENTRY
+zs_u64 entry(void) {
+  char path[64];
+  zs_req_path(path, sizeof(path));
+  if (zs_strcmp(path, "/direct-object") == 0) {
+    zs_meta_set(ZS_STR("direct-plugin"), ZS_STR("${version}"));
+  }
+  return 0;
+}
+`;
+}
+
+function siteObjectSource(version: string): string {
+  return `#include <zeroserve.h>
+
+ZS_ENTRY
+zs_u64 entry(void) {
+  char path[64];
+  zs_req_path(path, sizeof(path));
+  if (zs_strcmp(path, "/direct-object") != 0) {
+    return 0;
+  }
+
+  char plugin[32];
+  zs_s64 plugin_len = zs_meta_get(ZS_STR("direct-plugin"), plugin, sizeof(plugin));
+  if (plugin_len <= 0) {
+    zs_respond(500, ZS_STR("plugin did not run\\n"));
+    return 0;
+  }
+
+  char body[64];
+  zs_u64 pos = 0;
+  const char prefix[] = "${version}:";
+  for (zs_u64 i = 0; i < sizeof(prefix) - 1 && pos < sizeof(body); i++) {
+    body[pos++] = prefix[i];
+  }
+  for (zs_u64 i = 0; i < 32 && i < (zs_u64)plugin_len && pos < sizeof(body); i++) {
+    body[pos++] = plugin[i];
+  }
+  zs_respond(200, body, pos);
+  return 0;
+}
+`;
+}
+
+async function assertDirectObjectResponse(
+  port: number,
+  expected: string,
+): Promise<void> {
+  const res = await fetch(`http://127.0.0.1:${port}/direct-object`);
+  assertEquals(res.status, 200);
+  assertEquals(await res.text(), expected);
+}
+
+async function waitForDirectObjectResponse(
+  proc: ZeroserveProc,
+  expected: string,
+  label: string,
+): Promise<void> {
+  for (let i = 0; i < 30; i++) {
+    const exited = await checkExited(proc.statusPromise);
+    assert(
+      exited === null,
+      `zeroserve exited during ${label} with code ${exited?.code}`,
+    );
+    const res = await fetch(`http://127.0.0.1:${proc.httpPort}/direct-object`);
+    if (res.status === 200 && await res.text() === expected) {
+      return;
+    }
+    await delay(100);
+  }
+  await assertDirectObjectResponse(proc.httpPort, expected);
 }
 
 async function assertPluginVersion(

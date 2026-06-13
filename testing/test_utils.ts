@@ -21,6 +21,43 @@ export async function packSite(siteRoot: string): Promise<string> {
   return tarPath;
 }
 
+export async function compileScriptObject(
+  source: string,
+  objectPath: string,
+): Promise<void> {
+  const sourcePath = await Deno.makeTempFile({ suffix: ".c" });
+  const bcPath = await Deno.makeTempFile({ suffix: ".bc" });
+  try {
+    await Deno.writeTextFile(sourcePath, source);
+    await runCommand("clang", [
+      "-O2",
+      "-Wall",
+      "-target",
+      "bpf",
+      "-fno-builtin",
+      "-emit-llvm",
+      "-c",
+      "-I",
+      join(repoRoot, "sdk"),
+      sourcePath,
+      "-o",
+      bcPath,
+    ]);
+    await runCommand("llc", [
+      "-march=bpf",
+      "-bpf-stack-size=4096",
+      "-mcpu=v3",
+      "-filetype=obj",
+      bcPath,
+      "-o",
+      objectPath,
+    ]);
+  } finally {
+    await Deno.remove(sourcePath).catch(() => {});
+    await Deno.remove(bcPath).catch(() => {});
+  }
+}
+
 export interface ZeroserveProc {
   child: Deno.ChildProcess;
   statusPromise: Promise<Deno.CommandStatus>;
