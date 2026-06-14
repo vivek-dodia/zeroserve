@@ -39,6 +39,7 @@ const TINYCC_SOURCES: &[&str] = &[
 const TINYCC_COMMIT: &str = "afcb3aa1a59568fec8b4bb604e43686723e34c94";
 const TINYCC_ZIP_URL: &str =
     "https://github.com/losfair/tinycc/archive/afcb3aa1a59568fec8b4bb604e43686723e34c94.zip";
+const TINYCC_BUILD_CACHE_VERSION: &str = "1";
 
 fn main() {
     // Generate the Caddyfile block-interior parser from the lalrpop grammar.
@@ -56,10 +57,30 @@ fn link_tinycc() {
     println!("cargo:rerun-if-env-changed=CC");
     println!("cargo:rerun-if-env-changed=CFLAGS");
 
+    let target = env::var("TARGET").expect("TARGET is set by Cargo");
+    let host = env::var("HOST").expect("HOST is set by Cargo");
+    emit_target_tool_rerun_hints(&target);
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by Cargo"));
-    let tinycc_source_dir = env::var_os("ZEROSERVE_TINYCC_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| fetch_default_tinycc(&out_dir));
+    let toolchain = TinyccToolchain::new(&host, &target);
+    let archive = out_dir.join("libzeroserve_tinycc_bpf.a");
+    let configured_tinycc_dir = env::var_os("ZEROSERVE_TINYCC_DIR").map(PathBuf::from);
+
+    // The default tinycc source is immutable because it is addressed by commit.
+    // Keep the already-built archive when the pinned commit and build inputs
+    // are unchanged. A user-provided source directory may change in place, so
+    // it keeps the previous always-rebuild behavior.
+    let cache_key = configured_tinycc_dir
+        .is_none()
+        .then(|| tinycc_build_cache_key(&host, &target, &toolchain));
+    if cache_key
+        .as_deref()
+        .is_some_and(|key| tinycc_build_cache_is_current(&out_dir, &archive, key))
+    {
+        emit_tinycc_link_directives(&out_dir);
+        return;
+    }
+
+    let tinycc_source_dir = configured_tinycc_dir.unwrap_or_else(|| fetch_default_tinycc(&out_dir));
     if !tinycc_source_dir.join("Makefile").exists() {
         panic!(
             "tinycc source directory not found at {}; set ZEROSERVE_TINYCC_DIR",
@@ -67,11 +88,7 @@ fn link_tinycc() {
         );
     }
 
-    let target = env::var("TARGET").expect("TARGET is set by Cargo");
-    let host = env::var("HOST").expect("HOST is set by Cargo");
-    emit_target_tool_rerun_hints(&target);
     let tinycc_dir = stage_tinycc_source(&tinycc_source_dir, &out_dir, &target);
-    let toolchain = TinyccToolchain::new(&host, &target);
     configure_tinycc(&tinycc_dir, &target, &toolchain);
     generate_tinycc_predefs(&tinycc_dir, &toolchain);
 
@@ -90,14 +107,62 @@ fn link_tinycc() {
         panic!("failed to build BPF tinycc in {}", tinycc_dir.display());
     }
 
-    let archive = out_dir.join("libzeroserve_tinycc_bpf.a");
     build_archive(&archive, &tinycc_dir);
+    if let Some(key) = cache_key {
+        write_tinycc_build_cache_key(&out_dir, &key);
+    }
 
+    emit_tinycc_link_directives(&out_dir);
+}
+
+fn emit_tinycc_link_directives(out_dir: &Path) {
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static=zeroserve_tinycc_bpf");
     println!("cargo:rustc-link-lib=m");
     println!("cargo:rustc-link-lib=dl");
     println!("cargo:rustc-link-lib=pthread");
+}
+
+fn tinycc_build_cache_key(host: &str, target: &str, toolchain: &TinyccToolchain) -> String {
+    format!(
+        "\
+version={TINYCC_BUILD_CACHE_VERSION}
+commit={TINYCC_COMMIT}
+host={host}
+target={target}
+target_cc={}
+target_ar={}
+host_cc={}
+ar={}
+cflags={}
+objects={}
+sources={}
+",
+        toolchain.target_cc,
+        toolchain.target_ar,
+        make_command_for_cc_tool(&toolchain.host_cc),
+        env::var("AR").unwrap_or_default(),
+        env::var("CFLAGS").unwrap_or_default(),
+        TINYCC_OBJECTS.join(","),
+        TINYCC_SOURCES.join(","),
+    )
+}
+
+fn tinycc_build_cache_is_current(out_dir: &Path, archive: &Path, cache_key: &str) -> bool {
+    let archive_exists = archive.metadata().is_ok_and(|metadata| metadata.len() > 0);
+    archive_exists
+        && fs::read_to_string(tinycc_build_cache_key_path(out_dir))
+            .is_ok_and(|cached| cached == cache_key)
+}
+
+fn write_tinycc_build_cache_key(out_dir: &Path, cache_key: &str) {
+    let path = tinycc_build_cache_key_path(out_dir);
+    fs::write(&path, cache_key)
+        .unwrap_or_else(|err| panic!("failed to write {}: {err}", path.display()));
+}
+
+fn tinycc_build_cache_key_path(out_dir: &Path) -> PathBuf {
+    out_dir.join("tinycc-build-cache.key")
 }
 
 fn fetch_default_tinycc(out_dir: &Path) -> PathBuf {
@@ -174,7 +239,7 @@ impl TinyccToolchain {
             .or_else(|| zig_cc_for_glibc_target(target))
             .unwrap_or_else(|| {
                 make_command_for_cc_tool(
-                    cc::Build::new()
+                    &cc::Build::new()
                         .host(host)
                         .target(&cargo_target)
                         .get_compiler(),
@@ -249,7 +314,7 @@ fn zig_cc_for_glibc_target(target: &str) -> Option<String> {
     Some(format!("zig cc -target {zig_arch}-linux-gnu.{version}"))
 }
 
-fn make_command_for_cc_tool(tool: cc::Tool) -> String {
+fn make_command_for_cc_tool(tool: &cc::Tool) -> String {
     let mut parts = vec![shell_quote(tool.path().as_os_str())];
     parts.extend(tool.args().iter().map(|arg| shell_quote(arg.as_os_str())));
     parts.join(" ")
