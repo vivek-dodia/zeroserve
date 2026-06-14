@@ -6,6 +6,7 @@ use std::{
     pin::Pin,
     rc::Rc,
     sync::Arc,
+    task::Poll,
     time::{Duration, Instant},
 };
 
@@ -554,8 +555,12 @@ impl ScriptRequest {
     }
 
     pub fn header(&self, name: &str) -> Option<&str> {
-        let name = name.to_ascii_lowercase();
-        self.headers.get(&name).map(String::as_str)
+        if name.bytes().all(|b| !b.is_ascii_uppercase()) {
+            self.headers.get(name).map(String::as_str)
+        } else {
+            let name = name.to_ascii_lowercase();
+            self.headers.get(&name).map(String::as_str)
+        }
     }
 
     pub fn query_param(&self, name: &str) -> Option<&str> {
@@ -1131,6 +1136,8 @@ pub struct ScriptOutcome {
     pub response: Option<ScriptResponse>,
     pub request_body_limit: Option<usize>,
     pub reverse_proxy: Option<String>,
+    pub caddy_reverse_proxy: bool,
+    pub caddy_default_forwarded: bool,
     pub file_server: Option<CaddyFileServer>,
     /// Streaming response compression requested by an `encode` handler, applied
     /// by the response-writing path against the request's `Accept-Encoding`.
@@ -1152,6 +1159,8 @@ impl ScriptOutcome {
             response: None,
             request_body_limit: None,
             reverse_proxy: None,
+            caddy_reverse_proxy: false,
+            caddy_default_forwarded: false,
             file_server: None,
             encode: None,
         }
@@ -1175,6 +1184,8 @@ pub struct ScriptExecutionContext {
     pub response: Option<ScriptResponse>,
     pub request_body_limit: Rc<Cell<Option<usize>>>,
     pub reverse_proxy: Option<String>,
+    pub caddy_reverse_proxy: bool,
+    pub caddy_default_forwarded: bool,
     pub file_server: Option<CaddyFileServer>,
     /// Streaming response compression config recorded by `zs_caddy_encode`.
     pub encode: Option<crate::helpers::compress::EncodeConfig>,
@@ -1249,6 +1260,8 @@ impl ScriptExecutionContext {
             response: None,
             request_body_limit,
             reverse_proxy: None,
+            caddy_reverse_proxy: false,
+            caddy_default_forwarded: false,
             file_server: None,
             encode: None,
             script_name,
@@ -1304,6 +1317,8 @@ impl ScriptExecutionContext {
         self.abort = true;
         self.response = None;
         self.reverse_proxy = None;
+        self.caddy_reverse_proxy = false;
+        self.caddy_default_forwarded = false;
         self.file_server = None;
         self.encode = None;
     }
@@ -1500,6 +1515,8 @@ impl ScriptRuntime {
                 response: None,
                 request_body_limit: Rc::new(Cell::new(None)),
                 reverse_proxy: None,
+                caddy_reverse_proxy: false,
+                caddy_default_forwarded: false,
                 file_server: None,
                 encode: None,
                 script_name: name.clone(),
@@ -1837,6 +1854,8 @@ async fn run_request_scripts_with_state(
             response: None,
             request_body_limit: None,
             reverse_proxy: None,
+            caddy_reverse_proxy: false,
+            caddy_default_forwarded: false,
             file_server: None,
             encode: None,
         };
@@ -1851,10 +1870,12 @@ async fn run_request_scripts_with_state(
     let request_body_limit: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
     let mut response: Option<ScriptResponse> = None;
     let mut reverse_proxy: Option<String> = None;
+    let mut caddy_reverse_proxy = false;
+    let mut caddy_default_forwarded = false;
     let mut encode: Option<crate::helpers::compress::EncodeConfig> = None;
     let preemption = PreemptionEnabled::new(t);
 
-    'sections: for section in [SCRIPT_TLS_ENTRYPOINT, SCRIPT_ENTRYPOINT] {
+    'sections: for section in [SCRIPT_ENTRYPOINT] {
         for (name, program) in scripts.iter() {
             if !program.has_section(section) {
                 continue;
@@ -1872,6 +1893,8 @@ async fn run_request_scripts_with_state(
                 response: None,
                 request_body_limit: request_body_limit.clone(),
                 reverse_proxy: None,
+                caddy_reverse_proxy: false,
+                caddy_default_forwarded: false,
                 file_server: None,
                 encode: None,
                 script_name: name.clone(),
@@ -1937,6 +1960,8 @@ async fn run_request_scripts_with_state(
                     }),
                     request_body_limit: request_body_limit.get(),
                     reverse_proxy: None,
+                    caddy_reverse_proxy: false,
+                    caddy_default_forwarded: false,
                     file_server: None,
                     encode: None,
                 };
@@ -1954,6 +1979,8 @@ async fn run_request_scripts_with_state(
                     response,
                     request_body_limit: request_body_limit.get(),
                     reverse_proxy,
+                    caddy_reverse_proxy,
+                    caddy_default_forwarded,
                     file_server: None,
                     encode: None,
                 };
@@ -1969,6 +1996,8 @@ async fn run_request_scripts_with_state(
             }
             if let Some(proxy_url) = ctx.reverse_proxy {
                 reverse_proxy = Some(proxy_url);
+                caddy_reverse_proxy = ctx.caddy_reverse_proxy;
+                caddy_default_forwarded = ctx.caddy_default_forwarded;
                 break 'sections;
             }
             if let Some(file_server) = ctx.file_server {
@@ -1984,6 +2013,8 @@ async fn run_request_scripts_with_state(
                     response,
                     request_body_limit: request_body_limit.get(),
                     reverse_proxy,
+                    caddy_reverse_proxy,
+                    caddy_default_forwarded,
                     file_server: Some(file_server),
                     encode,
                 };
@@ -2003,6 +2034,8 @@ async fn run_request_scripts_with_state(
         response,
         request_body_limit: request_body_limit.get(),
         reverse_proxy,
+        caddy_reverse_proxy,
+        caddy_default_forwarded,
         file_server: None,
         encode,
     }
@@ -2112,7 +2145,15 @@ impl Timeslicer for MonoioTimeslicer {
     }
 
     fn yield_now(&self) -> impl Future<Output = ()> {
-        monoio::time::sleep(Duration::from_millis(0))
+        let yielded = Cell::new(false);
+        std::future::poll_fn(move |cx| {
+            if yielded.replace(true) {
+                Poll::Ready(())
+            } else {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        })
     }
 }
 

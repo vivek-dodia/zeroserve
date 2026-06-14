@@ -119,6 +119,10 @@ impl<'a> ResponseHookState<'a> {
         }
     }
 
+    pub(super) fn has_hooks(&self) -> bool {
+        !self.hooks.is_empty()
+    }
+
     pub(super) async fn run(
         &self,
         status: StatusCode,
@@ -595,7 +599,7 @@ pub(super) fn populate_reverse_proxy_response_state(
     status: StatusCode,
     raw_status_text: Option<&str>,
     headers: &mut ::http::HeaderMap,
-    upstream_latency: Duration,
+    upstream_latency: Option<Duration>,
 ) {
     populate_reverse_proxy_response_metadata(
         hook_state,
@@ -611,7 +615,7 @@ pub(super) async fn prepare_reverse_proxy_raw_h1_response_headers(
     status: StatusCode,
     raw_status_text: Option<&str>,
     headers: &mut ::http::HeaderMap,
-    upstream_latency: Duration,
+    upstream_latency: Option<Duration>,
     early_response_headers: Option<&::http::HeaderMap>,
     metadata: &HashMap<String, String>,
 ) -> RawResponseHookOutcome {
@@ -637,7 +641,7 @@ pub(super) async fn prepare_reverse_proxy_response_headers(
     status: StatusCode,
     raw_status_text: Option<&str>,
     headers: &mut ::http::HeaderMap,
-    upstream_latency: Duration,
+    upstream_latency: Option<Duration>,
     early_response_headers: Option<&::http::HeaderMap>,
     metadata: &HashMap<String, String>,
 ) -> ResponseHookOutcome {
@@ -683,7 +687,7 @@ pub(super) fn populate_reverse_proxy_response_metadata(
     status: StatusCode,
     raw_status_text: Option<&str>,
     headers: &::http::HeaderMap,
-    upstream_latency: Duration,
+    upstream_latency: Option<Duration>,
 ) {
     let Some(hook_state) = hook_state else {
         return;
@@ -704,14 +708,16 @@ pub(super) fn populate_reverse_proxy_response_metadata(
         })
         .unwrap_or_else(|| status.as_u16().to_string());
     metadata.insert("http.reverse_proxy.status_text".to_string(), status_text);
-    metadata.insert(
-        "http.reverse_proxy.upstream.latency".to_string(),
-        caddy_duration_string(upstream_latency),
-    );
-    metadata.insert(
-        "http.reverse_proxy.upstream.latency_ms".to_string(),
-        caddy_duration_ms_string(upstream_latency),
-    );
+    if let Some(upstream_latency) = upstream_latency {
+        metadata.insert(
+            "http.reverse_proxy.upstream.latency".to_string(),
+            caddy_duration_string(upstream_latency),
+        );
+        metadata.insert(
+            "http.reverse_proxy.upstream.latency_ms".to_string(),
+            caddy_duration_ms_string(upstream_latency),
+        );
+    }
 
     let mut grouped = BTreeMap::<String, Vec<String>>::new();
     for (name, value) in headers.iter() {
@@ -855,9 +861,22 @@ fn script_request_wire_uri(request: &ScriptRequest) -> String {
 pub(super) fn reverse_proxy_uses_caddy_headers(
     metadata: &HashMap<String, String>,
     hook_state: Option<&ResponseHookState<'_>>,
+    caddy_reverse_proxy: bool,
 ) -> bool {
-    caddy_proxy_metadata_value(metadata, hook_state, "zs.caddy.reverse_proxy").as_deref()
-        == Some("1")
+    caddy_reverse_proxy
+        || caddy_proxy_metadata_value(metadata, hook_state, "zs.caddy.reverse_proxy").as_deref()
+            == Some("1")
+}
+
+pub(super) fn reverse_proxy_uses_default_forwarded(
+    metadata: &HashMap<String, String>,
+    hook_state: Option<&ResponseHookState<'_>>,
+    caddy_default_forwarded: bool,
+) -> bool {
+    caddy_default_forwarded
+        || caddy_proxy_metadata_value(metadata, hook_state, "zs.caddy.reverse_proxy.forwarded")
+            .as_deref()
+            == Some("default")
 }
 
 pub(super) fn prepare_reverse_proxy_request_headers_h1(
@@ -868,10 +887,26 @@ pub(super) fn prepare_reverse_proxy_request_headers_h1(
     scheme: Scheme,
     metadata: &HashMap<String, String>,
     hook_state: Option<&ResponseHookState<'_>>,
+    caddy_reverse_proxy: bool,
+    caddy_default_forwarded: bool,
 ) {
-    strip_reverse_proxy_request_headers(headers, websocket, metadata, hook_state);
+    strip_reverse_proxy_request_headers(
+        headers,
+        websocket,
+        metadata,
+        hook_state,
+        caddy_reverse_proxy,
+    );
     super::apply_proxy_request_headers(headers, body);
-    finish_reverse_proxy_request_headers(headers, peer, scheme, metadata, hook_state);
+    finish_reverse_proxy_request_headers(
+        headers,
+        peer,
+        scheme,
+        metadata,
+        hook_state,
+        caddy_reverse_proxy,
+        caddy_default_forwarded,
+    );
 }
 
 pub(super) fn prepare_reverse_proxy_request_headers_h2(
@@ -881,10 +916,20 @@ pub(super) fn prepare_reverse_proxy_request_headers_h2(
     scheme: Scheme,
     metadata: &HashMap<String, String>,
     hook_state: Option<&ResponseHookState<'_>>,
+    caddy_reverse_proxy: bool,
+    caddy_default_forwarded: bool,
 ) -> bool {
-    strip_reverse_proxy_request_headers(headers, false, metadata, hook_state);
+    strip_reverse_proxy_request_headers(headers, false, metadata, hook_state, caddy_reverse_proxy);
     let chunked = super::apply_proxy_request_headers_h2(headers, has_body);
-    finish_reverse_proxy_request_headers(headers, peer, scheme, metadata, hook_state);
+    finish_reverse_proxy_request_headers(
+        headers,
+        peer,
+        scheme,
+        metadata,
+        hook_state,
+        caddy_reverse_proxy,
+        caddy_default_forwarded,
+    );
     chunked
 }
 
@@ -893,11 +938,12 @@ fn strip_reverse_proxy_request_headers(
     websocket: bool,
     metadata: &HashMap<String, String>,
     hook_state: Option<&ResponseHookState<'_>>,
+    caddy_reverse_proxy: bool,
 ) {
     super::strip_proxy_request_hop_headers(
         headers,
         websocket,
-        reverse_proxy_uses_caddy_headers(metadata, hook_state),
+        reverse_proxy_uses_caddy_headers(metadata, hook_state, caddy_reverse_proxy),
     );
 }
 
@@ -907,8 +953,18 @@ fn finish_reverse_proxy_request_headers(
     scheme: Scheme,
     metadata: &HashMap<String, String>,
     hook_state: Option<&ResponseHookState<'_>>,
+    caddy_reverse_proxy: bool,
+    caddy_default_forwarded: bool,
 ) {
-    apply_reverse_proxy_forwarded_headers(headers, peer, scheme, metadata, hook_state);
+    apply_reverse_proxy_forwarded_headers(
+        headers,
+        peer,
+        scheme,
+        metadata,
+        hook_state,
+        caddy_reverse_proxy,
+        caddy_default_forwarded,
+    );
 }
 
 fn apply_reverse_proxy_forwarded_headers(
@@ -917,9 +973,35 @@ fn apply_reverse_proxy_forwarded_headers(
     scheme: Scheme,
     metadata: &HashMap<String, String>,
     hook_state: Option<&ResponseHookState<'_>>,
+    caddy_reverse_proxy: bool,
+    caddy_default_forwarded: bool,
 ) {
-    if !reverse_proxy_uses_caddy_headers(metadata, hook_state) {
+    if reverse_proxy_uses_default_forwarded(metadata, hook_state, caddy_default_forwarded) {
+        apply_caddy_default_forwarded_headers(headers, peer, scheme);
+        return;
+    }
+    if !reverse_proxy_uses_caddy_headers(metadata, hook_state, caddy_reverse_proxy) {
         apply_caddy_forwarded_headers(headers, peer, scheme);
+    }
+}
+
+fn apply_caddy_default_forwarded_headers(
+    headers: &mut ::http::HeaderMap,
+    peer: std::net::SocketAddr,
+    scheme: Scheme,
+) {
+    if let Ok(value) = ::http::HeaderValue::from_str(&peer.ip().to_string()) {
+        headers.insert("x-forwarded-for", value);
+    }
+    if let Ok(value) = ::http::HeaderValue::from_str(scheme.as_str()) {
+        headers.insert("x-forwarded-proto", value);
+    }
+    let host = headers
+        .get(::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    if let Ok(value) = ::http::HeaderValue::from_str(host) {
+        headers.insert("x-forwarded-host", value);
     }
 }
 
