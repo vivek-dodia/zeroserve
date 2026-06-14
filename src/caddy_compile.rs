@@ -1929,7 +1929,18 @@ impl Generator {
                 for (idx, route) in routes.iter().enumerate() {
                     validate_route_fields(route, &format!("subroute route {idx}"))?;
                 }
-                let previous_error_routes = std::mem::replace(&mut self.error_routes, error_routes);
+                // A subroute with its own error routes handles errors locally; a
+                // subroute without them propagates errors to the enclosing (server
+                // or parent subroute) error routes, matching Caddy's subroute
+                // semantics. Replacing them with an empty list would drop
+                // server-level handle_errors for errors raised inside the subroute
+                // (e.g. the `error` directive or a zeroserve_call error action),
+                // emitting a bare status response instead of the error page.
+                let previous_error_routes = if error_routes.is_empty() {
+                    self.error_routes.clone()
+                } else {
+                    std::mem::replace(&mut self.error_routes, error_routes)
+                };
                 let previous_fallthrough = self.error_routes_fallthrough;
                 self.error_routes_fallthrough = true;
                 let result = self.emit_subroute_routes(&routes);
@@ -8679,6 +8690,29 @@ mod tests {
         let c = compile_caddy_json(source).unwrap();
         assert!(c.contains("zs_caddy_respond(\"{http.vars.status}\""));
         assert!(!c.contains("not-body"));
+    }
+
+    #[test]
+    fn subroute_errors_inherit_enclosing_error_routes() {
+        // An error raised inside a `route {}` subroute that has no error routes of
+        // its own must propagate to the server-level handle_errors routes, not
+        // collapse into a bare status response.
+        let source = r#"{
+          "apps": {"http": {"servers": {"srv0": {"routes": [{
+            "handle": [{"handler": "subroute", "routes": [{
+              "handle": [{"handler": "error", "status_code": 401, "error": "denied"}]
+            }]}]
+          }],
+          "errors": {"routes": [{
+            "handle": [{"handler": "static_response", "status_code": "{http.error.status_code}", "body": "handled"}]
+          }]}}}}}
+        }"#;
+
+        let c = compile_caddy_json(source).unwrap();
+        // The subroute error sets error metadata and inlines the server error
+        // route (its "handled" body) rather than emitting a bare 401.
+        assert!(c.contains("zs_caddy_set_error(\"401\""), "{c}");
+        assert!(c.contains("handled"), "{c}");
     }
 
     #[test]
