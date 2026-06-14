@@ -3,8 +3,8 @@
 Zero-config, fast, scriptable `io_uring` HTTPS server.
 
 `zeroserve` serves a website packaged as a single tarball, runs sandboxed eBPF
-request scripts (written in C, compiled with a built-in compiler — or clang for
-more optimized builds), and can
+request scripts (written in C, compiled with builtin [tinycc with eBPF backend patch](https://github.com/losfair/tinycc/tree/ebpf) -
+or clang for more optimized builds), and can
 compile and serve a [Caddy](https://caddyserver.com/) config directly. It hot
 reloads on `SIGHUP`, leaves no temporary files on disk, and hardens itself with
 Linux namespaces and capability dropping.
@@ -20,11 +20,12 @@ Linux namespaces and capability dropping.
 - **eBPF request scripting.** Inspect and rewrite requests, generate responses,
   reverse-proxy, rate-limit, do crypto, sign AWS SigV4 requests, and gate the
   site behind OAuth2/OIDC login — all from small C scripts compiled to eBPF and
-  JIT-executed per request. A built-in [tinycc](https://bellard.org/tcc/)
-  backend means no external toolchain is required (clang/llc is also supported).
+  JIT-executed per request. The builtin tinycc-ebpf
+  backend means no external toolchain is required - but clang/llc is also supported
+  for more optimal C-to-eBPF compilation.
 - **Caddy compatibility.** Adapt a Caddyfile (or Caddy JSON) to a zeroserve
   script and serve it in one command. See [`CADDY_COMPAT.md`](CADDY_COMPAT.md).
-- **Modern TLS.** TLS via BoringSSL, SNI certificate selection from a directory,
+- **Modern TLS.** TLS 1.3 via BoringSSL, SNI certificate selection from a directory,
   and Encrypted Client Hello (ECH) with key rotation and transparent relay
   fallback.
 - **Hardened runtime.** Linux namespace isolation, capability dropping, and an
@@ -56,8 +57,7 @@ cargo build --release --locked
 # binary at target/release/zeroserve
 ```
 
-> zeroserve is Linux-only: it relies on `io_uring`, namespaces, capabilities,
-> and eBPF program loading.
+> zeroserve is Linux-only because it relies on `io_uring`.
 
 ## Quick start
 
