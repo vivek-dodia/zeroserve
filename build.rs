@@ -36,9 +36,9 @@ const TINYCC_SOURCES: &[&str] = &[
     "config.h",
 ];
 
-const TINYCC_COMMIT: &str = "17caf669f03c80fcd4499aa2d4fd1ffc3ec5f153";
+const TINYCC_COMMIT: &str = "9638f31722ef55ef012d9a2da276cb0bcdabc72f";
 const TINYCC_ZIP_URL: &str =
-    "https://github.com/losfair/tinycc/archive/17caf669f03c80fcd4499aa2d4fd1ffc3ec5f153.zip";
+    "https://github.com/losfair/tinycc/archive/9638f31722ef55ef012d9a2da276cb0bcdabc72f.zip";
 
 fn main() {
     // Generate the Caddyfile block-interior parser from the lalrpop grammar.
