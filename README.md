@@ -3,8 +3,7 @@
 Zero-config, fast, scriptable `io_uring` HTTPS server.
 
 `zeroserve` serves a website packaged as a single tarball, runs sandboxed eBPF
-request scripts (written in C, compiled with builtin [tinycc with eBPF backend patch](https://github.com/losfair/tinycc/tree/ebpf) -
-or clang for more optimized builds), and can
+request scripts JIT-compiled to native code, and can
 compile and serve a [Caddy](https://caddyserver.com/) config directly. It hot
 reloads on `SIGHUP`, leaves no temporary files on disk, and hardens itself with
 Linux namespaces and capability dropping.
@@ -19,10 +18,12 @@ Linux namespaces and capability dropping.
   no temp files.
 - **eBPF request scripting.** Inspect and rewrite requests, generate responses,
   reverse-proxy, rate-limit, do crypto, sign AWS SigV4 requests, and gate the
-  site behind OAuth2/OIDC login — all from small C scripts compiled to eBPF and
-  JIT-executed per request. The builtin tinycc-ebpf
-  backend means no external toolchain is required - but clang/llc is also supported
-  for more optimal C-to-eBPF compilation.
+  site behind OAuth2/OIDC login - all from small eBPF scripts (written in C, or if you prefer, Rust)
+  JIT-compiled to native code on load and executed per request.
+  It's preferred to feed zeroserve tarballs with precompiled eBPF `.o` files,
+  but it also accepts raw `.c` files - zeroserve has a built-in
+  [tinycc with eBPF backend patch](https://github.com/losfair/tinycc/tree/ebpf)
+  so it can compile C to eBPF on the fly.
 - **Caddy compatibility.** Adapt a Caddyfile (or Caddy JSON) to a zeroserve
   script and serve it in one command. See [`CADDY_COMPAT.md`](CADDY_COMPAT.md).
 - **Modern TLS.** TLS 1.3 via BoringSSL, SNI certificate selection from a directory,
@@ -144,6 +145,44 @@ helper reference, and [`examples/`](examples/) for runnable scripts.
 
 > Generating scripts is easiest via the `zeroserve-script-create` workflow, or
 > by hand against `sdk/zeroserve.h`.
+
+## Script sandboxing: the pointer cage
+
+Request scripts are compiled to eBPF and JIT-executed **in-process**, in the
+same address space as the server. The pointer cage — provided by the
+[async-ebpf](https://github.com/losfair/async-ebpf) runtime — is the memory
+isolation boundary that makes this safe: a buggy or malicious script cannot read
+or write any memory outside its own sandbox, no matter how it computes a pointer.
+
+It works by confining every guest memory access to a fixed, power-of-two-sized
+window of virtual memory:
+
+- **Caged layout.** Each program gets one anonymous mapping, initially
+  `PROT_NONE`, carved into a read/write **stack** region (per-invocation) and a
+  read-only **data** region (the linked program image), separated and surrounded
+  by **guard regions**. The guard sizes are randomized per program (ASLR-style),
+  and the whole window is padded to a power of two with a one-page margin on each
+  side to absorb the maximum load/store displacement.
+- **Branchless pointer masking.** The JIT (a patched [uBPF](https://github.com/iovisor/ubpf))
+  rewrites every load and store address to `(address & mask) + offset` before the
+  native access, where `mask = window_size - 1` and `offset` is the window base.
+  Because the window is a power of two, _any_ pointer — however the script
+  arithmetic produced it — is forced back inside the cage. The transform is
+  branchless, so there is no mis-speculatable path for a transient out-of-bounds
+  read (Spectre-v1).
+- **Guard pages catch escapes.** A masked pointer that lands in a guard region
+  hits `PROT_NONE` memory and faults. A `SIGSEGV` handler translates the faulting
+  native address back to a guest offset and turns it into a clean, contained
+  program fault instead of a server crash or an escape.
+- **Immutable code and data.** After linking, the data/code region is frozen to
+  read-only (`mprotect`), and the JIT confines **all stores to the stack region**
+  regardless of analysis hints — so a script can never modify its own code or the
+  shared data region.
+
+Static region analysis is layered on top as a _performance_ optimization (it
+lets confidently-classified loads skip one of two region probes), but it is
+explicitly **not** a security boundary — the JIT always retains a single-region
+bounds check, so the cage holds even if the analysis is imprecise.
 
 ## Caddy compatibility
 
