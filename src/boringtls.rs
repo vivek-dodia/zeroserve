@@ -21,7 +21,7 @@ use boring::asn1::Asn1Time;
 use boring::ex_data::Index;
 use boring::ssl::{
     AlpnError, ClientHello, ErrorCode, HandshakeError, NameType, SelectCertError, Ssl,
-    SslConnector, SslContext, SslContextBuilder, SslFiletype, SslMethod, SslStream,
+    SslConnector, SslContext, SslContextBuilder, SslFiletype, SslMethod, SslRef, SslStream,
     SslStreamBuilder, SslVerifyMode, SslVersion, select_next_proto,
 };
 use boring::x509::{X509, X509Ref};
@@ -346,8 +346,10 @@ impl BoringAcceptor {
 
     /// Like `accept`, but for script-selected acceptors: when the handshake
     /// pauses for certificate selection, `selector` is run with the
-    /// (lowercased) SNI and its decision resumes the handshake. `Ok(None)`
-    /// falls back to the default identity; `Err` rejects the connection.
+    /// (lowercased) SNI and its decision resumes the handshake. The decision is
+    /// the selected context (`Ok((None, _))` falls back to the default identity;
+    /// `Err` rejects the connection) plus whether to request a client
+    /// certificate for this connection (the SNI matched a `client_auth` policy).
     pub async fn accept_with_cert_selector<IO, F, Fut>(
         &self,
         io: IO,
@@ -356,7 +358,7 @@ impl BoringAcceptor {
     where
         IO: AsyncReadRent + AsyncWriteRent,
         F: FnOnce(Option<String>) -> Fut,
-        Fut: Future<Output = Result<Option<SslContext>>>,
+        Fut: Future<Output = Result<(Option<SslContext>, bool)>>,
     {
         let ssl = Ssl::new(&self.ctx).context("Ssl::new")?;
         let mid = SslStreamBuilder::new(ssl, MemBridge::new()).setup_accept();
@@ -366,7 +368,7 @@ impl BoringAcceptor {
 
 /// Selector for acceptors that never pause for certificate selection (their
 /// callbacks never return `RETRY`); reaching it indicates a logic error.
-async fn reject_cert_selector(_sni: Option<String>) -> Result<Option<SslContext>> {
+async fn reject_cert_selector(_sni: Option<String>) -> Result<(Option<SslContext>, bool)> {
     Err(anyhow!(
         "TLS handshake paused for certificate selection on a static acceptor"
     ))
@@ -413,9 +415,10 @@ fn configure_server_context(
     install_server_identity(builder, identity)
 }
 
-/// Server context settings shared by every acceptor variant: TLS 1.3 only,
-/// h2/http1.1 ALPN, and optional client certificates (verification is done by
-/// the script layer, not BoringSSL).
+/// Server context settings shared by every acceptor variant: TLS 1.3 only and
+/// h2/http1.1 ALPN. Client certificates are *not* requested here — the default
+/// `SslVerifyMode::NONE` keeps the server from sending a TLS `CertificateRequest`
+/// unless a flow that supports client auth opts in via [`request_client_cert`].
 fn configure_base_server_context(builder: &mut SslContextBuilder) -> Result<()> {
     builder
         .set_min_proto_version(Some(SslVersion::TLS1_3))
@@ -426,8 +429,20 @@ fn configure_base_server_context(builder: &mut SslContextBuilder) -> Result<()> 
     builder.set_alpn_select_callback(|_ssl, client| {
         select_next_proto(ALPN_WIRE, client).ok_or(AlpnError::NOACK)
     });
-    builder.set_verify_callback(SslVerifyMode::PEER, |_, _| true);
     Ok(())
+}
+
+/// Ask this connection's client for a certificate (TLS `CertificateRequest`)
+/// while unconditionally accepting whatever it presents — actual client
+/// certificate verification is performed by the script layer
+/// (`zs_caddy_tls_client_auth`), not BoringSSL. Driven per connection by the
+/// `--caddy` flow: the eBPF TLS section signals, for the connection's SNI,
+/// whether a `client_auth` policy applies, and only then is this called. It runs
+/// while the handshake is paused at the ClientHello (before the server's flight,
+/// so the request is included) and survives the subsequent `set_ssl_context`
+/// certificate swap, which copies only the certificate, not the verify mode.
+fn request_client_cert(ssl: &mut SslRef) {
+    ssl.set_verify_callback(SslVerifyMode::PEER, |_, _| true);
 }
 
 /// Build a standalone server context for `identity`, configured like the
@@ -533,7 +548,7 @@ async fn drive_handshake<IO, F, Fut>(
 where
     IO: AsyncReadRent + AsyncWriteRent,
     F: FnOnce(Option<String>) -> Fut,
-    Fut: Future<Output = Result<Option<SslContext>>>,
+    Fut: Future<Output = Result<(Option<SslContext>, bool)>>,
 {
     let mut selector = Some(selector);
     // Snapshot of the peer's first flight (the ClientHello on the server path),
@@ -564,10 +579,17 @@ where
                     .ssl()
                     .servername(NameType::HOST_NAME)
                     .map(str::to_ascii_lowercase);
-                let decision = selector(sni)
+                let (decision, request_cc) = selector(sni)
                     .await
                     .context("TLS certificate selection failed")?;
                 m.ssl_mut().set_ex_data(cert_select_ex_index(), decision);
+                // Set the client-certificate request now, while the handshake is
+                // still paused before the server's flight. The later
+                // `set_ssl_context` cert swap copies only the certificate, so the
+                // verify mode set here persists into the CertificateRequest.
+                if request_cc {
+                    request_client_cert(m.ssl_mut());
+                }
                 mid = m;
             }
             Err(HandshakeError::WouldBlock(mut m)) => {

@@ -111,8 +111,11 @@ pub fn h_caddy_tls_client_auth(
     let config = parse_json_cached::<CaddyTlsClientAuthConfig>(scope, config_ptr, config_len)?;
     with_ectx(scope, |ctx| {
         // During the pre-handshake TLS section run the client certificate has
-        // not been received yet; enforcement happens on the request-phase run.
-        if ctx.tls_select.is_some() {
+        // not been received yet: signal that this connection's SNI wants one so
+        // the acceptor sends a CertificateRequest. Enforcement happens on the
+        // request-phase run.
+        if let Some(select) = &ctx.tls_select {
+            select.request_client_cert.set(true);
             return Ok(1);
         }
         let request = ctx.request.borrow();

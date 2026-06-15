@@ -30,22 +30,6 @@ function bytesToBase64Url(bytes: Uint8Array): string {
     return base64ToBase64Url(bytesToBase64(bytes));
 }
 
-function pemToDerBytes(pem: string): Uint8Array {
-    const base64 = pem
-        .split(/\r?\n/)
-        .filter((line) => !line.startsWith("-----") && line.length > 0)
-        .join("");
-    return Uint8Array.from(atob(base64), (ch) => ch.charCodeAt(0));
-}
-
-async function sha256Hex(bytes: Uint8Array): Promise<string> {
-    const input = new ArrayBuffer(bytes.byteLength);
-    new Uint8Array(input).set(bytes);
-    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", input));
-    return Array.from(digest, (byte) => byte.toString(16).padStart(2, "0"))
-        .join("");
-}
-
 async function startBackend(
     handler: (req: Request) => Response | Promise<Response>,
 ): Promise<{ url: string; close: () => Promise<void> }> {
@@ -692,6 +676,9 @@ Deno.test({
                         }
                     },
                 );
+                // Without client_auth configured, the server never sends a TLS
+                // CertificateRequest, so a client that *offers* a certificate is
+                // still not asked for one — zeroserve sees no client cert.
                 await withZeroserveTls(
                     tarPath,
                     cert.certPath,
@@ -699,7 +686,6 @@ Deno.test({
                     async (_httpUrl, httpsUrl) => {
                         const caCert = await Deno.readTextFile(cert.certPath);
                         const key = await Deno.readTextFile(cert.keyPath);
-                        const expectedFingerprint = await sha256Hex(pemToDerBytes(caCert));
                         const client = Deno.createHttpClient({
                             caCerts: [caCert],
                             cert: caCert,
@@ -710,21 +696,11 @@ Deno.test({
                             assertEquals(res.status, 200);
                             const body = (await res.json()) as {
                                 tls_client: {
-                                    certificate: {
-                                        fingerprint_sha256: string;
-                                        subject: string;
-                                        issuer: string;
-                                        serial: string;
-                                    } | null;
+                                    certificate: unknown;
                                     chain_fingerprints_sha256: string[];
                                 };
                             };
-                            assertEquals(body.tls_client.certificate?.subject, "CN=localhost");
-                            assertEquals(body.tls_client.certificate?.issuer, "CN=localhost");
-                            assertEquals(
-                                body.tls_client.certificate?.fingerprint_sha256,
-                                expectedFingerprint,
-                            );
+                            assertEquals(body.tls_client.certificate, null);
                             assertEquals(
                                 body.tls_client.chain_fingerprints_sha256,
                                 [],

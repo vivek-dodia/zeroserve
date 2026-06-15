@@ -1478,18 +1478,19 @@ impl ScriptRuntime {
         sni: Option<String>,
         peer: std::net::SocketAddr,
         local: std::net::SocketAddr,
-    ) -> anyhow::Result<Option<SslContext>> {
+    ) -> anyhow::Result<(Option<SslContext>, bool)> {
         let scripts = (*self.scripts.borrow()).clone();
         if !scripts
             .iter()
             .any(|(_, program)| program.has_section(SCRIPT_TLS_ENTRYPOINT))
         {
-            return Ok(None);
+            return Ok((None, false));
         }
 
         let select = Rc::new(TlsCertSelect {
             runtime: tls,
             chosen: RefCell::new(None),
+            request_client_cert: Cell::new(false),
         });
         let request = Rc::new(RefCell::new(ScriptRequest::for_tls_handshake(
             peer, local, sni,
@@ -1568,7 +1569,7 @@ impl ScriptRuntime {
         }
 
         let chosen = select.chosen.borrow_mut().take();
-        Ok(chosen)
+        Ok((chosen, select.request_client_cert.get()))
     }
 
     pub async fn run_request(

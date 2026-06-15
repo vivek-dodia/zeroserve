@@ -651,64 +651,78 @@ impl Generator {
             .filter(|policy| policy.certificate_selection.is_some())
             .cloned()
             .collect::<Vec<_>>();
-        if !certificate_policies.is_empty() {
-            self.line("ZS_TLS_ENTRY");
-            self.line("zs_u64 caddy_tls(void) {");
+        let client_auth_policies = self.client_auth_policies();
+        if certificate_policies.is_empty() && client_auth_policies.is_empty() {
+            self.blank();
+            return Ok(());
+        }
+
+        self.line("ZS_TLS_ENTRY");
+        self.line("zs_u64 caddy_tls(void) {");
+        self.indent += 1;
+        self.emit_caddy_tls_sni_setup();
+
+        for policy in certificate_policies {
+            let condition = tls_policy_sni_condition(&policy);
+            self.line(&format!("if ({condition}) {{"));
             self.indent += 1;
-            self.line("char caddy_tls_sni[256];");
+            let selection = normalize_tls_certificate_selection(
+                policy
+                    .certificate_selection
+                    .as_ref()
+                    .expect("certificate policy must have selection"),
+            )?;
             self.line(&format!(
-                "zs_s64 caddy_tls_sni_raw = zs_caddy_expand({}, {}, caddy_tls_sni, sizeof(caddy_tls_sni));",
-                c_str("{http.request.tls.server_name}"),
-                "{http.request.tls.server_name}".len()
+                "if (zs_caddy_tls_certificate({}, {}, {}, {}) == 0) {{",
+                c_str(&selection.certificate),
+                selection.certificate.len(),
+                c_str(&selection.key),
+                selection.key.len()
             ));
-            self.line("zs_u64 caddy_tls_sni_len = zs_caddy_clamp_len(caddy_tls_sni_raw, sizeof(caddy_tls_sni));");
-
-            for policy in certificate_policies {
-                let condition = tls_policy_sni_condition(&policy);
-                self.line(&format!("if ({condition}) {{"));
-                self.indent += 1;
-                let selection = normalize_tls_certificate_selection(
-                    policy
-                        .certificate_selection
-                        .as_ref()
-                        .expect("certificate policy must have selection"),
-                )?;
-                self.line(&format!(
-                    "if (zs_caddy_tls_certificate({}, {}, {}, {}) == 0) {{",
-                    c_str(&selection.certificate),
-                    selection.certificate.len(),
-                    c_str(&selection.key),
-                    selection.key.len()
-                ));
-                self.indent += 1;
-                self.line("zs_abort();");
-                self.line("return 0;");
-                self.indent -= 1;
-                self.line("}");
-                self.indent -= 1;
-                self.line("}");
-            }
-
+            self.indent += 1;
+            self.line("zs_abort();");
             self.line("return 0;");
             self.indent -= 1;
             self.line("}");
+            self.indent -= 1;
+            self.line("}");
         }
+
+        // Running the client-auth check during the handshake makes the helper
+        // request a client certificate for matching SNIs (it returns 1 here, so
+        // never aborts); the request-phase run below enforces it.
+        self.emit_tls_client_auth_checks(&client_auth_policies)?;
+
+        self.line("return 0;");
+        self.indent -= 1;
+        self.line("}");
 
         self.blank();
         Ok(())
     }
 
     fn emit_tls_request_checks(&mut self) -> Result<()> {
-        let client_auth_policies = self
-            .tls_connection_policies
-            .iter()
-            .filter(|policy| policy.client_authentication.is_some())
-            .cloned()
-            .collect::<Vec<_>>();
+        let client_auth_policies = self.client_auth_policies();
         if client_auth_policies.is_empty() {
             return Ok(());
         }
 
+        self.emit_caddy_tls_sni_setup();
+        self.emit_tls_client_auth_checks(&client_auth_policies)?;
+
+        self.blank();
+        Ok(())
+    }
+
+    fn client_auth_policies(&self) -> Vec<TlsConnectionPolicy> {
+        self.tls_connection_policies
+            .iter()
+            .filter(|policy| policy.client_authentication.is_some())
+            .cloned()
+            .collect()
+    }
+
+    fn emit_caddy_tls_sni_setup(&mut self) {
         self.line("char caddy_tls_sni[256];");
         self.line(&format!(
             "zs_s64 caddy_tls_sni_raw = zs_caddy_expand({}, {}, caddy_tls_sni, sizeof(caddy_tls_sni));",
@@ -716,9 +730,14 @@ impl Generator {
             "{http.request.tls.server_name}".len()
         ));
         self.line("zs_u64 caddy_tls_sni_len = zs_caddy_clamp_len(caddy_tls_sni_raw, sizeof(caddy_tls_sni));");
+    }
 
+    fn emit_tls_client_auth_checks(
+        &mut self,
+        client_auth_policies: &[TlsConnectionPolicy],
+    ) -> Result<()> {
         for policy in client_auth_policies {
-            let condition = tls_policy_sni_condition(&policy);
+            let condition = tls_policy_sni_condition(policy);
             self.line(&format!("if ({condition}) {{"));
             self.indent += 1;
             let auth = normalize_tls_client_auth(
@@ -741,8 +760,6 @@ impl Generator {
             self.indent -= 1;
             self.line("}");
         }
-
-        self.blank();
         Ok(())
     }
 
@@ -9384,7 +9401,7 @@ mod tests {
     }
 
     #[test]
-    fn compiles_tls_client_auth_policy_into_request_entry() {
+    fn compiles_tls_client_auth_policy_into_tls_and_request_entries() {
         let source = r#"{
           "apps": {"http": {"servers": {"srv0": {
             "tls_connection_policies": [{
@@ -9403,9 +9420,12 @@ mod tests {
         }"#;
 
         let c = compile_caddy_json(source).unwrap();
-        assert!(!c.contains("ZS_TLS_ENTRY"), "{c}");
+        // The check is emitted into the TLS entrypoint (so the matching SNI
+        // requests a client certificate during the handshake) and the request
+        // entrypoint (which enforces it after the handshake).
+        assert!(c.contains("ZS_TLS_ENTRY"), "{c}");
         assert!(c.contains("ZS_ENTRY"), "{c}");
-        assert!(c.contains("zs_caddy_tls_client_auth"), "{c}");
+        assert_eq!(c.matches("zs_caddy_tls_client_auth").count(), 2, "{c}");
         assert!(c.contains("zs_abort();"), "{c}");
         assert!(c.contains("example.com"), "{c}");
         assert!(c.contains("/tmp/client-ca.pem"), "{c}");

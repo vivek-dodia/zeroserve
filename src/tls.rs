@@ -1,5 +1,5 @@
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
@@ -64,6 +64,10 @@ impl TlsRuntime {
 pub struct TlsCertSelect {
     pub runtime: Arc<TlsRuntime>,
     pub chosen: RefCell<Option<SslContext>>,
+    /// Set by `zs_caddy_tls_client_auth` during the pre-handshake TLS section
+    /// run when this connection's SNI matches a `client_auth` policy: the
+    /// acceptor then requests a client certificate for the handshake.
+    pub request_client_cert: Cell<bool>,
 }
 
 pub fn load_tls_if_configured(config: &Arc<StaticConfig>) -> Result<Option<TlsRuntime>> {
