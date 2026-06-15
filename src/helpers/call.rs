@@ -7,7 +7,7 @@ use crate::{
     json::JsonRef,
     script::{
         MAX_CALL_DEPTH, MonoioTimeslicer, ResponseHook, SCRIPT_CALL_SECTION_PREFIX,
-        ScriptExecutionContext, default_timeslice, read_utf8, with_ectx,
+        ScriptExecutionContext, ScriptResponse, default_timeslice, read_utf8, with_ectx,
     },
 };
 
@@ -26,6 +26,47 @@ enum CallError {
     CalleeError,
     /// The callee returned a handle that is not a live JSON object.
     BadReturn,
+}
+
+fn call_action(value: &serde_json::Value) -> Option<&str> {
+    value
+        .as_object()
+        .and_then(|obj| obj.get("action"))
+        .and_then(serde_json::Value::as_str)
+}
+
+fn response_to_caddy_call_action(response: ScriptResponse) -> Result<serde_json::Value, CallError> {
+    let body = String::from_utf8(response.body).map_err(|_| CallError::BadReturn)?;
+    let mut headers = serde_json::Map::new();
+    if let Some(content_type) = response.content_type {
+        headers.insert(
+            "content-type".to_string(),
+            serde_json::Value::Array(vec![serde_json::Value::String(content_type)]),
+        );
+    }
+    for (name, value) in response.headers {
+        headers
+            .entry(name)
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+            .as_array_mut()
+            .ok_or(CallError::BadReturn)?
+            .push(serde_json::Value::String(value));
+    }
+
+    let mut out = serde_json::Map::new();
+    out.insert(
+        "action".to_string(),
+        serde_json::Value::String("respond".to_string()),
+    );
+    out.insert(
+        "status".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(response.status)),
+    );
+    out.insert("body".to_string(), serde_json::Value::String(body));
+    if !headers.is_empty() {
+        out.insert("headers".to_string(), serde_json::Value::Object(headers));
+    }
+    Ok(serde_json::Value::Object(out))
 }
 
 /// `zs_call(script, script_len, func, func_len, json_handle)` — invoke another
@@ -159,11 +200,31 @@ pub fn h_call(
             if ret < 0 {
                 return Err(CallError::CalleeError);
             }
-            callee
+            let value = callee
                 .extobj::<JsonRef>(ret as u64)
                 .map_err(|_| CallError::BadReturn)?
                 .view(|v| v.clone())
-                .map_err(|_| CallError::BadReturn)
+                .map_err(|_| CallError::BadReturn)?;
+
+            if call_action(&value) == Some("adopt_response") {
+                if let Some(response) = callee.response {
+                    return response_to_caddy_call_action(response);
+                }
+                if let Some(url) = callee.reverse_proxy {
+                    return Ok(serde_json::json!({
+                        "action": "proxy",
+                        "url": url,
+                    }));
+                }
+                if callee.abort {
+                    return Ok(serde_json::json!({
+                        "action": "abort",
+                    }));
+                }
+                return Err(CallError::BadReturn);
+            }
+
+            Ok(value)
         }
         .await;
 

@@ -80,6 +80,15 @@ ZS_CALL_ENTRY(mutate, input) {
   return out;
 }
 
+/* sdk_respond: call a native terminal response helper, then ask zs_call to
+ * translate that callee-local response into a Caddy adoptable action. */
+ZS_CALL_ENTRY(sdk_respond, input) {
+  zs_respond(202, ZS_STR("sdk response\\n"));
+  zs_s64 out = zs_json_new_object();
+  set_action(out, "adopt_response");
+  return out;
+}
+
 /* proxy: terminal reverse-proxy to input.config.url. */
 ZS_CALL_ENTRY(proxy, input) {
   char url[256];
@@ -258,6 +267,27 @@ Deno.test({
     } finally {
       await backend.close();
     }
+  },
+});
+
+Deno.test({
+  name: "e2e: zeroserve_call can adopt a native helper response from the callee",
+  ignore: !canRunScripts,
+  fn: async () => {
+    await withGate(
+      `:80 {
+  route {
+    zeroserve_call gate sdk_respond
+    respond "fallback" 200
+  }
+}
+`,
+      async (baseUrl) => {
+        const res = await fetch(`${baseUrl}/anything`);
+        assertEquals(res.status, 202);
+        assertEquals(await res.text(), "sdk response\n");
+      },
+    );
   },
 });
 

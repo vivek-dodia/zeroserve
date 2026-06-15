@@ -127,6 +127,11 @@ The callable returns a JSON object with one of these actions:
 - `{ "action": "abort" }`: close the request without a response.
 - `{ "action": "error", "status": 401, "message": "unauthorized" }`: set
   Caddy error metadata and enter generated Caddy error-route handling.
+- `{ "action": "adopt_response" }`: opt in to converting the callee's
+  terminal SDK output into one of the actions above. This is intended for
+  native helpers such as OIDC that produce redirects, cookies, or static
+  responses by writing to the callee response slot. Without this explicit action,
+  a callee's response and reverse-proxy slots remain local to the call.
 
 Unknown actions, malformed return JSON, a missing target script/function, or a
 callee trap should be treated as handler failure. If the server has Caddy error
@@ -135,12 +140,13 @@ the generated error flow; otherwise it should emit a direct `500` response. This
 matches the existing principle that unsupported or failed generated behavior is
 not silently ignored.
 
-The bridge should not change `zs_call`'s call isolation rules. Today a callee's
-response/reverse-proxy slot is intentionally local to that call, while request
-mutation, metadata, and response-hook registration are shared by reference. The
-route bridge should preserve that behavior: generated Caddy middleware uses
-`zs_call` to get the callee's JSON result, then adopts only the explicit action
-encoded in that JSON result.
+The bridge should not change `zs_call`'s call isolation rules by default. A
+callee's response/reverse-proxy slot is intentionally local to that call, while
+request mutation, metadata, and response-hook registration are shared by
+reference. The route bridge preserves that behavior unless the callee returns
+`{ "action": "adopt_response" }`, in which case `zs_call` converts the
+callee-local terminal output into an explicit Caddy action for
+`zs_caddy_adopt_call_result`.
 
 The action can be adopted in one of two ways:
 
