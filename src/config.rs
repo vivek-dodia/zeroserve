@@ -16,6 +16,7 @@ pub struct StaticConfig {
     /// source Caddyfile for diagnostics.
     pub caddy_tarball: Option<Arc<Vec<u8>>>,
     pub plugin_paths: Vec<PathBuf>,
+    pub plugin_dir_paths: Vec<PathBuf>,
     pub cert_path: Option<PathBuf>,
     pub key_path: Option<PathBuf>,
     pub cert_dir_path: Option<PathBuf>,
@@ -120,6 +121,7 @@ impl TryFrom<Cli> for StaticConfig {
             tar_path,
             caddy_tarball: None,
             plugin_paths: cli.plugin,
+            plugin_dir_paths: cli.plugin_dir,
             cert_path,
             key_path,
             cert_dir_path,

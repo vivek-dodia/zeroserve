@@ -100,6 +100,7 @@ zeroserve auth.c
 
 # Run plugin scripts before the site's own scripts
 zeroserve --plugin auth.c,metrics.o site.tar
+zeroserve --plugin-dir ./plugins/auth site.tar
 
 # Inherit a pre-bound socket (socket activation)
 zeroserve --addr fd:3 site.tar

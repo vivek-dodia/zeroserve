@@ -169,6 +169,7 @@ impl BodySource {
 static SCRIPT_HELPERS: &[(&str, Helper)] = &[
     ("zs_log", helpers::h_log),
     ("zs_now_ms", helpers::h_now_ms),
+    ("zs_version", helpers::h_version),
     ("zs_env_get", helpers::h_env_get),
     ("zs_getrandom", helpers::h_getrandom),
     ("zs_sha256", helpers::h_sha256),

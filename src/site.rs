@@ -156,6 +156,17 @@ impl Site {
         .with_context(|| format!("failed to load standalone script {}", path.display()))
     }
 
+    pub fn load_directory(
+        path: &Path,
+        max_rate_limit_buckets: usize,
+        compiler: EbpfCompiler,
+    ) -> Result<Self> {
+        let tarball = crate::pack::pack_site_to_vec(path, compiler)
+            .with_context(|| format!("failed to pack directory {}", path.display()))?;
+        Self::load_from_bytes("zeroserve-directory-site", &tarball, max_rate_limit_buckets)
+            .with_context(|| format!("failed to load directory {}", path.display()))
+    }
+
     fn get_entry_safe<'a>(&'a self, key: &str) -> Option<&'a Arc<TarEntry>> {
         if key.starts_with(".zeroserve/") {
             return None;

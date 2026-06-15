@@ -37,8 +37,8 @@ proxy behavior, response hooks, variables, maps, and basic authentication.
 zeroserve has two distinct middleware worlds:
 
 - Caddy-compatible middleware generated from Caddy JSON/Caddyfile input.
-- Native zeroserve eBPF scripts loaded from plugin/site tarballs or standalone
-  `.c`/`.o` files.
+- Native zeroserve eBPF scripts loaded from plugin/site tarballs, plugin
+  directories, or standalone `.c`/`.o` files.
 
 The compatibility goal is to make those worlds compose without pretending that
 native eBPF scripts are Caddy modules. Caddy semantics should remain
@@ -49,8 +49,8 @@ normal zeroserve SDK.
 
 The current loader is already useful for coarse interop:
 
-- `--plugin a.tar,b.c --caddy Caddyfile` runs plugin scripts before generated
-  `caddy.o`.
+- `--plugin a.tar,b.c --plugin-dir ./plugins/auth --caddy Caddyfile` runs
+  plugin scripts before generated `caddy.o`.
 - `--caddy-compile Caddyfile > .zeroserve/scripts/50-caddy.c` lets a normal
   site tarball include native scripts around the generated Caddy script by
   filename order.
@@ -169,7 +169,7 @@ Script lookup should use the existing `zs_call` naming rules: `auth` and
 with the same script name, `auth.o`. If multiple loaded sites or standalone
 scripts provide the same script name, the first loaded script wins,
 matching the visible script chain order: plugin paths in CLI order, then the
-main site.
+plugin directory paths in CLI order, then the main site.
 
 Generated `caddy.o` should remain just another script in the loaded script list.
 Native scripts can still run before it through plugins or lexical filename

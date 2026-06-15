@@ -302,6 +302,10 @@ Key options:
   tarballs; eBPF objects are read from `.zeroserve/scripts/*.o`. A standalone
   `.o` is loaded using its file name as the script name; a standalone `.c` is
   compiled with `clang`/`llc` and loaded as `<stem>.o`.
+- `--plugin-dir <DIR[,DIR...]>`: Load unpacked plugin directories before
+  scripts from `SITE_TAR_OR_SCRIPT`. Directories are packed in memory using the
+  same rules as `--pack`, including compiling `.zeroserve/scripts/*.c` sources.
+  `--plugin` entries run before `--plugin-dir` entries.
 - `--chunk-size <BYTES>`: Streaming chunk size for tar reads (default 65536).
 - `--max-buffered-body-size-kb <KB>`: Maximum request body size in KB for script
   body reads via `zs_req_body_json` (default 256).
@@ -336,6 +340,7 @@ zeroserve --try-html --enable-proxy-protocol site.tar
 
 # Plugin scripts before site scripts
 zeroserve --plugin auth.tar,headers.tar site.tar
+zeroserve --plugin-dir ./plugins/auth site.tar
 
 # Standalone eBPF scripts without a plugin/site tarball
 zeroserve --plugin auth.c app.o
@@ -361,8 +366,9 @@ The default index document is `index.html`, configurable via `--index`.
 
 ## Hot reload
 
-Zeroserve reloads the site tarball or standalone site `.c`/`.o`, plugin tarballs
-or standalone plugin `.c`/`.o` files, scripts, and TLS configuration on:
+Zeroserve reloads the site tarball or standalone site `.c`/`.o`, plugin
+tarballs, plugin directories, standalone plugin `.c`/`.o` files, scripts, and
+TLS configuration on:
 
 - `SIGHUP` (for example: `killall -SIGHUP zeroserve`).
 - Changes to `--reload-signal-file` (polled periodically, content-based).
@@ -472,12 +478,13 @@ the undecryptable case. It is enabled automatically whenever ECH is configured.
 ## Request scripting (eBPF)
 
 Zeroserve can run eBPF programs on every request. Scripts are loaded from
-`.zeroserve/scripts/*.o` inside plugin tarballs and the site tarball, or from
-standalone `.c`/`.o` files passed to `--plugin` or as `SITE_TAR_OR_SCRIPT`.
-Scripts in plugins run first, in the order given to `--plugin`; scripts inside
-each tarball run in sorted path order, standalone plugin scripts run at their
-position in the `--plugin` list, and then site scripts run. A standalone site
-script serves no static files unless the script itself responds or proxies.
+`.zeroserve/scripts/*.o` inside plugin tarballs, plugin directories, and the
+site tarball, or from standalone `.c`/`.o` files passed to `--plugin` or as
+`SITE_TAR_OR_SCRIPT`. Scripts in plugins run first, in the order given to
+`--plugin`, then in the order given to `--plugin-dir`; scripts inside each
+tarball or directory run in sorted path order, standalone plugin scripts run at
+their position in the `--plugin` list, and then site scripts run. A standalone
+site script serves no static files unless the script itself responds or proxies.
 
 Flow and behavior:
 
@@ -525,21 +532,23 @@ Put the `.o` files at `.zeroserve/scripts/` in the tarball, or pass a single
 
 ### Plugin tarballs
 
-Plugin tarballs use the same layout as site tarballs, but only their eBPF script
-objects are loaded. `--plugin` also accepts standalone `.c`/`.o` files. Static
-file serving and helpers such as `zs_load_static_json` read from the main site
-tarball.
+Plugin tarballs and plugin directories use the same layout as site tarballs, but
+only their eBPF script objects are loaded. `--plugin-dir` packs directories in
+memory on startup and on each hot reload using the same rules as `--pack`.
+`--plugin` also accepts standalone `.c`/`.o` files. Static file serving and
+helpers such as `zs_load_static_json` read from the main site tarball.
 
 ```bash
 zeroserve --plugin auth.tar,headers.tar site.tar
+zeroserve --plugin-dir ./plugins/auth site.tar
 zeroserve --plugin auth.c site.tar
 zeroserve --plugin auth.o site.tar
 ```
 
-Hot reload reloads plugin tarballs, standalone plugin `.c`/`.o` files, site
-scripts, site files or a standalone site `.c`/`.o`, and TLS assets together. If
-any plugin or site script fails to load during reload, Zeroserve keeps serving
-the previous site and script chain.
+Hot reload reloads plugin tarballs, plugin directories, standalone plugin
+`.c`/`.o` files, site scripts, site files or a standalone site `.c`/`.o`, and
+TLS assets together. If any plugin or site script fails to load during reload,
+Zeroserve keeps serving the previous site and script chain.
 
 ### Helper API overview
 
@@ -547,6 +556,7 @@ Logging and time:
 
 - `zs_log(msg, len)`
 - `zs_now_ms()` returns milliseconds since the Unix epoch.
+- `zs_version(out, out_len)` writes the current zeroserve version.
 - `zs_env_get(name, name_len, out, out_len)` reads an environment variable.
 
 Crypto and encoding:

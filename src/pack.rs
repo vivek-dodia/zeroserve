@@ -15,6 +15,17 @@ pub const ZEROSERVE_CADDY_H: &[u8] = include_bytes!("../sdk/zeroserve_caddy.h");
 pub const USER_MANUAL: &str = include_str!("../docs/user_manual.md");
 
 pub fn pack_site(root: &Path, compiler: EbpfCompiler) -> Result<()> {
+    let stdout = io::stdout();
+    pack_site_to_writer(root, compiler, stdout.lock())
+}
+
+pub fn pack_site_to_vec(root: &Path, compiler: EbpfCompiler) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    pack_site_to_writer(root, compiler, &mut output)?;
+    Ok(output)
+}
+
+fn pack_site_to_writer<W: io::Write>(root: &Path, compiler: EbpfCompiler, writer: W) -> Result<()> {
     let meta = fs::metadata(root)
         .with_context(|| format!("failed to stat pack path {}", root.display()))?;
     if !meta.is_dir() {
@@ -23,8 +34,7 @@ pub fn pack_site(root: &Path, compiler: EbpfCompiler) -> Result<()> {
 
     let temp_dir = create_temp_dir()?;
     let header_dir = extract_header(&temp_dir)?;
-    let stdout = io::stdout();
-    let mut builder = Builder::new(stdout.lock());
+    let mut builder = Builder::new(writer);
 
     let result = (|| {
         pack_dir(&mut builder, root, root, &temp_dir, &header_dir, compiler)?;

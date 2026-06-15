@@ -71,6 +71,7 @@ typedef int8_t zs_s8;
 
 extern zs_s64 zs_log(const char *msg, zs_u64 len);
 extern zs_u64 zs_now_ms(void);
+extern zs_s64 zs_version(char *out, zs_u64 out_len);
 extern zs_s64 zs_env_get(const char *name, zs_u64 name_len, char *out,
                          zs_u64 out_len);
 extern zs_s64 zs_getrandom(void *out, zs_u64 out_len);

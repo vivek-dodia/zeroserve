@@ -56,6 +56,17 @@ pub fn h_now_ms(_: &HelperScope, _: u64, _: u64, _: u64, _: u64, _: u64) -> Resu
     Ok(now.as_millis() as u64)
 }
 
+pub fn h_version(
+    scope: &HelperScope,
+    out_ptr: u64,
+    out_len: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    deref_and_write_cstr(scope, out_ptr, out_len, env!("CARGO_PKG_VERSION"))
+}
+
 pub fn h_env_get(
     scope: &HelperScope,
     name_ptr: u64,

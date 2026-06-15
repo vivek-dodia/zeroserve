@@ -106,6 +106,15 @@ pub struct Cli {
     )]
     pub plugin: Vec<PathBuf>,
 
+    /// Unpacked plugin directories. Directory scripts run after --plugin scripts and before site scripts.
+    #[arg(
+        long,
+        value_name = "DIR",
+        value_delimiter = ',',
+        conflicts_with_all = ["pack", "dump_sdk", "manual", "gen_ech_key"]
+    )]
+    pub plugin_dir: Vec<PathBuf>,
+
     /// Pack a directory to stdout as a site tarball.
     #[arg(long, value_name = "DIR", conflicts_with = "tarball")]
     pub pack: Option<PathBuf>,
@@ -267,6 +276,28 @@ mod tests {
         let err = Cli::try_parse_from(["zeroserve", "--manual", "site.tar"]).unwrap_err();
 
         assert!(err.to_string().contains("cannot be used with"));
+    }
+
+    #[test]
+    fn plugin_dir_accepts_comma_delimited_and_repeated_values() {
+        let cli = Cli::try_parse_from([
+            "zeroserve",
+            "--plugin-dir",
+            "plugins/auth,plugins/metrics",
+            "--plugin-dir",
+            "plugins/audit",
+            "site.tar",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            cli.plugin_dir,
+            vec![
+                PathBuf::from("plugins/auth"),
+                PathBuf::from("plugins/metrics"),
+                PathBuf::from("plugins/audit"),
+            ]
+        );
     }
 
     #[test]

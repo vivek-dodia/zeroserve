@@ -141,6 +141,59 @@ zs_u64 entry(void) {
 });
 
 Deno.test({
+  name: "e2e: plugin directories run before site scripts and hot reload",
+  ignore: !canRunScripts,
+  fn: async () => {
+    const pluginDir = await Deno.makeTempDir();
+    const siteDir = await Deno.makeTempDir();
+    let siteTarPath: string | null = null;
+    let proc: ZeroserveProc | null = null;
+    try {
+      await writePluginSite(pluginDir, "dir-v1");
+      await writePluginOrderSite(siteDir);
+      siteTarPath = await packSite(siteDir);
+
+      proc = await spawnZeroserve([
+        "--plugin-dir",
+        pluginDir,
+        siteTarPath,
+      ]);
+      const port = proc.httpPort;
+
+      await assertPluginVersion(port, "dir-v1");
+
+      await writePluginSite(pluginDir, "dir-v2");
+      proc.child.kill("SIGHUP");
+      await waitForPluginVersion(proc, "dir-v2", "plugin directory reload");
+
+      await Deno.writeTextFile(
+        join(pluginDir, ".zeroserve", "scripts", "10-plugin.c"),
+        "this is not valid C\n",
+      );
+      proc.child.kill("SIGHUP");
+      for (let i = 0; i < 20; i++) {
+        const exited = await checkExited(proc.statusPromise);
+        assert(
+          exited === null,
+          `zeroserve exited during failed plugin directory reload with code ${exited?.code}`,
+        );
+        await assertPluginVersion(port, "dir-v2");
+        await delay(100);
+      }
+    } finally {
+      if (proc) {
+        await proc.stop();
+      }
+      if (siteTarPath) {
+        await Deno.remove(siteTarPath).catch(() => {});
+      }
+      await Deno.remove(pluginDir, { recursive: true }).catch(() => {});
+      await Deno.remove(siteDir, { recursive: true }).catch(() => {});
+    }
+  },
+});
+
+Deno.test({
   name: "e2e: direct script objects load as plugins and site and reload",
   ignore: !canRunScripts,
   fn: async () => {
@@ -355,6 +408,35 @@ async function writeSite(
   );
 }
 
+async function writePluginOrderSite(siteDir: string): Promise<void> {
+  await Deno.writeTextFile(join(siteDir, "index.html"), "site\n");
+  const siteScriptsDir = join(siteDir, ".zeroserve", "scripts");
+  await Deno.mkdir(siteScriptsDir, { recursive: true });
+  await Deno.writeTextFile(
+    join(siteScriptsDir, "20-site.c"),
+    `#include <zeroserve.h>
+
+ZS_ENTRY
+zs_u64 entry(void) {
+  char path[64];
+  zs_req_path(path, sizeof(path));
+  if (zs_strcmp(path, "/plugin-order") != 0) {
+    return 0;
+  }
+
+  char value[32];
+  zs_s64 value_len = zs_meta_get(ZS_STR("plugin-order"), value, sizeof(value));
+  if (value_len <= 0) {
+    zs_respond(500, ZS_STR("plugin did not run first\\n"));
+    return 0;
+  }
+  zs_respond(200, value, value_len);
+  return 0;
+}
+`,
+  );
+}
+
 async function writePluginSite(
   pluginDir: string,
   version: string,
@@ -463,6 +545,26 @@ async function assertPluginVersion(
   const res = await fetch(`http://127.0.0.1:${port}/plugin-order`);
   assertEquals(res.status, 200);
   assertEquals(await res.text(), version);
+}
+
+async function waitForPluginVersion(
+  proc: ZeroserveProc,
+  expected: string,
+  label: string,
+): Promise<void> {
+  for (let i = 0; i < 30; i++) {
+    const exited = await checkExited(proc.statusPromise);
+    assert(
+      exited === null,
+      `zeroserve exited during ${label} with code ${exited?.code}`,
+    );
+    const res = await fetch(`http://127.0.0.1:${proc.httpPort}/plugin-order`);
+    if (res.status === 200 && await res.text() === expected) {
+      return;
+    }
+    await delay(100);
+  }
+  await assertPluginVersion(proc.httpPort, expected);
 }
 
 async function fetchText(port: number): Promise<string> {

@@ -603,6 +603,64 @@ zs_u64 entry(void) {
 });
 
 Deno.test({
+    name: "e2e: zs_version returns the zeroserve package version",
+    ignore: !canRunScripts,
+    fn: async () => {
+        const siteDir = await Deno.makeTempDir();
+        let tarPath: string | null = null;
+        try {
+            const cargoToml = await Deno.readTextFile(join(repoRoot, "Cargo.toml"));
+            const expected = cargoToml.match(/^version = "([^"]+)"/m)?.[1];
+            assert(expected !== undefined, "Cargo.toml version not found");
+
+            const scriptsDir = join(siteDir, ".zeroserve", "scripts");
+            await Deno.mkdir(scriptsDir, { recursive: true });
+            await Deno.writeTextFile(
+                join(scriptsDir, "10-version.c"),
+                `#include <zeroserve.h>
+
+ZS_ENTRY
+zs_u64 entry(void) {
+  char path[32];
+  zs_req_path(path, sizeof(path));
+  if (zs_strcmp(path, "/version") != 0) {
+    return 0;
+  }
+
+  char version[64];
+  zs_s64 written = zs_version(version, sizeof(version));
+  if (written <= 0) {
+    zs_respond(500, ZS_STR("version helper failed\\n"));
+    return 0;
+  }
+
+  zs_u64 len = 0;
+  while (len < sizeof(version) && version[len] != 0) {
+    len++;
+  }
+  zs_respond(200, version, len);
+  return 0;
+}
+`,
+            );
+
+            tarPath = await packSite(siteDir);
+
+            await withZeroserve(tarPath, async (baseUrl) => {
+                const res = await fetch(`${baseUrl}/version`);
+                assertEquals(res.status, 200);
+                assertEquals(await res.text(), expected);
+            });
+        } finally {
+            if (tarPath) {
+                await Deno.remove(tarPath).catch(() => {});
+            }
+            await Deno.remove(siteDir, { recursive: true }).catch(() => {});
+        }
+    },
+});
+
+Deno.test({
     name: "e2e: zs_connection_info reports tls/alpn/ech",
     ignore: !canRunScripts,
     fn: async () => {

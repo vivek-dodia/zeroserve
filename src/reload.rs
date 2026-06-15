@@ -135,7 +135,8 @@ fn perform_reload(
     eprintln!("reloading plugin, site, and TLS assets");
 
     // Filesystem work happens exactly once, here on the coordinator thread.
-    let mut plugin_sites = Vec::with_capacity(shared.config.plugin_paths.len());
+    let mut plugin_sites =
+        Vec::with_capacity(shared.config.plugin_paths.len() + shared.config.plugin_dir_paths.len());
     for plugin_path in &shared.config.plugin_paths {
         plugin_sites.push(Arc::new(
             Site::load_path(
@@ -144,6 +145,18 @@ fn perform_reload(
                 shared.config.ebpf_compiler,
             )
             .with_context(|| format!("failed to reload plugin {}", plugin_path.display()))?,
+        ));
+    }
+    for plugin_dir in &shared.config.plugin_dir_paths {
+        plugin_sites.push(Arc::new(
+            Site::load_directory(
+                plugin_dir,
+                shared.config.max_rate_limit_buckets,
+                shared.config.ebpf_compiler,
+            )
+            .with_context(|| {
+                format!("failed to reload plugin directory {}", plugin_dir.display())
+            })?,
         ));
     }
     let site = Arc::new(
@@ -217,6 +230,9 @@ fn perform_reload(
     }
     for plugin_path in &shared.config.plugin_paths {
         eprintln!("reloaded plugin {}", plugin_path.display());
+    }
+    for plugin_dir in &shared.config.plugin_dir_paths {
+        eprintln!("reloaded plugin directory {}", plugin_dir.display());
     }
     eprintln!("canary validated; rolled out to all workers");
     Ok(())
