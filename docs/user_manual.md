@@ -323,6 +323,15 @@ Key options:
   `421 Misdirected Request` response. Supports IPv4, IPv6 (bracket notation), and
   hostnames with optional ports (e.g., `example.com,api.example.com,[::1]`).
   Matching is case-insensitive and port numbers are stripped before comparison.
+- `--iroh-proxy`: Enable the experimental iroh reverse-proxy transport
+  (available only in binaries built with the `iroh-proxy` Cargo feature).
+- `--iroh-secret-key <FILE>`: Load or create the local iroh endpoint secret key
+  as 64 hex characters. Newly created files are written with owner-only `0600`
+  permissions. When this flag is omitted, `ZEROSERVE_IROH_SECRET_KEY` may
+  provide a 64-hex secret key; if neither is set, zeroserve generates an
+  ephemeral iroh endpoint key for the process.
+- `--iroh-disable-networking`: Disable iroh relay and DNS discovery for local
+  direct-address testing.
 
 Examples:
 
@@ -1104,6 +1113,11 @@ If a script does `zs_meta_set("name", ..., "Ada", ...)`, the response becomes:
 `zs_reverse_proxy` takes a backend URL such as `http://127.0.0.1:9000`,
 `https://api.example.com/v1?token=abc`, or a Unix socket upstream dial such as
 `unix//run/docker.sock`.
+When zeroserve is built with the `iroh-proxy` feature and started with
+`--iroh-proxy`, it also accepts experimental iroh HTTP upstreams such as
+`iroh://<node-id>/v1?addr=127.0.0.1:12345&token=abc`. The `addr` query
+parameter is consumed as direct iroh dialing metadata; other query parameters
+remain part of the proxied upstream request.
 
 Zeroserve will:
 
@@ -1116,6 +1130,10 @@ Zeroserve will:
   configured reverse-proxy request header operations to the upstream request
   only, then applies Caddy's server-level and handler `trusted_proxies` rules to
   either replace untrusted forwarded values or preserve trusted values.
+- For iroh upstreams, stream request and response bodies concurrently through
+  bounded runtime channels without collecting whole bodies. HTTP/1 WebSocket
+  upgrades tunnel raw bytes after the upstream `101 Switching Protocols`
+  response.
 - Generated Caddy reverse-proxy middleware preserves `TE: trailers` on upstream
   requests while stripping other hop-by-hop headers, matching Caddy's proxy
   request preparation.

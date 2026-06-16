@@ -235,6 +235,23 @@ pub struct Cli {
     /// Comma-separated list of allowed hostnames. Requests with non-matching hostnames receive a 421 error.
     #[arg(long, value_delimiter = ',')]
     pub validate_hostnames: Vec<String>,
+
+    /// Enable the experimental iroh reverse-proxy transport.
+    #[cfg(feature = "iroh-proxy")]
+    #[arg(long)]
+    pub iroh_proxy: bool,
+
+    /// Load or create the local iroh endpoint secret key at this path.
+    /// If omitted, ZEROSERVE_IROH_SECRET_KEY may provide a 64-hex key;
+    /// otherwise an ephemeral process key is generated.
+    #[cfg(feature = "iroh-proxy")]
+    #[arg(long, value_name = "FILE", requires = "iroh_proxy")]
+    pub iroh_secret_key: Option<PathBuf>,
+
+    /// Disable iroh relay and DNS discovery for local/direct-address testing.
+    #[cfg(feature = "iroh-proxy")]
+    #[arg(long, requires = "iroh_proxy")]
+    pub iroh_disable_networking: bool,
 }
 
 #[cfg(test)]
