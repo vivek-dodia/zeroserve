@@ -273,7 +273,7 @@ pub fn adapt(blocks: Vec<ServerBlock>) -> Result<(Value, Vec<String>)> {
             .iter()
             .map(|k| Address::parse(&k.text))
             .collect::<Result<Vec<_>>>()?;
-        let (routes, error_routes, tls_policies) =
+        let (routes, error_routes, tls_policies, acme_automation) =
             compile_block_routes(&block, &options, &counter, &warnings, &extra_apps)?;
 
         compiled.push(CompiledBlock {
@@ -283,6 +283,7 @@ pub fn adapt(blocks: Vec<ServerBlock>) -> Result<(Value, Vec<String>)> {
             routes,
             error_routes,
             tls_policies,
+            acme_automation,
         });
     }
 
@@ -292,6 +293,9 @@ pub fn adapt(blocks: Vec<ServerBlock>) -> Result<(Value, Vec<String>)> {
     {
         // Still allow address-only configs to produce an (empty) server.
     }
+
+    // Build the TLS automation app (ACME issuers) before `compiled` is consumed.
+    let tls_app = build_tls_automation(&options, &compiled)?;
 
     let servers = build_servers(compiled, &options, &counter, &warnings, &named_routes)?;
 
@@ -309,12 +313,132 @@ pub fn adapt(blocks: Vec<ServerBlock>) -> Result<(Value, Vec<String>)> {
     for (key, value) in extra_apps.borrow().iter() {
         apps.insert(key.clone(), value.clone());
     }
+    if let Some(tls_app) = tls_app {
+        apps.insert("tls".to_string(), tls_app);
+    }
     apps.insert("http".to_string(), Value::Object(http_app));
     let config = json!({ "apps": Value::Object(apps) });
     let warns = Rc::try_unwrap(warnings)
         .map(RefCell::into_inner)
         .unwrap_or_default();
     Ok((config, warns))
+}
+
+/// Set `slot` to `value`, rejecting a different already-set value. The generated
+/// `acme_config` is global (one CA/contact/EAB), so divergent per-site ACME
+/// settings cannot be represented and are a hard error.
+fn set_unique_acme_field(
+    field: &str,
+    slot: &mut Option<String>,
+    value: Option<&str>,
+) -> Result<()> {
+    if let Some(v) = value {
+        if let Some(existing) = slot
+            && existing != v
+        {
+            bail!(
+                "conflicting ACME {field} across sites ({existing:?} vs {v:?}); zeroserve issues all domains from a single ACME account, so {field} must be consistent"
+            );
+        }
+        *slot = Some(v.to_string());
+    }
+    Ok(())
+}
+
+/// Build the `apps.tls` app holding ACME `automation.policies`, translating the
+/// global `email`/`acme_ca`/`acme_eab` options and per-site `tls <email>` /
+/// `tls internal` / `tls { ca/eab }` directives. Returns `Ok(None)` when the
+/// config configures no ACME automation and no `internal` issuer. Errors when
+/// sites set conflicting ACME settings. The Caddy compiler reads this to emit
+/// `zeroserve.init.acme_config`.
+fn build_tls_automation(
+    options: &options::Options,
+    compiled: &[CompiledBlock],
+) -> Result<Option<Value>> {
+    let mut acme_present = false;
+    let mut email = options.acme_email.clone();
+    let mut ca = options.acme_ca.clone();
+    let mut eab = options.acme_eab.clone();
+    if email.is_some() || ca.is_some() || eab.is_some() {
+        acme_present = true;
+    }
+
+    let mut internal_subjects: Vec<String> = Vec::new();
+    for block in compiled {
+        let hosts: Vec<String> = block
+            .parsed_keys
+            .iter()
+            .filter(|a| !a.host.is_empty())
+            .map(|a| a.host.clone())
+            .collect();
+        for entry in &block.acme_automation {
+            // `tls off` skip markers are handled in build_servers (emitted as
+            // automatic_https.skip), not here.
+            if entry.get("skip").and_then(Value::as_bool) == Some(true) {
+                continue;
+            }
+            if entry.get("internal").and_then(Value::as_bool) == Some(true) {
+                for host in &hosts {
+                    if !internal_subjects.contains(host) {
+                        internal_subjects.push(host.clone());
+                    }
+                }
+                continue;
+            }
+            acme_present = true;
+            set_unique_acme_field(
+                "email",
+                &mut email,
+                entry.get("email").and_then(Value::as_str),
+            )?;
+            set_unique_acme_field("ca", &mut ca, entry.get("ca").and_then(Value::as_str))?;
+            if let Some(e) = entry.get("eab") {
+                let kid = e.get("key_id").and_then(Value::as_str);
+                let mac = e.get("mac_key").and_then(Value::as_str);
+                if let (Some(kid), Some(mac)) = (kid, mac) {
+                    let new = (kid.to_string(), mac.to_string());
+                    if let Some(existing) = &eab
+                        && *existing != new
+                    {
+                        bail!(
+                            "conflicting ACME external account binding across sites; zeroserve issues all domains from a single ACME account, so the EAB must be consistent"
+                        );
+                    }
+                    eab = Some(new);
+                }
+            }
+        }
+    }
+
+    let mut policies: Vec<Value> = Vec::new();
+    if acme_present {
+        let mut issuer = Map::new();
+        issuer.insert("module".into(), json!("acme"));
+        if let Some(ca) = &ca {
+            issuer.insert("ca".into(), json!(ca));
+        }
+        if let Some(email) = &email {
+            issuer.insert("email".into(), json!(email));
+        }
+        if let Some((kid, mac)) = &eab {
+            issuer.insert(
+                "external_account".into(),
+                json!({ "key_id": kid, "mac_key": mac }),
+            );
+        }
+        policies.push(json!({ "issuers": [Value::Object(issuer)] }));
+    }
+    if !internal_subjects.is_empty() {
+        policies.push(json!({
+            "subjects": internal_subjects,
+            "issuers": [{ "module": "internal" }],
+        }));
+    }
+
+    if policies.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(json!({ "automation": { "policies": policies } })))
 }
 
 fn is_registered_directive_name(name: &str) -> bool {
@@ -331,7 +455,7 @@ fn compile_block_routes(
     counter: &Rc<RefCell<Counter>>,
     warnings: &Rc<RefCell<Vec<String>>>,
     extra_apps: &Rc<RefCell<Map<String, Value>>>,
-) -> Result<(Vec<ConfigValue>, Vec<Subroute>, Vec<Value>)> {
+) -> Result<(Vec<ConfigValue>, Vec<Subroute>, Vec<Value>, Vec<Value>)> {
     let segments: Vec<Vec<Token>> = block
         .segments
         .iter()
@@ -362,6 +486,7 @@ fn compile_block_routes(
     let mut routes: Vec<ConfigValue> = Vec::new();
     let mut error_routes: Vec<Subroute> = Vec::new();
     let mut tls_policies: Vec<Value> = Vec::new();
+    let mut acme_automation: Vec<Value> = Vec::new();
     for seg in &segments {
         let dir = seg.first().map(|t| t.text.clone()).unwrap_or_default();
         if dir.starts_with(MATCHER_PREFIX) {
@@ -409,12 +534,17 @@ fn compile_block_routes(
                         tls_policies.push(v);
                     }
                 }
+                "acme_automation" => {
+                    if let RouteOrSub::Json(v) = result.value {
+                        acme_automation.push(v);
+                    }
+                }
                 _ => routes.push(result),
             }
         }
     }
 
-    Ok((routes, error_routes, tls_policies))
+    Ok((routes, error_routes, tls_policies, acme_automation))
 }
 
 fn apply_segment_shorthands(seg: &[Token]) -> Vec<Token> {
@@ -443,7 +573,7 @@ fn build_named_routes(
             bail!("cannot have duplicate named_routes: {name}");
         }
 
-        let (routes, error_routes, _) =
+        let (routes, error_routes, _, _) =
             compile_block_routes(&block, options, counter, warnings, extra_apps)?;
         let mut subroute =
             handlers::build_subroute(routes, counter, true, &options.directive_order)?;
@@ -471,6 +601,7 @@ struct CompiledBlock {
     routes: Vec<ConfigValue>,
     error_routes: Vec<Subroute>,
     tls_policies: Vec<Value>,
+    acme_automation: Vec<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -517,6 +648,7 @@ fn build_servers(
         let mut routes: Vec<Value> = Vec::new();
         let mut error_routes: Vec<Value> = Vec::new();
         let mut tls_connection_policies: Vec<Value> = Vec::new();
+        let mut skip_hosts: Vec<String> = Vec::new();
 
         for &placement_idx in &placement_idxs {
             let placement = &placements[placement_idx];
@@ -525,6 +657,19 @@ fn build_servers(
             let tls_policies = blocks[placement.block_idx].tls_policies.clone();
             let matcher_sets = compile_encoded_matcher_sets(&placement.matcher_keys)?;
             let sni = tls_policy_sni_hosts(&placement.matcher_keys);
+
+            // `tls off`: exclude this site's hostnames from automatic HTTPS.
+            let skipped = blocks[placement.block_idx]
+                .acme_automation
+                .iter()
+                .any(|e| e.get("skip").and_then(Value::as_bool) == Some(true));
+            if skipped {
+                for host in &sni {
+                    if !skip_hosts.contains(host) {
+                        skip_hosts.push(host.clone());
+                    }
+                }
+            }
 
             let site_subroute =
                 handlers::build_subroute(block, counter, true, &options.directive_order)?;
@@ -563,6 +708,10 @@ fn build_servers(
                 "tls_connection_policies".into(),
                 Value::Array(tls_connection_policies),
             );
+        }
+        if !skip_hosts.is_empty() {
+            skip_hosts.sort();
+            srv.insert("automatic_https".into(), json!({ "skip": skip_hosts }));
         }
         if !named_routes.is_empty() {
             srv.insert("named_routes".into(), Value::Object(named_routes.clone()));
@@ -1459,7 +1608,6 @@ example.com {
             "events",
             "storage",
             "acme_dns",
-            "acme_eab",
             "cert_issuer",
             "on_demand_tls",
             "preferred_chains",
@@ -1509,7 +1657,6 @@ example.com {
             "default_bind",
             "storage_check",
             "storage_clean_interval",
-            "email",
             "renewal_window_ratio",
             "tls_resolvers",
             "ocsp_stapling",
@@ -4650,6 +4797,136 @@ example.com {
     }
 
     #[test]
+    fn acme_options_produce_tls_automation_policies() {
+        let (v, _) = adapt_full(
+            r#"{
+  email admin@example.com
+  acme_ca https://acme.example/dir
+  acme_eab {
+    key_id kid-1
+    mac_key bWFjLXNlY3JldA
+  }
+}
+example.com {
+  respond ok
+}
+internal.example {
+  tls internal
+  respond ok
+}"#,
+        );
+        let policies = v["apps"]["tls"]["automation"]["policies"]
+            .as_array()
+            .expect("automation policies");
+        let acme = policies
+            .iter()
+            .find_map(|p| {
+                p["issuers"]
+                    .as_array()?
+                    .iter()
+                    .find(|i| i["module"] == "acme")
+            })
+            .expect("acme issuer");
+        assert_eq!(acme["email"], "admin@example.com");
+        assert_eq!(acme["ca"], "https://acme.example/dir");
+        assert_eq!(acme["external_account"]["key_id"], "kid-1");
+        assert_eq!(acme["external_account"]["mac_key"], "bWFjLXNlY3JldA");
+        let internal = policies
+            .iter()
+            .find(|p| {
+                p["issuers"]
+                    .as_array()
+                    .is_some_and(|is| is.iter().any(|i| i["module"] == "internal"))
+            })
+            .expect("internal policy");
+        assert_eq!(internal["subjects"][0], "internal.example");
+    }
+
+    #[test]
+    fn site_tls_email_produces_acme_issuer() {
+        let (v, _) = adapt_full(
+            r#"example.com {
+  tls me@example.com
+  respond ok
+}"#,
+        );
+        let policies = v["apps"]["tls"]["automation"]["policies"]
+            .as_array()
+            .expect("automation policies");
+        assert!(policies.iter().any(|p| {
+            p["issuers"].as_array().is_some_and(|is| {
+                is.iter()
+                    .any(|i| i["module"] == "acme" && i["email"] == "me@example.com")
+            })
+        }));
+    }
+
+    #[test]
+    fn conflicting_site_acme_settings_are_rejected() {
+        let err = adapt_err(
+            r#"a.example {
+  tls a@example.com
+  respond ok
+}
+b.example {
+  tls b@example.com
+  respond ok
+}"#,
+        );
+        assert!(err.contains("conflicting ACME email"), "{err}");
+
+        let ca_conflict = adapt_err(
+            r#"{
+  acme_ca https://ca-one.example/dir
+}
+a.example {
+  tls {
+    ca https://ca-two.example/dir
+  }
+  respond ok
+}"#,
+        );
+        assert!(ca_conflict.contains("conflicting ACME ca"), "{ca_conflict}");
+    }
+
+    #[test]
+    fn site_tls_off_emits_automatic_https_skip() {
+        let (v, _) = adapt_full(
+            r#"{
+  email admin@example.com
+}
+a.example {
+  respond ok
+}
+b.example {
+  tls off
+  respond ok
+}"#,
+        );
+        let skip = &v["apps"]["http"]["servers"]["srv0"]["automatic_https"]["skip"];
+        assert_eq!(skip, &json!(["b.example"]));
+        // `tls off` must not contribute an ACME issuer.
+        let policies = v["apps"]["tls"]["automation"]["policies"]
+            .as_array()
+            .expect("automation policies");
+        assert!(policies.iter().all(|p| {
+            p["issuers"]
+                .as_array()
+                .is_none_or(|is| is.iter().all(|i| i["module"] != "internal"))
+        }));
+    }
+
+    #[test]
+    fn no_tls_app_without_acme_config() {
+        let (v, _) = adapt_full(
+            r#"example.com {
+  respond ok
+}"#,
+        );
+        assert!(v["apps"].get("tls").is_none(), "{v}");
+    }
+
+    #[test]
     fn site_tls_rejects_invalid_shape() {
         let naked = adapt_err("example.com {\n  tls\n}");
         assert!(naked.contains("wrong argument count"), "{naked}");
@@ -4657,7 +4934,7 @@ example.com {
         let bad_single_arg = adapt_err("example.com {\n  tls not-an-email\n}");
         assert!(
             bad_single_arg.contains(
-                "single argument must either be 'internal', 'force_automate', or an email address"
+                "single argument must be 'internal', 'force_automate', 'off', or an email address"
             ),
             "{bad_single_arg}"
         );

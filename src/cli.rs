@@ -81,6 +81,15 @@ pub struct Cli {
     #[arg(long, value_name = "DIR", conflicts_with_all = ["cert", "key"])]
     pub cert_dir: Option<PathBuf>,
 
+    /// Directory for ACME-managed certificates. Enables automatic certificate
+    /// provisioning over ACME (TLS-ALPN-01). The set of domains is read from the
+    /// site's `zeroserve.init.acme_config` script section. The ACME account key
+    /// and obtained certificates are persisted here and reused across restarts.
+    /// May be combined with `--cert-dir`: a hostname already covered by a
+    /// `--cert-dir` certificate is served from there and never acquired over ACME.
+    #[arg(long, value_name = "DIR")]
+    pub acme_dir: Option<PathBuf>,
+
     /// Default document to serve from directories.
     #[arg(long, default_value_t = String::from(crate::DEFAULT_INDEX))]
     pub index: String,

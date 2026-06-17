@@ -20,8 +20,8 @@ use anyhow::{Context, Result, anyhow};
 use boring::asn1::Asn1Time;
 use boring::ex_data::Index;
 use boring::ssl::{
-    AlpnError, ClientHello, ErrorCode, HandshakeError, NameType, SelectCertError, Ssl,
-    SslConnector, SslContext, SslContextBuilder, SslFiletype, SslMethod, SslRef, SslStream,
+    AlpnError, ClientHello, ErrorCode, ExtensionType, HandshakeError, NameType, SelectCertError,
+    Ssl, SslConnector, SslContext, SslContextBuilder, SslFiletype, SslMethod, SslRef, SslStream,
     SslStreamBuilder, SslVerifyMode, SslVersion, select_next_proto,
 };
 use boring::x509::{X509, X509Ref};
@@ -31,7 +31,24 @@ use monoio::{
     io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt},
 };
 
+use crate::acme::SharedCerts;
 use crate::ja4;
+
+/// Wire-format name of the ACME TLS-ALPN-01 protocol (`acme-tls/1`), preceded by
+/// its 1-byte length as it appears in the ALPN extension's protocol list.
+const ACME_TLS_ALPN_NAME: &[u8] = b"\x0aacme-tls/1";
+
+/// Whether the ClientHello offers the `acme-tls/1` ALPN protocol (a TLS-ALPN-01
+/// validation handshake).
+fn client_hello_offers_acme_tls(client_hello: &ClientHello<'_>) -> bool {
+    client_hello
+        .get_extension(ExtensionType::APPLICATION_LAYER_PROTOCOL_NEGOTIATION)
+        .map(|ext| {
+            ext.windows(ACME_TLS_ALPN_NAME.len())
+                .any(|w| w == ACME_TLS_ALPN_NAME)
+        })
+        .unwrap_or(false)
+}
 
 const READ_CHUNK: usize = 16 * 1024;
 // Wire-format ALPN list the server offers, in preference order: h2, http/1.1.
@@ -54,7 +71,7 @@ pub struct ServerIdentity {
     pub cert_path: PathBuf,
     pub key_path: PathBuf,
     leaf: X509,
-    dns_names: Vec<String>,
+    pub(crate) dns_names: Vec<String>,
 }
 
 impl ServerIdentity {
@@ -287,6 +304,7 @@ impl BoringAcceptor {
     pub fn build_script_selected(
         default_identity: Option<ServerIdentity>,
         relay_public_names: Vec<String>,
+        acme_certs: Option<Arc<SharedCerts>>,
         configure: impl FnOnce(&mut SslContextBuilder) -> Result<()>,
     ) -> Result<Self> {
         let mut builder = SslContextBuilder::new(SslMethod::tls())
@@ -302,6 +320,27 @@ impl BoringAcceptor {
         let has_default = default_identity.is_some();
         builder.set_select_certificate_callback(move |mut client_hello| {
             record_ja4(&mut client_hello);
+            // TLS-ALPN-01: a validation handshake (ALPN `acme-tls/1`) for a name
+            // we have a pending challenge for is served the challenge certificate
+            // directly, never reaching the eBPF certificate-selection pause.
+            if let Some(certs) = &acme_certs {
+                if client_hello_offers_acme_tls(&client_hello) {
+                    if let Some(sni) = client_hello
+                        .servername(NameType::HOST_NAME)
+                        .map(str::to_ascii_lowercase)
+                    {
+                        if let Some(ctx) = certs.challenge_for_sni(&sni) {
+                            client_hello
+                                .ssl_mut()
+                                .set_ssl_context(&ctx)
+                                .map_err(|_| SelectCertError::ERROR)?;
+                            return Ok(());
+                        }
+                    }
+                    // No challenge for this name: refuse the acme-tls/1 handshake.
+                    return Err(SelectCertError::ERROR);
+                }
+            }
             let Some(decision) = client_hello.ssl().ex_data(cert_select_ex_index()).cloned() else {
                 // First pass: pause the handshake until the script has chosen.
                 return Err(SelectCertError::RETRY);
@@ -518,7 +557,7 @@ fn dns_sans(cert: &X509Ref) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn dns_name_matches(pattern: &str, sni: &str) -> bool {
+pub(crate) fn dns_name_matches(pattern: &str, sni: &str) -> bool {
     let pattern = pattern.to_ascii_lowercase();
     let sni = sni.to_ascii_lowercase();
 
@@ -677,16 +716,29 @@ const CA_BUNDLE_PATHS: &[&str] = &[
 /// `/etc` is a tmpfs). Reverse-proxying to HTTPS upstreams fails if this wasn't
 /// initialized.
 pub fn init_client_from_system_roots() -> Result<()> {
-    let bundle = CA_BUNDLE_PATHS
-        .iter()
-        .map(std::path::Path::new)
-        .find(|p| p.exists())
-        .ok_or_else(|| {
-            anyhow!(
-                "no system CA bundle found (looked in {:?}); HTTPS reverse-proxy upstreams will fail",
-                CA_BUNDLE_PATHS
-            )
-        })?;
+    // Honor the conventional `SSL_CERT_FILE` override (used to trust a private
+    // or test CA, e.g. a local ACME server). Falls back to probing the common
+    // system bundle locations.
+    let ssl_cert_file = std::env::var_os("SSL_CERT_FILE").map(std::path::PathBuf::from);
+    let bundle: &std::path::Path = match &ssl_cert_file {
+        Some(path) if path.exists() => path.as_path(),
+        Some(path) => {
+            return Err(anyhow!(
+                "SSL_CERT_FILE points at {}, which does not exist",
+                path.display()
+            ));
+        }
+        None => CA_BUNDLE_PATHS
+            .iter()
+            .map(std::path::Path::new)
+            .find(|p| p.exists())
+            .ok_or_else(|| {
+                anyhow!(
+                    "no system CA bundle found (looked in {:?}); HTTPS reverse-proxy upstreams will fail",
+                    CA_BUNDLE_PATHS
+                )
+            })?,
+    };
     let mut builder =
         SslConnector::builder(SslMethod::tls()).context("creating BoringSSL client context")?;
     builder

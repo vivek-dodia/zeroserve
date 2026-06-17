@@ -257,11 +257,24 @@ pub fn compile_caddy_json_collecting(source: &str) -> Result<(String, Vec<String
     }
     let mut routes = Vec::new();
     let mut tls_connection_policies = Vec::new();
+    let mut acme_skip_hosts: Vec<String> = Vec::new();
     let mut access_log_config = AccessLogConfig::default();
     for (server_name, server) in http.servers {
         let server_access_log_config = access_log_config_for_server(logging_config, &server.extra)?;
         access_log_config.merge(server_access_log_config);
         validate_http_server_fields(&server, &server_name, &mut warnings)?;
+        // `automatic_https.skip` hostnames (e.g. from Caddyfile `tls off`) are
+        // excluded from the generated acme_config.
+        if let Some(skip) = server
+            .extra
+            .get("automatic_https")
+            .and_then(|a| a.get("skip"))
+            .and_then(Value::as_array)
+        {
+            for host in skip.iter().filter_map(Value::as_str) {
+                acme_skip_hosts.push(host.to_ascii_lowercase());
+            }
+        }
         for (idx, policy) in server.tls_connection_policies.iter().enumerate() {
             validate_tls_connection_policy(
                 policy,
@@ -298,6 +311,11 @@ pub fn compile_caddy_json_collecting(source: &str) -> Result<(String, Vec<String
     let mut generator = Generator::default();
     generator.access_log_config = access_log_config;
     generator.tls_connection_policies = tls_connection_policies;
+    generator.acme = parse_acme_automation(
+        config.apps.extra.get("tls"),
+        &generator.tls_connection_policies,
+        &acme_skip_hosts,
+    )?;
     generator.emit_preamble();
     generator.line(HOST_TABLE_MARKER);
     generator.blank();
@@ -337,6 +355,7 @@ pub fn compile_caddy_json_collecting(source: &str) -> Result<(String, Vec<String
         generator.indent -= 1;
         generator.line("}");
         generator.finish_response_hook();
+        generator.emit_init_acme_config();
         for warning in generator.ignored_warnings {
             if !warnings.contains(&warning) {
                 warnings.push(warning);
@@ -425,6 +444,7 @@ pub fn compile_caddy_json_collecting(source: &str) -> Result<(String, Vec<String
     generator.indent -= 1;
     generator.line("}");
     generator.finish_response_hook();
+    generator.emit_init_acme_config();
     for warning in generator.ignored_warnings {
         if !warnings.contains(&warning) {
             warnings.push(warning);
@@ -603,6 +623,172 @@ struct Generator {
     /// value is the insertion id behind the emitted `ZS_HOST_ID_<id>` define;
     /// the define resolves to the pattern's sorted table index at finish.
     host_table: BTreeMap<String, usize>,
+    /// ACME automation parsed from `apps.tls.automation`; when present and at
+    /// least one routed public domain qualifies, a `zeroserve.init.acme_config`
+    /// section is emitted.
+    acme: Option<AcmeAutomationRaw>,
+}
+
+/// ACME automation extracted from `apps.tls`. Domains are resolved against the
+/// routed host table at emit time (after host matchers populate it).
+#[derive(Debug, Default)]
+struct AcmeAutomationRaw {
+    contact: Option<String>,
+    directory_url: Option<String>,
+    /// `(kid, hmac_key)` external account binding.
+    eab: Option<(String, String)>,
+    /// A subject-less ACME policy manages every eligible routed domain.
+    manage_all: bool,
+    /// Explicit subjects from subject-scoped ACME policies (lowercased).
+    acme_subjects: Vec<String>,
+    /// Domains under an `internal` issuer — excluded from ACME (lowercased).
+    internal_subjects: Vec<String>,
+    /// Domains with an explicit `tls <cert> <key>` — excluded (lowercased).
+    explicit_cert_snis: Vec<String>,
+    /// Domains in `automatic_https.skip` (Caddyfile `tls off`) — excluded.
+    skip_subjects: Vec<String>,
+}
+
+/// Whether `host` is eligible for ACME TLS-ALPN-01 issuance: a public domain
+/// name, not an IP literal, `localhost`, or a wildcard (wildcards need DNS-01).
+fn is_public_acme_domain(host: &str) -> bool {
+    if host.is_empty() || host == "localhost" || host.ends_with(".localhost") {
+        return false;
+    }
+    if !host.contains('.') || host.contains('*') {
+        return false;
+    }
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return false;
+    }
+    host.split('.').all(|label| {
+        !label.is_empty()
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    })
+}
+
+/// Set `slot` to `value`, rejecting a different already-set value. zeroserve's
+/// `acme_config` is global (one CA/contact/EAB), so divergent ACME issuers
+/// cannot be represented.
+fn set_unique_acme(field: &str, slot: &mut Option<String>, value: Option<&str>) -> Result<()> {
+    if let Some(v) = value {
+        if let Some(existing) = slot
+            && existing != v
+        {
+            bail!(
+                "conflicting ACME {field} ({existing:?} vs {v:?}); zeroserve issues all domains from a single ACME account, so {field} must be consistent"
+            );
+        }
+        *slot = Some(v.to_string());
+    }
+    Ok(())
+}
+
+/// Parse ACME automation from the `apps.tls` app and explicit-cert SNIs from the
+/// HTTP server's TLS connection policies. Returns `Ok(None)` when no ACME issuer
+/// is configured (so no `acme_config` section is emitted); errors when issuers
+/// disagree on the CA, contact, or EAB.
+fn parse_acme_automation(
+    tls_app: Option<&Value>,
+    tls_policies: &[TlsConnectionPolicy],
+    skip_hosts: &[String],
+) -> Result<Option<AcmeAutomationRaw>> {
+    let mut raw = AcmeAutomationRaw::default();
+    raw.skip_subjects = skip_hosts.to_vec();
+    for policy in tls_policies {
+        if policy.certificate_selection.is_some()
+            && let Some(m) = &policy.match_
+        {
+            for sni in &m.sni {
+                raw.explicit_cert_snis.push(sni.to_ascii_lowercase());
+            }
+        }
+    }
+
+    let mut acme_present = false;
+    let mut email: Option<String> = None;
+    let mut ca: Option<String> = None;
+    let policies = tls_app
+        .and_then(|t| t.get("automation"))
+        .and_then(|a| a.get("policies"))
+        .and_then(Value::as_array);
+    for policy in policies.into_iter().flatten() {
+        let subjects: Vec<String> = policy
+            .get("subjects")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(|s| s.to_ascii_lowercase())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let Some(issuers) = policy.get("issuers").and_then(Value::as_array) else {
+            continue;
+        };
+        for issuer in issuers {
+            match issuer.get("module").and_then(Value::as_str) {
+                Some("acme") => {
+                    acme_present = true;
+                    set_unique_acme(
+                        "email",
+                        &mut email,
+                        issuer.get("email").and_then(Value::as_str),
+                    )?;
+                    set_unique_acme("ca", &mut ca, issuer.get("ca").and_then(Value::as_str))?;
+                    if let Some(ea) = issuer.get("external_account")
+                        && let (Some(kid), Some(mac)) = (
+                            ea.get("key_id").and_then(Value::as_str),
+                            ea.get("mac_key").and_then(Value::as_str),
+                        )
+                    {
+                        let new = (kid.to_string(), mac.to_string());
+                        if let Some(existing) = &raw.eab
+                            && *existing != new
+                        {
+                            bail!(
+                                "conflicting ACME external account binding; zeroserve issues all domains from a single ACME account, so the EAB must be consistent"
+                            );
+                        }
+                        raw.eab = Some(new);
+                    }
+                    if subjects.is_empty() {
+                        raw.manage_all = true;
+                    } else {
+                        for s in &subjects {
+                            if !raw.acme_subjects.contains(s) {
+                                raw.acme_subjects.push(s.clone());
+                            }
+                        }
+                    }
+                }
+                Some("internal") => {
+                    for s in &subjects {
+                        if !raw.internal_subjects.contains(s) {
+                            raw.internal_subjects.push(s.clone());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if !acme_present {
+        return Ok(None);
+    }
+    // The acme_config `contact` is a URL; Caddy's email is a bare address.
+    raw.contact = email.map(|e| {
+        if e.contains(':') {
+            e
+        } else {
+            format!("mailto:{e}")
+        }
+    });
+    raw.directory_url = ca;
+    Ok(Some(raw))
 }
 
 impl Generator {
@@ -641,6 +827,84 @@ impl Generator {
             "zs_meta_set(ZS_STR(\"zs.caddy.access_log.file\"), {}, {});",
             c_str(file),
             file.len()
+        ));
+    }
+
+    /// Emit a `ZS_INIT_ENTRY(acme_config)` section listing the routed public
+    /// domains to manage over ACME, plus contact/directory_url/eab when set.
+    /// No-op unless an ACME issuer was configured and ≥1 domain qualifies. Must
+    /// run after host matchers have populated `host_table`.
+    fn emit_init_acme_config(&mut self) {
+        let Some(acme) = self.acme.take() else {
+            return;
+        };
+        let mut domains: Vec<String> = self
+            .host_table
+            .keys()
+            .filter(|h| is_public_acme_domain(h))
+            .filter(|h| !acme.internal_subjects.contains(h))
+            .filter(|h| !acme.explicit_cert_snis.contains(h))
+            .filter(|h| !acme.skip_subjects.contains(h))
+            .filter(|h| acme.manage_all || acme.acme_subjects.contains(h))
+            .cloned()
+            .collect();
+        domains.sort();
+        domains.dedup();
+        if domains.is_empty() {
+            return;
+        }
+
+        self.blank();
+        self.line("ZS_INIT_ENTRY(acme_config) {");
+        self.indent += 1;
+        self.line("zs_s64 cfg = zs_json_new_object();");
+        self.line("zs_s64 domains = zs_json_new_array();");
+        for domain in &domains {
+            self.line(&format!(
+                "{{ zs_s64 d = zs_json_new_object(); zs_json_set_string(d, {}, {}); zs_json_array_push(domains, d); zs_object_free(d); }}",
+                c_str(domain),
+                domain.len()
+            ));
+        }
+        self.line("zs_json_set(cfg, ZS_STR(\"domains\"), domains);");
+        self.line("zs_object_free(domains);");
+        if let Some(contact) = &acme.contact {
+            self.emit_acme_string_field("contact", contact);
+        }
+        if let Some(url) = &acme.directory_url {
+            self.emit_acme_string_field("directory_url", url);
+        }
+        if let Some((kid, mac)) = &acme.eab {
+            self.line("{");
+            self.indent += 1;
+            self.line("zs_s64 eab = zs_json_new_object();");
+            self.line(&format!(
+                "{{ zs_s64 v = zs_json_new_object(); zs_json_set_string(v, {}, {}); zs_json_set(eab, ZS_STR(\"kid\"), v); zs_object_free(v); }}",
+                c_str(kid),
+                kid.len()
+            ));
+            self.line(&format!(
+                "{{ zs_s64 v = zs_json_new_object(); zs_json_set_string(v, {}, {}); zs_json_set(eab, ZS_STR(\"hmac_key\"), v); zs_object_free(v); }}",
+                c_str(mac),
+                mac.len()
+            ));
+            self.line("zs_json_set(cfg, ZS_STR(\"eab\"), eab);");
+            self.line("zs_object_free(eab);");
+            self.indent -= 1;
+            self.line("}");
+        }
+        self.line("return cfg;");
+        self.indent -= 1;
+        self.line("}");
+    }
+
+    /// Emit `cfg["<key>"] = "<value>"` (string) inside the acme_config builder.
+    fn emit_acme_string_field(&mut self, key: &str, value: &str) {
+        self.line(&format!(
+            "{{ zs_s64 v = zs_json_new_object(); zs_json_set_string(v, {}, {}); zs_json_set(cfg, ZS_STR(\"{}\"), v); zs_object_free(v); }}",
+            c_str(value),
+            value.len(),
+            key
         ));
     }
 
@@ -6260,6 +6524,15 @@ fn validate_http_server_fields(
         if key == "logs" {
             continue;
         }
+        // `automatic_https` carrying only `skip` (Caddyfile `tls off`) is honored
+        // by the acme_config generator, not ignored — don't warn for it.
+        if key == "automatic_https"
+            && let Some(obj) = server.extra.get(key).and_then(Value::as_object)
+            && !obj.is_empty()
+            && obj.keys().all(|k| k == "skip")
+        {
+            continue;
+        }
         if ignorable_http_server_field(key) {
             warnings.push(format!(
                 "ignoring apps.http.servers.{server_name} field {key:?}: configured outside zeroserve's eBPF request-processing surface"
@@ -7873,6 +8146,111 @@ mod tests {
     #[test]
     fn c_string_uses_bounded_octal_for_non_ascii() {
         assert_eq!(c_str("café1"), "\"caf\\303\\2511\"");
+    }
+
+    #[test]
+    fn public_acme_domain_eligibility() {
+        assert!(is_public_acme_domain("example.com"));
+        assert!(is_public_acme_domain("www.example.com"));
+        assert!(!is_public_acme_domain("localhost"));
+        assert!(!is_public_acme_domain("app.localhost"));
+        assert!(!is_public_acme_domain("internal")); // no dot
+        assert!(!is_public_acme_domain("127.0.0.1")); // IPv4 literal
+        assert!(!is_public_acme_domain("*.example.com")); // wildcard (needs DNS-01)
+        assert!(!is_public_acme_domain(""));
+    }
+
+    #[test]
+    fn compiles_acme_config_init_section_from_automation() {
+        let source = r#"{
+          "apps": {
+            "tls": { "automation": { "policies": [
+              { "issuers": [ { "module": "acme", "ca": "https://acme.example/dir", "email": "a@b.c",
+                               "external_account": { "key_id": "kid1", "mac_key": "bWFj" } } ] },
+              { "subjects": ["internal.example"], "issuers": [ { "module": "internal" } ] }
+            ] } },
+            "http": { "servers": { "srv0": {
+              "tls_connection_policies": [
+                { "match": {"sni": ["explicit.example"]}, "certificate_selection": {"certificate": "/c.pem", "key": "/k.pem"} }
+              ],
+              "routes": [
+                { "match": [{"host": ["example.com"]}], "handle": [{"handler": "static_response", "status_code": 200}] },
+                { "match": [{"host": ["explicit.example"]}], "handle": [{"handler": "static_response", "status_code": 200}] },
+                { "match": [{"host": ["internal.example"]}], "handle": [{"handler": "static_response", "status_code": 200}] }
+              ]
+            } } }
+          }
+        }"#;
+        let c = compile_caddy_json(source).unwrap();
+        assert!(c.contains("ZS_INIT_ENTRY(acme_config)"), "{c}");
+        // Managed: the public domain; excluded: explicit-cert and internal.
+        assert!(c.contains("zs_json_set_string(d, \"example.com\""), "{c}");
+        assert!(
+            !c.contains("zs_json_set_string(d, \"explicit.example\""),
+            "{c}"
+        );
+        assert!(
+            !c.contains("zs_json_set_string(d, \"internal.example\""),
+            "{c}"
+        );
+        assert!(c.contains("mailto:a@b.c"), "{c}");
+        assert!(c.contains("https://acme.example/dir"), "{c}");
+        assert!(c.contains("\"kid\""), "{c}");
+        assert!(c.contains("\"hmac_key\""), "{c}");
+    }
+
+    #[test]
+    fn conflicting_acme_issuers_are_rejected() {
+        let source = r#"{
+          "apps": {
+            "tls": { "automation": { "policies": [
+              { "issuers": [ { "module": "acme", "ca": "https://ca-one.example/dir" } ] },
+              { "subjects": ["b.example"], "issuers": [ { "module": "acme", "ca": "https://ca-two.example/dir" } ] }
+            ] } },
+            "http": { "servers": { "srv0": { "routes": [
+              { "match": [{"host": ["a.example"]}], "handle": [{"handler": "static_response", "status_code": 200}] }
+            ] } } }
+          }
+        }"#;
+        let err = compile_caddy_json(source).unwrap_err().to_string();
+        assert!(err.contains("conflicting ACME ca"), "{err}");
+    }
+
+    #[test]
+    fn acme_config_excludes_automatic_https_skip_hosts() {
+        let source = r#"{
+          "apps": {
+            "tls": { "automation": { "policies": [
+              { "issuers": [ { "module": "acme", "email": "a@b.c" } ] }
+            ] } },
+            "http": { "servers": { "srv0": {
+              "automatic_https": { "skip": ["b.example"] },
+              "routes": [
+                { "match": [{"host": ["a.example"]}], "handle": [{"handler": "static_response", "status_code": 200}] },
+                { "match": [{"host": ["b.example"]}], "handle": [{"handler": "static_response", "status_code": 200}] }
+              ]
+            } } }
+          }
+        }"#;
+        let (c, warnings) = compile_caddy_json_collecting(source).unwrap();
+        assert!(c.contains("zs_json_set_string(d, \"a.example\""), "{c}");
+        assert!(!c.contains("zs_json_set_string(d, \"b.example\""), "{c}");
+        // automatic_https with only `skip` is honored, not warned about.
+        assert!(
+            !warnings.iter().any(|w| w.contains("automatic_https")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn no_acme_config_without_acme_issuer() {
+        let source = r#"{
+          "apps": { "http": { "servers": { "srv0": { "routes": [
+            { "match": [{"host": ["example.com"]}], "handle": [{"handler": "static_response", "status_code": 200}] }
+          ] } } } }
+        }"#;
+        let c = compile_caddy_json(source).unwrap();
+        assert!(!c.contains("acme_config"), "{c}");
     }
 
     #[test]
