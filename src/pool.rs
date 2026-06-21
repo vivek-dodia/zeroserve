@@ -1,4 +1,9 @@
-use std::{cell::RefCell, collections::HashMap, sync::Arc};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    os::fd::{AsRawFd, RawFd},
+    sync::Arc,
+};
 
 use monoio::net::{TcpStream, UnixStream};
 
@@ -37,6 +42,36 @@ pub enum PooledConnection {
     Unix(H1Connection<UnixStream>),
 }
 
+impl PooledConnection {
+    fn raw_fd(&mut self) -> Option<RawFd> {
+        match self {
+            PooledConnection::Http(conn) => conn.io_mut().ok().map(|io| io.as_raw_fd()),
+            PooledConnection::Https(conn) => conn.io_mut().ok().map(|io| io.as_raw_fd()),
+            PooledConnection::Unix(conn) => conn.io_mut().ok().map(|io| io.as_raw_fd()),
+        }
+    }
+}
+
+fn connection_still_idle(conn: &mut PooledConnection) -> bool {
+    let Some(fd) = conn.raw_fd() else {
+        return false;
+    };
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
+    if ret < 0 {
+        return false;
+    }
+
+    // A reusable backend connection is expected to be completely idle. Any
+    // readable, hangup, or error event means the peer sent data or closed after
+    // the connection was pooled, so reusing it would consume stale state or EOF.
+    ret == 0 && pfd.revents == 0
+}
+
 struct PoolEntry {
     conn: PooledConnection,
 }
@@ -57,15 +92,19 @@ impl ProxyPool {
             return None;
         };
 
-        while let Some(entry) = entries.pop() {
-            if entries.is_empty() {
-                self.entries.remove(key);
+        let mut reusable = None;
+        while let Some(mut entry) = entries.pop() {
+            if connection_still_idle(&mut entry.conn) {
+                reusable = Some(entry.conn);
+                break;
             }
-            return Some(entry.conn);
         }
 
-        self.entries.remove(key);
-        None
+        let is_empty = entries.is_empty();
+        if is_empty {
+            self.entries.remove(key);
+        }
+        reusable
     }
 
     pub fn put(&mut self, key: PoolKey, conn: PooledConnection) {
@@ -81,10 +120,6 @@ impl ProxyPool {
 thread_local! {
     static PROXY_POOL: RefCell<ProxyPool> = RefCell::new(ProxyPool::new());
 }
-
-/// Retained for startup compatibility; pooled connections are validated when
-/// reused, avoiding per-request watcher task churn on the hot proxy path.
-pub fn install_hup_watcher(_hup: std::sync::Arc<crate::hupwatch::HupWatcher>) {}
 
 pub fn take_connection(key: &PoolKey) -> Option<PooledConnection> {
     PROXY_POOL.with(|pool| pool.borrow_mut().take(key))
@@ -146,6 +181,21 @@ mod tests {
             return_connection(key.clone(), conn);
 
             assert!(take_connection(&key).is_some());
+        });
+    }
+
+    #[test]
+    fn closed_pooled_connection_is_not_reused() {
+        run(async {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+
+            let (key, backend_side) = pooled_pair(&listener).await;
+            unsafe {
+                libc::shutdown(backend_side.as_raw_fd(), libc::SHUT_RDWR);
+            }
+            drop(backend_side);
+
+            assert!(take_connection(&key).is_none());
         });
     }
 }
