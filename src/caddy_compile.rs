@@ -8243,6 +8243,31 @@ mod tests {
     }
 
     #[test]
+    fn caddyfile_acme_config_uses_site_addresses_not_nested_host_matchers() {
+        let (json, _) = crate::caddyfile::adapt_to_string(
+            r#"{
+  email admin@example.com
+}
+site.example.com {
+  @inner host inner.example.com
+  respond @inner inner
+  respond outer
+}"#,
+            "Caddyfile",
+        )
+        .unwrap();
+        let c = compile_caddy_json(&json).unwrap();
+        assert!(
+            c.contains("zs_json_set_string(d, \"site.example.com\""),
+            "{c}"
+        );
+        assert!(
+            !c.contains("zs_json_set_string(d, \"inner.example.com\""),
+            "{c}"
+        );
+    }
+
+    #[test]
     fn no_acme_config_without_acme_issuer() {
         let source = r#"{
           "apps": { "http": { "servers": { "srv0": { "routes": [

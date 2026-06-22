@@ -40,6 +40,10 @@ const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 /// by a sibling process are picked up promptly.
 const CERT_SYNC_INTERVAL: Duration = Duration::from_secs(60);
 
+fn format_domain_list(domains: &[String]) -> String {
+    domains.join(", ")
+}
+
 /// Shared certificate state consulted during the TLS handshake by every worker.
 /// `live` maps an SNI to its serving context; `challenges` maps an identifier to
 /// a transient TLS-ALPN-01 validation context while an order is in flight.
@@ -171,6 +175,11 @@ impl AcmeRuntime {
                 return;
             }
         };
+        eprintln!("acme: opened state directory {}", self.acme_dir.display());
+        eprintln!(
+            "acme: certificate sync interval {:?}; renewal scan interval {:?}",
+            CERT_SYNC_INTERVAL, RENEWAL_INTERVAL
+        );
 
         // mtimes of certificates already loaded into the live store, so we only
         // rebuild a context when a (possibly sibling-written) file changes.
@@ -214,6 +223,9 @@ impl AcmeRuntime {
                     Ok(ctx) => {
                         self.certs.insert_live(domain, ctx);
                         loaded.insert(domain.clone(), mtime);
+                        eprintln!(
+                            "acme: loaded stored certificate for {domain} into live TLS store"
+                        );
                     }
                     Err(e) => {
                         eprintln!(
@@ -231,9 +243,11 @@ impl AcmeRuntime {
     /// sibling generating the key never stalls the monoio event loop.
     async fn account_key(&self, store: &Store) -> Result<AccountKey> {
         if let Some(key) = store.read_account_key().await? {
+            eprintln!("acme: using existing account key");
             return Ok(key);
         }
         let lock_path = store.account_key_lock_path();
+        eprintln!("acme: account key not found; acquiring account-key creation lock");
         let _guard = loop {
             match store.try_lock(&lock_path)? {
                 Some(guard) => break guard,
@@ -242,6 +256,7 @@ impl AcmeRuntime {
         };
         // A sibling may have created the key before we acquired the lock.
         if let Some(key) = store.read_account_key().await? {
+            eprintln!("acme: using account key created by sibling process");
             return Ok(key);
         }
         store.create_account_key().await
@@ -249,16 +264,39 @@ impl AcmeRuntime {
 
     async fn provision_cycle(&self, store: &Store, config: &AcmeConfig) -> Result<()> {
         let mut pending: Vec<String> = Vec::new();
+        let mut covered: Vec<String> = Vec::new();
         for domain in &config.domains {
-            if !self.covered_by_cert_dir(domain) && store.needs_renewal(domain).await {
+            if self.covered_by_cert_dir(domain) {
+                covered.push(domain.clone());
+            } else if store.needs_renewal(domain).await {
                 pending.push(domain.clone());
             }
         }
+        if !covered.is_empty() {
+            eprintln!(
+                "acme: skipping {} domain(s) covered by --cert-dir: {}",
+                covered.len(),
+                format_domain_list(&covered)
+            );
+        }
         if pending.is_empty() {
+            eprintln!("acme: renewal scan complete; no certificates need issuance or renewal");
             return Ok(());
         }
+        eprintln!(
+            "acme: renewal scan found {} pending domain(s): {}",
+            pending.len(),
+            format_domain_list(&pending)
+        );
 
         let key = self.account_key(store).await?;
+        eprintln!("acme: connecting to directory {}", config.directory_url);
+        if let Some(contact) = &config.contact {
+            eprintln!("acme: account contact configured: {contact}");
+        }
+        if config.eab.is_some() {
+            eprintln!("acme: external account binding configured");
+        }
         let client = AcmeClient::connect(
             key,
             &config.directory_url,
@@ -266,6 +304,7 @@ impl AcmeRuntime {
             config.eab.as_ref(),
         )
         .await?;
+        eprintln!("acme: account ready");
 
         for domain in pending {
             if let Err(e) = self.provision_domain(store, &client, &domain).await {
@@ -285,18 +324,22 @@ impl AcmeRuntime {
         // it is already provisioning, so skip and let `sync_live_certs` adopt its
         // certificate. The lock is non-blocking, so this never stalls the loop.
         let Some(_lock) = store.try_lock_domain(domain).await? else {
+            eprintln!("acme: provisioning for {domain} is already in progress in another process");
             return Ok(());
         };
         // Re-check under the lock: a sibling may have finished just before us.
         if !store.needs_renewal(domain).await {
+            eprintln!("acme: {domain} no longer needs renewal after acquiring lock");
             return Ok(());
         }
         eprintln!("acme: provisioning certificate for {domain}");
 
         let domains = [domain.to_string()];
+        eprintln!("acme: creating new order for {domain}");
         let order = client.new_order(&domains).await?;
 
         for authz_url in &order.authorizations {
+            eprintln!("acme: fetching tls-alpn-01 authorization for {domain}");
             let challenge = client.tls_alpn_challenge(authz_url).await?;
             let ctx = build_challenge_context(&challenge.identifier, &challenge.key_authorization)?;
             self.certs.insert_challenge(&challenge.identifier, ctx);
@@ -305,9 +348,17 @@ impl AcmeRuntime {
             store
                 .write_challenge(&challenge.identifier, &challenge.key_authorization)
                 .await?;
+            eprintln!(
+                "acme: published tls-alpn-01 challenge for {}",
+                challenge.identifier
+            );
 
             // Always tear the challenge down, whether validation succeeds or not.
             let result = async {
+                eprintln!(
+                    "acme: signaling challenge readiness for {}",
+                    challenge.identifier
+                );
                 client
                     .signal_challenge_ready(&challenge.challenge_url)
                     .await?;
@@ -316,13 +367,22 @@ impl AcmeRuntime {
             .await;
             self.certs.remove_challenge(&challenge.identifier);
             store.remove_challenge(&challenge.identifier).await;
+            eprintln!(
+                "acme: removed tls-alpn-01 challenge for {}",
+                challenge.identifier
+            );
             result?;
+            eprintln!("acme: authorization valid for {}", challenge.identifier);
         }
 
+        eprintln!("acme: finalizing order for {domain}");
         let key_pem = client.finalize(&order, &domains).await?;
+        eprintln!("acme: waiting for issued certificate for {domain}");
         let cert_url = client.poll_order_certificate(&order).await?;
+        eprintln!("acme: downloading certificate for {domain}");
         let cert_pem = client.download_certificate(&cert_url).await?;
         store.save_cert(domain, &cert_pem, &key_pem).await?;
+        eprintln!("acme: saved certificate for {domain}");
 
         let ctx = context_from_pem(&cert_pem, &key_pem)?;
         self.certs.insert_live(domain, ctx);

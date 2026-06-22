@@ -431,7 +431,18 @@ fn run_worker(
                     match script_runtime.run_init_section(site, "acme_config").await {
                         Ok(entries) => match acme::AcmeConfig::merge(&entries) {
                             Ok(Some(cfg)) => {
-                                eprintln!("acme: managing {} domain(s)", cfg.domains.len());
+                                eprintln!(
+                                    "acme: managing {} domain(s): {}",
+                                    cfg.domains.len(),
+                                    cfg.domains.join(", ")
+                                );
+                                eprintln!("acme: configured directory {}", cfg.directory_url);
+                                if let Some(contact) = &cfg.contact {
+                                    eprintln!("acme: configured contact {contact}");
+                                }
+                                if cfg.eab.is_some() {
+                                    eprintln!("acme: configured external account binding");
+                                }
                                 monoio::spawn(acme.run(cfg));
                             }
                             Ok(None) => eprintln!(

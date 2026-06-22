@@ -353,8 +353,10 @@ Current generated middleware support includes:
 - Caddyfile ACME client configuration: the global `email`, `acme_ca`, and
   `acme_eab` options and the site `tls <email>` / `tls { ca <url> … eab { … } }`
   directives compile into a `zeroserve.init.acme_config` section listing the
-  routed public domains to manage (excluding `localhost`, IP literals,
-  wildcards, `tls internal` sites, and sites with an explicit `tls <cert> <key>`).
+  concrete top-level Caddyfile site addresses to manage. Nested `host` matchers,
+  catch-all site addresses such as `*` and `:80`, `localhost`, IP literals,
+  wildcards, `tls internal` sites, and sites with an explicit `tls <cert> <key>`
+  are excluded.
   Certificates are obtained and renewed over ACME (TLS-ALPN-01) when the server
   runs with `--acme-dir`; wildcard subjects and DNS-01 are not supported. A
   single site opts out with `tls off` (compiled to `automatic_https.skip`): it is

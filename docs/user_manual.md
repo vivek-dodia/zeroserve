@@ -108,10 +108,11 @@ Most TLS/PKI/admin global options are accepted but reported as warnings, since
 they live outside zeroserve's eBPF request-processing surface. The ACME client
 options are an exception: the global `email`, `acme_ca`, and `acme_eab`, and the
 site `tls <email>` / `tls { ca <url> … eab { … } }` directives compile into a
-`zeroserve.init.acme_config` section (see "Automatic HTTPS (ACME)"). Every
-routed public domain (excluding `localhost`, IP literals, wildcards, `tls
-internal` sites, and sites with an explicit `tls <cert> <key>`) is then
-provisioned automatically when the server runs with `--acme-dir`.
+`zeroserve.init.acme_config` section (see "Automatic HTTPS (ACME)"). Only
+concrete top-level Caddyfile site addresses are considered for automatic
+issuance; nested `host` matchers, catch-all site addresses such as `*` and
+`:80`, `localhost`, IP literals, wildcards, `tls internal` sites, and sites with
+an explicit `tls <cert> <key>` are excluded.
 
 The generated script implements Caddy HTTP routes, matcher sets, route groups,
 terminal routes, method/query/header/header-regexp/path-regexp/file/protocol/TLS/

@@ -345,6 +345,22 @@ fn set_unique_acme_field(
     Ok(())
 }
 
+fn push_unique_acme_subject(subjects: &mut Vec<String>, host: &str) {
+    if !subjects.iter().any(|existing| existing == host) {
+        subjects.push(host.to_string());
+    }
+}
+
+fn push_block_acme_subjects(subjects: &mut Vec<String>, hosts: &[String]) {
+    for host in hosts {
+        push_unique_acme_subject(subjects, host);
+    }
+}
+
+fn is_site_acme_subject(host: &str) -> bool {
+    !host.is_empty() && !host.contains('*') && !host.contains('{') && !host.contains('}')
+}
+
 /// Build the `apps.tls` app holding ACME `automation.policies`, translating the
 /// global `email`/`acme_ca`/`acme_eab` options and per-site `tls <email>` /
 /// `tls internal` / `tls { ca/eab }` directives. Returns `Ok(None)` when the
@@ -359,25 +375,31 @@ fn build_tls_automation(
     let mut email = options.acme_email.clone();
     let mut ca = options.acme_ca.clone();
     let mut eab = options.acme_eab.clone();
-    if email.is_some() || ca.is_some() || eab.is_some() {
+    let global_acme = email.is_some() || ca.is_some() || eab.is_some();
+    if global_acme {
         acme_present = true;
     }
 
+    let mut acme_subjects: Vec<String> = Vec::new();
     let mut internal_subjects: Vec<String> = Vec::new();
     for block in compiled {
         let hosts: Vec<String> = block
             .parsed_keys
             .iter()
-            .filter(|a| !a.host.is_empty())
+            .filter(|a| is_site_acme_subject(&a.host))
             .map(|a| a.host.clone())
             .collect();
+        let mut block_excluded_from_acme = false;
+        let mut block_has_acme_issuer = false;
         for entry in &block.acme_automation {
             // `tls off` skip markers are handled in build_servers (emitted as
             // automatic_https.skip), not here.
             if entry.get("skip").and_then(Value::as_bool) == Some(true) {
+                block_excluded_from_acme = true;
                 continue;
             }
             if entry.get("internal").and_then(Value::as_bool) == Some(true) {
+                block_excluded_from_acme = true;
                 for host in &hosts {
                     if !internal_subjects.contains(host) {
                         internal_subjects.push(host.clone());
@@ -386,6 +408,7 @@ fn build_tls_automation(
                 continue;
             }
             acme_present = true;
+            block_has_acme_issuer = true;
             set_unique_acme_field(
                 "email",
                 &mut email,
@@ -408,10 +431,13 @@ fn build_tls_automation(
                 }
             }
         }
+        if (global_acme || block_has_acme_issuer) && !block_excluded_from_acme {
+            push_block_acme_subjects(&mut acme_subjects, &hosts);
+        }
     }
 
     let mut policies: Vec<Value> = Vec::new();
-    if acme_present {
+    if acme_present && !acme_subjects.is_empty() {
         let mut issuer = Map::new();
         issuer.insert("module".into(), json!("acme"));
         if let Some(ca) = &ca {
@@ -426,7 +452,7 @@ fn build_tls_automation(
                 json!({ "key_id": kid, "mac_key": mac }),
             );
         }
-        policies.push(json!({ "issuers": [Value::Object(issuer)] }));
+        policies.push(json!({ "subjects": acme_subjects, "issuers": [Value::Object(issuer)] }));
     }
     if !internal_subjects.is_empty() {
         policies.push(json!({
@@ -4831,6 +4857,15 @@ internal.example {
         assert_eq!(acme["ca"], "https://acme.example/dir");
         assert_eq!(acme["external_account"]["key_id"], "kid-1");
         assert_eq!(acme["external_account"]["mac_key"], "bWFjLXNlY3JldA");
+        let acme_policy = policies
+            .iter()
+            .find(|p| {
+                p["issuers"]
+                    .as_array()
+                    .is_some_and(|is| is.iter().any(|i| i["module"] == "acme"))
+            })
+            .expect("acme policy");
+        assert_eq!(acme_policy["subjects"], json!(["example.com"]));
         let internal = policies
             .iter()
             .find(|p| {
@@ -4859,6 +4894,64 @@ internal.example {
                     .any(|i| i["module"] == "acme" && i["email"] == "me@example.com")
             })
         }));
+        assert_eq!(policies[0]["subjects"], json!(["example.com"]));
+    }
+
+    #[test]
+    fn acme_subjects_come_from_site_addresses_not_nested_host_matchers() {
+        let (v, _) = adapt_full(
+            r#"{
+  email admin@example.com
+}
+site.example.com {
+  @inner host inner.example.com
+  respond @inner inner
+  respond outer
+}"#,
+        );
+        let policies = v["apps"]["tls"]["automation"]["policies"]
+            .as_array()
+            .expect("automation policies");
+        let acme_policy = policies
+            .iter()
+            .find(|p| {
+                p["issuers"]
+                    .as_array()
+                    .is_some_and(|is| is.iter().any(|i| i["module"] == "acme"))
+            })
+            .expect("acme policy");
+        assert_eq!(acme_policy["subjects"], json!(["site.example.com"]));
+    }
+
+    #[test]
+    fn acme_subjects_exclude_catch_all_site_addresses() {
+        for key in ["*", ":80"] {
+            let (v, _) = adapt_full(&format!(
+                r#"{{
+  email admin@example.com
+}}
+{key} {{
+  respond ok
+}}"#
+            ));
+            assert!(v["apps"].get("tls").is_none(), "{v}");
+        }
+
+        let (v, _) = adapt_full(
+            r#"{
+  email admin@example.com
+}
+* {
+  respond catch-all
+}
+site.example.com {
+  respond site
+}"#,
+        );
+        let policies = v["apps"]["tls"]["automation"]["policies"]
+            .as_array()
+            .expect("automation policies");
+        assert_eq!(policies[0]["subjects"], json!(["site.example.com"]));
     }
 
     #[test]
